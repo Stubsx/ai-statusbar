@@ -85,7 +85,14 @@ struct PanelView: View {
             .padding(.bottom, 8)
 
             if let tools = store.data?.tools {
-                ForEach(tools, id: \.key) { t in
+                let visible = tools.filter { $0.state != "off" }  // 未运行的不显示
+                if visible.isEmpty {
+                    Text("全部未运行")
+                        .font(.system(size: 11))
+                        .foregroundColor(.white.opacity(0.35))
+                        .padding(.vertical, 4)
+                }
+                ForEach(visible, id: \.key) { t in
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 10) {
                             Circle()
@@ -134,7 +141,7 @@ struct PanelView: View {
         .padding(.horizontal, 16)
         .padding(.top, 12)
         .padding(.bottom, 10)
-        .frame(minWidth: 280)
+        .frame(width: 300)  // 固定宽度，长标题自动省略号
         .background(
             RoundedRectangle(cornerRadius: 16)
                 .fill(.ultraThinMaterial)
@@ -210,7 +217,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let badge: (ToolStatus) -> String = { t in
             t.state == "busy" ? "\(t.letter)🟢\(t.busyCount)" : "\(t.letter)\(self.mark(t.state))"
         }
-        statusItem.button?.title = data.tools.map(badge).joined(separator: " ")
+        let visible = data.tools.filter { $0.state != "off" }
+        // 全部未运行时保留一个占位徽标，保证菜单入口还在
+        statusItem.button?.title = visible.isEmpty ? "AI⚪️" : visible.map(badge).joined(separator: " ")
 
         // 浮窗尺寸跟随内容
         hosting.layout()
@@ -231,28 +240,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// 标题限宽，超长截断加省略号
+    private func truncate(_ s: String, _ maxChars: Int = 40) -> String {
+        s.count > maxChars ? String(s.prefix(maxChars - 1)) + "…" : s
+    }
+
     // MARK: 菜单
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         let label = ["busy": "工作中", "idle": "空闲", "off": "未运行"]
         if let data = store.data {
-            for t in data.tools {
+            let visible = data.tools.filter { $0.state != "off" }
+            if visible.isEmpty {
+                let empty = NSMenuItem(title: "全部未运行", action: nil, keyEquivalent: "")
+                empty.isEnabled = false
+                menu.addItem(empty)
+                menu.addItem(.separator())
+            }
+            for t in visible {
                 let header = NSMenuItem(title: "\(mark(t.state)) \(t.name)：\(label[t.state] ?? t.state)（\(t.detail)）",
                                         action: nil, keyEquivalent: "")
                 header.isEnabled = false
                 menu.addItem(header)
                 for title in t.busyTitles.prefix(3) {
-                    let item = NSMenuItem(title: "▶ \(title)", action: nil, keyEquivalent: "")
+                    let item = NSMenuItem(title: "▶ \(truncate(title))", action: nil, keyEquivalent: "")
                     item.isEnabled = false
-                    item.attributedTitle = NSAttributedString(string: "▶ \(title)", attributes: [
+                    item.attributedTitle = NSAttributedString(string: item.title, attributes: [
                         .font: NSFont.systemFont(ofSize: 11),
                         .foregroundColor: NSColor.systemGreen,
                     ])
                     menu.addItem(item)
                 }
                 if t.busyTitles.isEmpty, let latest = t.latestTitle {
-                    let item = NSMenuItem(title: "最近任务：\(latest) · \(t.latestAge ?? "")", action: nil, keyEquivalent: "")
+                    let item = NSMenuItem(title: "最近任务：\(truncate(latest, 34)) · \(t.latestAge ?? "")", action: nil, keyEquivalent: "")
                     item.isEnabled = false
                     item.attributedTitle = NSAttributedString(string: item.title, attributes: [
                         .font: NSFont.systemFont(ofSize: 11),
