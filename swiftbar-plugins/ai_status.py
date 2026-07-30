@@ -34,11 +34,33 @@ HERMES_HEARTBEAT = os.path.join(HOME, ".hermes", "state", "gateway.heartbeat")
 ZCODE_DB = latest_glob(os.path.join(HOME, ".zcode", "v*", "tasks-index.sqlite")) \
     or os.path.join(HOME, ".zcode", "v2", "tasks-index.sqlite")
 ZCODE_CLI = os.path.join(HOME, ".zcode", "cli")
-ZCODE_BUSY_SEC = 300  # model-io/artifacts 5 分钟内有写入算工作中
 
 NOW = time.time()
-BUSY_MTIME_SEC = 300   # 日志 5 分钟内有动静才可能算“工作中”
 TAIL_BYTES = 256 * 1024
+
+# ---------- 空闲判定时间设置（~/.ai-statusbar/settings.json，菜单栏可改） ----------
+USAGE_DIR = os.path.join(HOME, ".ai-statusbar")
+SETTINGS_PATH = os.path.join(USAGE_DIR, "settings.json")
+DEFAULT_BUSY_SEC = 300  # 默认 5 分钟
+
+
+def _load_busy_settings():
+    try:
+        s = json.load(open(SETTINGS_PATH, encoding="utf-8"))
+        return int(s.get("default_busy_sec", DEFAULT_BUSY_SEC)), dict(s.get("per_tool", {}))
+    except Exception:
+        return DEFAULT_BUSY_SEC, {}
+
+
+_DEFAULT_BUSY, _PER_TOOL_BUSY = _load_busy_settings()
+
+
+def busy_sec(tool):
+    """某工具的空闲判定秒数：单独设置优先，否则用统一值。"""
+    try:
+        return int(_PER_TOOL_BUSY.get(tool, _DEFAULT_BUSY))
+    except Exception:
+        return _DEFAULT_BUSY
 
 
 def proc_count(basename, exclude_substrings=()):
@@ -170,7 +192,7 @@ def codex_status():
                     pending.pop(p.get("call_id"), None)
         # turn 开启未收尾（最后事件是 task_started）或有未返回的工具调用，
         # 且日志 5 分钟内有动静，才算工作中
-        if (last_task == "task_started" or pending) and NOW - mtime < BUSY_MTIME_SEC:
+        if (last_task == "task_started" or pending) and NOW - mtime < busy_sec("codex"):
             r["busy"].append(title)
     return n, app_n, res
 
@@ -192,7 +214,7 @@ def kimi_status():
         mtime = max(os.path.getmtime(w) for w in wires)
         if latest is None or mtime > latest[1]:
             latest = (title, mtime)
-        if NOW - mtime > BUSY_MTIME_SEC:
+        if NOW - mtime > busy_sec("kimi"):
             continue
         for w in wires:
             steps, tools = {}, {}
@@ -256,7 +278,7 @@ def claude_status():
             title = os.path.basename(os.path.dirname(f)).lstrip("-").rsplit("-", 1)[-1] or "(未命名会话)"
         if latest is None or mtime > latest[1]:
             latest = (title, mtime)
-        if NOW - mtime > BUSY_MTIME_SEC or last_msg is None:
+        if NOW - mtime > busy_sec("claude") or last_msg is None:
             continue
         t, kinds = last_msg
         # 最后是 user 消息（prompt 或 tool_result）说明模型正在生成；
@@ -287,7 +309,7 @@ def hermes_status():
             SELECT DISTINCT s.title FROM sessions s
             JOIN session_model_usage u ON u.session_id = s.id
             WHERE u.last_seen > ? AND s.archived = 0 AND s.title IS NOT NULL AND s.title != ''
-            ORDER BY u.last_seen DESC""", (NOW - BUSY_MTIME_SEC,))]
+            ORDER BY u.last_seen DESC""", (NOW - busy_sec("hermes"),))]
         row = db.execute("""SELECT title, started_at FROM sessions
             WHERE archived = 0 AND title IS NOT NULL AND title != ''
             ORDER BY started_at DESC LIMIT 1""").fetchone()
@@ -338,7 +360,7 @@ def zcode_status():
 
     running = []
     for sid, ts in sorted(activity.items(), key=lambda kv: -kv[1]):
-        if NOW - ts < ZCODE_BUSY_SEC:
+        if NOW - ts < busy_sec("zcode"):
             running.append(titles.get(sid, "(未知任务)"))
     if latest is None and activity:
         sid, ts = max(activity.items(), key=lambda kv: kv[1])
@@ -347,7 +369,6 @@ def zcode_status():
 
 
 # ---------- Token 用量统计（增量扫描，缓存于本地 sqlite） ----------
-USAGE_DIR = os.path.join(HOME, ".ai-statusbar")
 USAGE_DB = os.path.join(USAGE_DIR, "usage.sqlite")
 USAGE_MAX_AGE = 70 * 86400  # 只索引最近 70 天的日志文件（热力图需要 10 周）
 

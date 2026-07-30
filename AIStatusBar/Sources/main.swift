@@ -512,6 +512,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 menu.addItem(.separator())
             }
         }
+        menu.addItem(busyMenu())
         let toggle = NSMenuItem(title: UserDefaults.standard.bool(forKey: "panelVisible") ? "隐藏桌面卡片" : "显示桌面卡片",
                                 action: #selector(togglePanel), keyEquivalent: "p")
         toggle.target = self
@@ -591,6 +592,98 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if visible {
             panel.orderFront(nil)
         }
+    }
+
+    // MARK: 空闲判定时间设置（写入 ~/.ai-statusbar/settings.json，采集端每次运行读取）
+
+    private static let busyOptions = [60, 180, 300, 600, 900, 1800]
+    private static let busyTools = [("codex", "Codex"), ("kimi", "Kimi Code"), ("claude", "Claude Code"),
+                                    ("hermes", "Hermes"), ("zcode", "ZCode")]
+    private var settingsPath: String { NSHomeDirectory() + "/.ai-statusbar/settings.json" }
+
+    private func labelSec(_ sec: Int) -> String {
+        sec < 3600 ? "\(sec / 60) 分钟" : "\(sec / 3600) 小时"
+    }
+
+    private func loadBusySettings() -> (defaultSec: Int, perTool: [String: Int]) {
+        guard let data = FileManager.default.contents(atPath: settingsPath),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return (300, [:])
+        }
+        let def = obj["default_busy_sec"] as? Int ?? 300
+        var per: [String: Int] = [:]
+        if let p = obj["per_tool"] as? [String: Int] { per = p }
+        return (def, per)
+    }
+
+    private func saveBusySettings(defaultSec: Int, perTool: [String: Int]) {
+        let obj: [String: Any] = ["default_busy_sec": defaultSec, "per_tool": perTool]
+        guard let data = try? JSONSerialization.data(withJSONObject: obj, options: .prettyPrinted) else { return }
+        try? FileManager.default.createDirectory(atPath: NSHomeDirectory() + "/.ai-statusbar",
+                                                 withIntermediateDirectories: true)
+        try? data.write(to: URL(fileURLWithPath: settingsPath))
+    }
+
+    private func busyMenu() -> NSMenuItem {
+        let (def, per) = loadBusySettings()
+        let root = NSMenuItem(title: "空闲判定时间", action: nil, keyEquivalent: "")
+        let m = NSMenu()
+
+        let unified = NSMenuItem(title: "统一设置（所有工具）", action: nil, keyEquivalent: "")
+        let um = NSMenu()
+        for sec in Self.busyOptions {
+            let it = NSMenuItem(title: labelSec(sec), action: #selector(setBusyUnified(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = sec
+            it.state = (per.isEmpty && def == sec) ? .on : .off
+            um.addItem(it)
+        }
+        unified.submenu = um
+        m.addItem(unified)
+        m.addItem(.separator())
+
+        for (key, name) in Self.busyTools {
+            let t = NSMenuItem(title: name, action: nil, keyEquivalent: "")
+            let tm = NSMenu()
+            let cur = per[key]
+            let follow = NSMenuItem(title: "跟随统一（\(labelSec(def))）", action: #selector(setBusyPerTool(_:)), keyEquivalent: "")
+            follow.target = self
+            follow.representedObject = ["tool": key, "sec": -1] as [String: Any]
+            follow.state = cur == nil ? .on : .off
+            tm.addItem(follow)
+            tm.addItem(.separator())
+            for sec in Self.busyOptions {
+                let it = NSMenuItem(title: labelSec(sec), action: #selector(setBusyPerTool(_:)), keyEquivalent: "")
+                it.target = self
+                it.representedObject = ["tool": key, "sec": sec] as [String: Any]
+                it.state = cur == sec ? .on : .off
+                tm.addItem(it)
+            }
+            t.submenu = tm
+            m.addItem(t)
+        }
+        root.submenu = m
+        return root
+    }
+
+    @objc private func setBusyUnified(_ sender: NSMenuItem) {
+        guard let sec = sender.representedObject as? Int else { return }
+        saveBusySettings(defaultSec: sec, perTool: [:])  // 统一改：清除所有单独设置
+        store.refresh()
+    }
+
+    @objc private func setBusyPerTool(_ sender: NSMenuItem) {
+        guard let info = sender.representedObject as? [String: Any],
+              let key = info["tool"] as? String else { return }
+        let (def, per0) = loadBusySettings()
+        var per = per0
+        if let sec = info["sec"] as? Int, sec > 0 {
+            per[key] = sec
+        } else {
+            per.removeValue(forKey: key)
+        }
+        saveBusySettings(defaultSec: def, perTool: per)
+        store.refresh()
     }
 
     @objc private func togglePanel() {
