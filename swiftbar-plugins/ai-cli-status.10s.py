@@ -19,17 +19,28 @@ CODEX_DB = os.path.join(HOME, ".codex", "state_5.sqlite")
 KIMI_SESSIONS = os.path.join(HOME, ".kimi-code", "sessions")
 ZCODE_DB = os.path.join(HOME, ".zcode", "v2", "tasks-index.sqlite")
 ZCODE_CLI = os.path.join(HOME, ".zcode", "cli")
-ZCODE_BUSY_SEC = 240  # model-io/artifacts 4 分钟内有写入算工作中
+ZCODE_BUSY_SEC = 300  # model-io/artifacts 5 分钟内有写入算工作中
 
 NOW = time.time()
-BUSY_MTIME_SEC = 600   # 日志 10 分钟内有动静才可能算“工作中”
+BUSY_MTIME_SEC = 300   # 日志 5 分钟内有动静才可能算“工作中”
 TAIL_BYTES = 256 * 1024
 
 
-def proc_count(basename):
+def proc_count(basename, exclude_substrings=()):
+    """按 argv[0] 的可执行文件名统计进程数，可按命令行内容排除。"""
     try:
-        out = subprocess.run(["ps", "-eo", "comm"], capture_output=True, text=True).stdout
-        return sum(1 for line in out.splitlines() if line.strip() == basename)
+        out = subprocess.run(["ps", "-eo", "args"], capture_output=True, text=True).stdout
+        n = 0
+        for line in out.splitlines()[1:]:
+            tokens = line.strip().split()
+            while tokens and "=" in tokens[0] and not tokens[0].startswith("/"):
+                tokens.pop(0)  # 跳过开头的环境变量赋值（如 HOME=... PATH=...）
+            if not tokens or os.path.basename(tokens[0]) != basename:
+                continue
+            if any(s in line for s in exclude_substrings):
+                continue
+            n += 1
+        return n
     except Exception:
         return 0
 
@@ -69,19 +80,21 @@ def iter_jsonl(text):
 
 # ---------- Codex ----------
 def codex_status():
-    n = proc_count("codex")
-    names = {}
+    n = proc_count("codex", ("ChatGPT.app/", "Codex.app/"))  # 纯 CLI 进程（排除桌面 App 内嵌的 codex）
+    app_n = proc_count("ChatGPT") + proc_count("Codex")      # 桌面/IDE 宿主（Codex.app 主进程名是 ChatGPT）
+    names = {}  # sid -> (title, updated_ts, kind)  kind: cli / ide
     # 桌面版/IDE 版的线程标题都在 state_5.sqlite 的 threads 表里
     try:
         db = sqlite3.connect(f"file:{CODEX_DB}?mode=ro", uri=True)
-        for tid, title, updated in db.execute(
-                "SELECT id, title, updated_at FROM threads WHERE archived=0"):
+        for tid, title, updated, source in db.execute(
+                "SELECT id, title, updated_at, source FROM threads WHERE archived=0"):
             if tid:
-                names[tid] = (title or "(未命名会话)", float(updated or 0))
+                kind = "cli" if source in ("cli", "exec") else "ide"
+                names[tid] = (title or "(未命名会话)", float(updated or 0), kind)
         db.close()
     except Exception:
         pass
-    if not names:  # 退回 session_index.jsonl
+    if not names:  # 退回 session_index.jsonl（主要是 CLI 会话）
         try:
             for r in iter_jsonl(open(CODEX_INDEX, encoding="utf-8").read()):
                 if r.get("id"):
@@ -90,21 +103,23 @@ def codex_status():
                             r.get("updated_at", "").replace("Z", "+00:00")).timestamp()
                     except Exception:
                         ts = 0
-                    names[r["id"]] = (r.get("thread_name") or "(未命名会话)", ts)
+                    names[r["id"]] = (r.get("thread_name") or "(未命名会话)", ts, "cli")
         except Exception:
             pass
 
-    busy, latest = [], None
+    res = {"cli": {"busy": [], "latest": None},
+           "ide": {"busy": [], "latest": None}}
     files = glob.glob(os.path.join(HOME, ".codex", "sessions", "*", "*", "*", "*.jsonl"))
     files = [f for f in files if NOW - os.path.getmtime(f) < 86400]
     for f in files:
         mtime = os.path.getmtime(f)
         sid = os.path.basename(f).rsplit("-", 5)
         sid = "-".join(sid[-5:]).replace(".jsonl", "") if len(sid) >= 5 else ""
-        title, ts = names.get(sid, ("(未命名会话)", mtime))
+        title, ts, kind = names.get(sid, ("(未命名会话)", mtime, "ide"))
         ts = ts or mtime
-        if latest is None or ts > latest[1]:
-            latest = (title, ts)
+        r = res[kind]
+        if r["latest"] is None or ts > r["latest"][1]:
+            r["latest"] = (title, ts)
         last_task, pending = None, {}
         try:
             with open(f, encoding="utf-8", errors="ignore") as fh:
@@ -135,12 +150,11 @@ def codex_status():
                         pending[cid] = True
                 elif t in ("function_call_output", "custom_tool_call_output"):
                     pending.pop(p.get("call_id"), None)
-        # 桌面版请求经常卡几十分钟：turn 开启未收尾（最后事件是 task_started）
-        # 即算工作中，放宽到 6 小时；仅靠未完成工具调用判断时仍要求 10 分钟新鲜度
-        if (last_task == "task_started" and NOW - mtime < 6 * 3600) or \
-           (pending and NOW - mtime < BUSY_MTIME_SEC):
-            busy.append(title)
-    return n, busy, latest
+        # turn 开启未收尾（最后事件是 task_started）或有未返回的工具调用，
+        # 且日志 5 分钟内有动静，才算工作中
+        if (last_task == "task_started" or pending) and NOW - mtime < BUSY_MTIME_SEC:
+            r["busy"].append(title)
+    return n, app_n, res
 
 
 # ---------- Kimi Code ----------
@@ -233,7 +247,7 @@ def mark(state):
     return {"busy": "🟢", "idle": "🟡", "off": "⚪️"}[state]
 
 
-codex_n, codex_busy, codex_latest = codex_status()
+codex_n, codex_app_n, codex = codex_status()
 kimi_n, kimi_busy, kimi_latest = kimi_status()
 zcode_cli_n, zcode_app, zcode_running, zcode_latest = zcode_status()
 
@@ -244,7 +258,8 @@ def state_of(proc_on, busy):
     return "idle" if proc_on else "off"
 
 
-cs = state_of(codex_n > 0, codex_busy)
+cs_ide = state_of(codex_app_n > 0, codex["ide"]["busy"])
+cs_cli = state_of(codex_n > 0, codex["cli"]["busy"])
 ks = state_of(kimi_n > 0, kimi_busy)
 zs = state_of(zcode_cli_n > 0 or zcode_app, zcode_running)
 
@@ -252,16 +267,25 @@ def badge(letter, st, count):
     return f"{letter}🟢{count}" if st == "busy" else f"{letter}{mark(st)}"
 
 
-print(f"{badge('C', cs, len(codex_busy))} {badge('K', ks, len(kimi_busy))} {badge('Z', zs, len(zcode_running))}")
+print(f"{badge('C', cs_ide, len(codex['ide']['busy']))} "
+      f"{badge('X', cs_cli, len(codex['cli']['busy']))} "
+      f"{badge('K', ks, len(kimi_busy))} "
+      f"{badge('Z', zs, len(zcode_running))}")
 print("---")
 
 label = {"busy": "工作中", "idle": "空闲", "off": "未运行"}
 
-for name, st, n, busy_titles, latest in (
-    ("Codex", cs, codex_n, codex_busy, codex_latest),
-    ("Kimi Code", ks, kimi_n, kimi_busy, kimi_latest),
+for name, st, detail, busy_titles, latest in (
+    ("Codex 桌面/IDE", cs_ide,
+     f"{len(codex['ide']['busy'])} 个任务" if cs_ide == "busy" else ("App 在线" if codex_app_n else "无进程"),
+     codex["ide"]["busy"], codex["ide"]["latest"]),
+    ("Codex CLI", cs_cli,
+     f"{len(codex['cli']['busy'])} 个任务" if cs_cli == "busy" else f"{codex_n} 个进程",
+     codex["cli"]["busy"], codex["cli"]["latest"]),
+    ("Kimi Code", ks,
+     f"{len(kimi_busy)} 个任务" if ks == "busy" else f"{kimi_n} 个进程",
+     kimi_busy, kimi_latest),
 ):
-    detail = f"{len(busy_titles)} 个任务" if st == "busy" else f"{n} 个进程"
     print(f"{mark(st)} {name}：{label[st]}（{detail}）")
     for t in busy_titles[:3]:
         print(f"▶ {t} | size=11 color=green")
@@ -280,5 +304,6 @@ for t in zcode_running[:3]:
 if zcode_latest and not zcode_running:
     print(f"最近任务：{zcode_latest[0]} · {age_str(zcode_latest[1])} | size=11 color=gray")
 print("---")
+print("C=Codex桌面/IDE  X=Codex CLI  K=Kimi  Z=ZCode | size=10 color=gray")
 print("🟢工作中  🟡空闲  ⚪️未运行 | size=10 color=gray")
 print("刷新 | refresh=true")
