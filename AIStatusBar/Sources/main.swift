@@ -70,6 +70,7 @@ final class StatusStore: ObservableObject {
 struct PanelView: View {
     @ObservedObject var store: StatusStore
     @State private var lastDrag = CGSize.zero
+    @AppStorage("panelPinned") private var pinned = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -149,6 +150,15 @@ struct PanelView: View {
                 .shadow(color: .black.opacity(0.4), radius: 16, y: 8)
         )
         .environment(\.colorScheme, .dark)
+        .contextMenu {
+            Button(pinned ? "取消置顶" : "置顶") {
+                pinned.toggle()
+                applyLevel()
+            }
+            Divider()
+            Button("退出 AIStatusBar") { NSApp.terminate(nil) }
+        }
+        .onAppear { applyLevel() }
         .gesture(
             DragGesture(minimumDistance: 3)
                 .onChanged { v in
@@ -166,6 +176,12 @@ struct PanelView: View {
                     }
                 }
         )
+    }
+
+    private func applyLevel() {
+        guard let w = NSApp.windows.first(where: { $0.identifier?.rawValue == "AIStatusPanel" }) as? NSPanel else { return }
+        w.isFloatingPanel = pinned
+        w.level = pinned ? .floating : .normal
     }
 
     private func color(for state: String) -> Color {
@@ -311,8 +327,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.identifier = NSUserInterfaceItemIdentifier("AIStatusPanel")
         panel.contentView = hosting
-        panel.isFloatingPanel = true
-        panel.level = .floating
+        let pinned = UserDefaults.standard.object(forKey: "panelPinned") == nil
+            ? true : UserDefaults.standard.bool(forKey: "panelPinned")
+        panel.isFloatingPanel = pinned
+        panel.level = pinned ? .floating : .normal
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.backgroundColor = .clear
         panel.isOpaque = false
