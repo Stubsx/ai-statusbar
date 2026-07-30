@@ -15,6 +15,7 @@ rm -rf .build
 
 cp ../swiftbar-plugins/ai_status.py "$APP/Contents/Resources/"
 cp Info.plist "$APP/Contents/"
+[ -f ../icons/AppIcon.icns ] && cp ../icons/AppIcon.icns "$APP/Contents/Resources/"
 
 # 临时签名（ad-hoc）：保证文件完整性可校验，减少 Gatekeeper 报“已损坏”的概率
 codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || true
