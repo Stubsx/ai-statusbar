@@ -15,9 +15,22 @@ struct ToolStatus: Codable {
     let latestAge: String?
 }
 
+struct UsageEntry: Codable {
+    let input: Int
+    let output: Int
+    let cache: Int
+}
+
+struct UsageData: Codable {
+    let date: String
+    let tools: [String: UsageEntry]
+    let total: UsageEntry
+}
+
 struct StatusData: Codable {
     let updatedAt: String
     let tools: [ToolStatus]
+    let usage: UsageData?
 }
 
 extension Notification.Name {
@@ -105,21 +118,24 @@ struct PanelView: View {
     @ObservedObject var store: StatusStore
     var bare = false  // true = 背景由外层 NSGlassEffectView 提供，SwiftUI 不再画背景
     @AppStorage("panelPinned") private var pinned = true
+    @AppStorage("panelTab") private var tab = "status"
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
+            HStack(spacing: 6) {
                 Text("AI AGENTS")
                     .font(.system(size: 11, weight: .semibold))
                     .tracking(1)
+                    .foregroundColor(.white.opacity(0.45))
                 Spacer()
-                Text(store.data?.updatedAt ?? "--:--:--")
-                    .font(.system(size: 11, weight: .regular).monospacedDigit())
+                tabButton("状态", "status")
+                tabButton("用量", "usage")
             }
-            .foregroundColor(.white.opacity(0.45))
             .padding(.bottom, 8)
 
-            if let tools = store.data?.tools {
+            if tab == "usage" {
+                usageView
+            } else if let tools = store.data?.tools {
                 let visible = tools.filter { $0.state != "off" }  // 未运行的不显示
                 if visible.isEmpty {
                     Text("全部未运行")
@@ -188,6 +204,70 @@ struct PanelView: View {
             Button("退出 AIStatusBar") { NSApp.terminate(nil) }
         }
         .onAppear { applyLevel() }
+    }
+
+    private func tabButton(_ title: String, _ id: String) -> some View {
+        Button(action: { tab = id }) {
+            Text(title)
+                .font(.system(size: 10, weight: tab == id ? .semibold : .regular))
+                .foregroundColor(tab == id ? .white.opacity(0.9) : .white.opacity(0.4))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 3)
+                .background(Capsule().fill(tab == id ? Color.white.opacity(0.16) : Color.white.opacity(0.06)))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var usageView: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if let u = store.data?.usage {
+                HStack {
+                    Text("今日用量 · \(u.date)")
+                        .font(.system(size: 11, weight: .semibold))
+                    Spacer()
+                    Text("输入 / 缓存 / 输出")
+                        .font(.system(size: 9))
+                        .foregroundColor(.white.opacity(0.35))
+                }
+                .foregroundColor(.white.opacity(0.6))
+                .padding(.bottom, 4)
+                usageRow("总计", u.total, bold: true)
+                Divider().background(Color.white.opacity(0.1))
+                ForEach(["codex", "kimi", "claude", "zcode", "hermes"], id: \.self) { key in
+                    if let e = u.tools[key] {
+                        usageRow(usageName(key), e, bold: false)
+                    }
+                }
+            } else {
+                Text("统计中…（首次全量索引约需几秒）")
+                    .font(.system(size: 11))
+                    .foregroundColor(.white.opacity(0.55))
+            }
+        }
+    }
+
+    private func usageRow(_ name: String, _ e: UsageEntry, bold: Bool) -> some View {
+        HStack {
+            Text(name)
+                .font(.system(size: 12, weight: bold ? .semibold : .medium))
+                .foregroundColor(bold ? .white.opacity(0.95) : .white.opacity(0.8))
+            Spacer()
+            Text("\(fmt(e.input)) / \(fmt(e.cache)) / \(fmt(e.output))")
+                .font(.system(size: 11, weight: bold ? .semibold : .regular).monospacedDigit())
+                .foregroundColor(bold ? .white.opacity(0.9) : .white.opacity(0.6))
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func usageName(_ key: String) -> String {
+        ["codex": "Codex", "kimi": "Kimi Code", "claude": "Claude Code", "zcode": "ZCode", "hermes": "Hermes"][key] ?? key
+    }
+
+    private func fmt(_ n: Int) -> String {
+        if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000) }
+        if n >= 10_000 { return String(format: "%.0fK", Double(n) / 1_000) }
+        if n >= 1_000 { return String(format: "%.1fK", Double(n) / 1_000) }
+        return "\(n)"
     }
 
     private func applyLevel() {
@@ -360,7 +440,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refresh.target = self
         menu.addItem(refresh)
         menu.addItem(.separator())
-        let legend = NSMenuItem(title: "C=Codex App  X=Codex CLI  K=Kimi  L=Claude  Z=ZCode", action: nil, keyEquivalent: "")
+        let legend = NSMenuItem(title: "C=Codex App  X=Codex CLI  K=Kimi  L=Claude  H=Hermes  Z=ZCode", action: nil, keyEquivalent: "")
         legend.isEnabled = false
         legend.attributedTitle = NSAttributedString(string: legend.title, attributes: [
             .font: NSFont.systemFont(ofSize: 10),

@@ -29,6 +29,8 @@ CODEX_DB = latest_glob(os.path.join(HOME, ".codex", "state_*.sqlite")) \
     or os.path.join(HOME, ".codex", "state_5.sqlite")
 KIMI_SESSIONS = os.path.join(HOME, ".kimi-code", "sessions")
 CLAUDE_PROJECTS = os.path.join(HOME, ".claude", "projects")
+HERMES_DB = os.path.join(HOME, ".hermes", "state.db")
+HERMES_HEARTBEAT = os.path.join(HOME, ".hermes", "state", "gateway.heartbeat")
 ZCODE_DB = latest_glob(os.path.join(HOME, ".zcode", "v*", "tasks-index.sqlite")) \
     or os.path.join(HOME, ".zcode", "v2", "tasks-index.sqlite")
 ZCODE_CLI = os.path.join(HOME, ".zcode", "cli")
@@ -265,6 +267,38 @@ def claude_status():
     return n, busy, latest
 
 
+# ---------- Hermes ----------
+def hermes_status():
+    # 在线：桌面 App 进程在，或 gateway 心跳 2 分钟内有更新（后端活着）
+    app_n = proc_count("Hermes")
+    try:
+        gw_alive = NOW - os.path.getmtime(HERMES_HEARTBEAT) < 120
+    except Exception:
+        gw_alive = False
+    busy, latest = [], None
+    try:
+        db = sqlite3.connect(f"file:{HERMES_DB}?mode=ro", uri=True)
+        cols = {r[1] for r in db.execute("PRAGMA table_info(sessions)")}
+        ucols = {r[1] for r in db.execute("PRAGMA table_info(session_model_usage)")}
+        if not {"id", "title", "started_at"} <= cols or "last_seen" not in ucols:
+            raise RuntimeError("hermes state.db 表结构不兼容")
+        # 工作中：5 分钟内有 API 调用的会话
+        busy = [r[0] for r in db.execute("""
+            SELECT DISTINCT s.title FROM sessions s
+            JOIN session_model_usage u ON u.session_id = s.id
+            WHERE u.last_seen > ? AND s.archived = 0 AND s.title IS NOT NULL AND s.title != ''
+            ORDER BY u.last_seen DESC""", (NOW - BUSY_MTIME_SEC,))]
+        row = db.execute("""SELECT title, started_at FROM sessions
+            WHERE archived = 0 AND title IS NOT NULL AND title != ''
+            ORDER BY started_at DESC LIMIT 1""").fetchone()
+        if row:
+            latest = (row[0], row[1])
+        db.close()
+    except Exception:
+        pass
+    return app_n, gw_alive, busy, latest
+
+
 # ---------- ZCode ----------
 def zcode_status():
     cli_n = proc_count("zcode-cli")
@@ -312,6 +346,196 @@ def zcode_status():
     return cli_n, app_on, running, latest
 
 
+# ---------- Token 用量统计（增量扫描，缓存于本地 sqlite） ----------
+USAGE_DIR = os.path.join(HOME, ".ai-statusbar")
+USAGE_DB = os.path.join(USAGE_DIR, "usage.sqlite")
+USAGE_MAX_AGE = 35 * 86400  # 只索引最近 35 天的日志文件
+
+
+def _usage_db():
+    os.makedirs(USAGE_DIR, exist_ok=True)
+    db = sqlite3.connect(USAGE_DB)
+    db.execute("""CREATE TABLE IF NOT EXISTS daily(
+        date TEXT, tool TEXT, input INT, output INT, cache INT,
+        PRIMARY KEY(date, tool))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS offsets(
+        path TEXT PRIMARY KEY, offset INT, mtime REAL)""")
+    return db
+
+
+def _local_date(ts):
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+
+
+def _add_usage(db, tool, ts, inp, outp, cache):
+    date = _local_date(ts)
+    db.execute("""INSERT INTO daily(date, tool, input, output, cache) VALUES(?,?,?,?,?)
+        ON CONFLICT(date, tool) DO UPDATE SET
+        input=input+excluded.input, output=output+excluded.output, cache=cache+excluded.cache""",
+        (date, tool, inp, outp, cache))
+
+
+def _scan_file(db, path, tool, parse):
+    """按字节偏移增量扫描追加式 jsonl，parse(line) -> (ts, input, output, cache) 或 None。"""
+    try:
+        size = os.path.getsize(path)
+        mtime = os.path.getmtime(path)
+    except Exception:
+        return
+    if NOW - mtime > USAGE_MAX_AGE:
+        return
+    row = db.execute("SELECT offset, mtime FROM offsets WHERE path=?", (path,)).fetchone()
+    offset = row[0] if row else 0
+    if row and row[0] == size and row[1] == mtime:
+        return  # 没变化
+    if size < offset:
+        offset = 0  # 文件被截断/轮转，重扫
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            raw = f.read()
+    except Exception:
+        return
+    end = raw.rfind(b"\n")
+    if end < 0:
+        return  # 没有完整行
+    complete = raw[:end]
+    for line in complete.decode("utf-8", "ignore").splitlines():
+        if not line.strip():
+            continue
+        r = parse(line)
+        if r:
+            _add_usage(db, tool, *r)
+    db.execute("INSERT INTO offsets(path, offset, mtime) VALUES(?,?,?) "
+               "ON CONFLICT(path) DO UPDATE SET offset=excluded.offset, mtime=excluded.mtime",
+               (path, offset + end + 1, mtime))
+
+
+def _parse_codex(line):
+    if "token_count" not in line:
+        return None
+    try:
+        d = json.loads(line)
+    except Exception:
+        return None
+    p = d.get("payload", {})
+    if d.get("type") != "event_msg" or p.get("type") != "token_count":
+        return None
+    try:
+        ts = datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+    u = p.get("info", {}).get("last_token_usage", {})
+    return (ts, u.get("input_tokens", 0), u.get("output_tokens", 0), u.get("cached_input_tokens", 0))
+
+
+def _parse_kimi(line):
+    if "usage.record" not in line:
+        return None
+    try:
+        d = json.loads(line)
+    except Exception:
+        return None
+    if d.get("type") != "usage.record" or not d.get("time"):
+        return None
+    u = d.get("usage", {})
+    return (d.get("time", 0) / 1000, u.get("inputOther", 0), u.get("output", 0), u.get("inputCacheRead", 0))
+
+
+def _parse_claude(line):
+    if '"usage"' not in line:
+        return None
+    try:
+        d = json.loads(line)
+    except Exception:
+        return None
+    u = d.get("message", {}).get("usage")
+    if not u or not d.get("timestamp"):
+        return None
+    try:
+        ts = datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+    return (ts, u.get("input_tokens", 0), u.get("output_tokens", 0),
+            u.get("cache_read_input_tokens", 0))
+
+
+def _parse_zcode(line):
+    if '"usage"' not in line:
+        return None
+    try:
+        d = json.loads(line)
+    except Exception:
+        return None
+    u = d.get("response", {}).get("usage")
+    ca = d.get("completedAt")
+    if not u or not ca:
+        return None
+    try:
+        ts = datetime.fromisoformat(ca.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+    return (ts, u.get("inputTokens", 0), u.get("outputTokens", 0), u.get("cacheReadTokens", 0))
+
+
+def collect_usage():
+    """增量扫描四家日志，返回今日用量。首次运行做全量索引（约数十秒）。"""
+    try:
+        db = _usage_db()
+        sources = [
+            (glob.glob(os.path.join(HOME, ".codex", "sessions", "*", "*", "*", "*.jsonl")), "codex", _parse_codex),
+            (glob.glob(os.path.join(KIMI_SESSIONS, "*", "*", "agents", "*", "wire.jsonl")), "kimi", _parse_kimi),
+            (glob.glob(os.path.join(CLAUDE_PROJECTS, "*", "*.jsonl")), "claude", _parse_claude),
+            (glob.glob(os.path.join(ZCODE_CLI, "rollout", "model-io-*.jsonl")), "zcode", _parse_zcode),
+        ]
+        for files, tool, parse in sources:
+            for f in files:
+                try:
+                    _scan_file(db, f, tool, parse)
+                except Exception:
+                    continue
+        # Hermes：session_model_usage 是累计计数，用快照差分归属到当天
+        try:
+            db.execute("""CREATE TABLE IF NOT EXISTS hermes_snap(
+                pk TEXT PRIMARY KEY, input INT, output INT, cache INT)""")
+            today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+            hdb = sqlite3.connect(f"file:{HERMES_DB}?mode=ro", uri=True)
+            rows = hdb.execute("""SELECT session_id||'|'||model||'|'||billing_provider||'|'||
+                billing_base_url||'|'||billing_mode||'|'||task,
+                input_tokens, output_tokens, cache_read_tokens, first_seen
+                FROM session_model_usage""").fetchall()
+            hdb.close()
+            for pk, inp, outp, cache, first_seen in rows:
+                prev = db.execute("SELECT input, output, cache FROM hermes_snap WHERE pk=?", (pk,)).fetchone()
+                db.execute("INSERT INTO hermes_snap(pk, input, output, cache) VALUES(?,?,?,?) "
+                           "ON CONFLICT(pk) DO UPDATE SET input=excluded.input, "
+                           "output=excluded.output, cache=excluded.cache", (pk, inp, outp, cache))
+                if prev is None:
+                    # 首次见到：只有今天才开始累计的行才全额计入，否则只建基线
+                    if first_seen and first_seen >= today_start:
+                        _add_usage(db, "hermes", NOW, inp, outp, cache)
+                else:
+                    di, do, dc = max(0, inp - prev[0]), max(0, outp - prev[1]), max(0, cache - prev[2])
+                    if di or do or dc:
+                        _add_usage(db, "hermes", NOW, di, do, dc)
+        except Exception:
+            pass
+        db.commit()
+        today = datetime.now().strftime("%Y-%m-%d")
+        rows = db.execute("SELECT tool, input, output, cache FROM daily WHERE date=?", (today,)).fetchall()
+        db.close()
+    except Exception:
+        return None
+    tools = {}
+    total = {"input": 0, "output": 0, "cache": 0}
+    for tool, inp, outp, cache in rows:
+        tools[tool] = {"input": inp, "output": outp, "cache": cache}
+        total["input"] += inp
+        total["output"] += outp
+        total["cache"] += cache
+    return {"date": datetime.now().strftime("%-m月%-d日"), "tools": tools, "total": total}
+
+
 def state_of(proc_on, busy):
     if busy:
         return "busy"
@@ -323,12 +547,14 @@ def collect():
     codex_n, codex_app_n, codex = codex_status()
     kimi_n, kimi_busy, kimi_latest = kimi_status()
     claude_n, claude_busy, claude_latest = claude_status()
+    hermes_n, hermes_gw, hermes_busy, hermes_latest = hermes_status()
     zcode_cli_n, zcode_app, zcode_running, zcode_latest = zcode_status()
 
     cs_ide = state_of(codex_app_n > 0, codex["ide"]["busy"])
     cs_cli = state_of(codex_n > 0, codex["cli"]["busy"])
     ks = state_of(kimi_n > 0, kimi_busy)
     ls_ = state_of(claude_n > 0, claude_busy)
+    hs = state_of(hermes_n > 0 or hermes_gw, hermes_busy)
     zs = state_of(zcode_cli_n > 0 or zcode_app, zcode_running)
 
     def tool(key, letter, name, st, busy_titles, latest, detail_off):
@@ -351,10 +577,14 @@ def collect():
              codex["cli"]["latest"], f"{codex_n} 个进程"),
         tool("kimi", "K", "Kimi Code", ks, kimi_busy, kimi_latest, f"{kimi_n} 个进程"),
         tool("claude", "L", "Claude Code", ls_, claude_busy, claude_latest, f"{claude_n} 个进程"),
+        tool("hermes", "H", "Hermes", hs, hermes_busy, hermes_latest,
+             "在线" if (hermes_n or hermes_gw) else "无进程"),
         tool("zcode", "Z", "ZCode", zs, zcode_running, zcode_latest,
              "App 在线" if zcode_app else "无进程"),
     ]
-    return {"updated_at": datetime.now().strftime("%H:%M:%S"), "tools": tools}
+    return {"updated_at": datetime.now().strftime("%H:%M:%S"),
+            "tools": tools,
+            "usage": collect_usage()}
 
 
 # ---------- SwiftBar 输出 ----------
@@ -380,7 +610,7 @@ def render_swiftbar(data):
         if t["latest_title"] and not t["busy_titles"]:
             out.append(f"最近任务：{t['latest_title']} · {t['latest_age']} | size=11 color=gray")
         out.append("---")
-    out.append("C=Codex App  X=Codex CLI  K=Kimi  L=Claude  Z=ZCode | size=10 color=gray")
+    out.append("C=Codex App  X=Codex CLI  K=Kimi  L=Claude  H=Hermes  Z=ZCode | size=10 color=gray")
     out.append("🟢工作中  🟡空闲  ⚪️未运行 | size=10 color=gray")
     out.append("刷新 | refresh=true")
     return "\n".join(out)
