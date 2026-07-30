@@ -65,11 +65,45 @@ final class StatusStore: ObservableObject {
     }
 }
 
+// MARK: - 卡片背景：非液态玻璃系统（macOS 15 及以下）的回退材质
+// macOS 26+ 由 AppKit 的 NSGlassEffectView 提供官方液态玻璃，不走这里
+
+struct GlassCard: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .background(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                    .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .stroke(Color.white.opacity(0.08)))
+                    .shadow(color: .black.opacity(0.4), radius: 16, y: 8)
+            )
+    }
+}
+
+/// bare=true 时背景由外层 NSGlassEffectView 提供，SwiftUI 不再画任何背景
+struct ConditionalGlass: ViewModifier {
+    let bare: Bool
+    func body(content: Content) -> some View {
+        if bare {
+            content
+        } else {
+            content.modifier(GlassCard())
+        }
+    }
+}
+
+// MARK: - 可拖动的 HostingView：让 isMovableByWindowBackground 生效（原生拖动，零抖动）
+
+final class DraggableHostingView<Content: View>: NSHostingView<Content> {
+    override var mouseDownCanMoveWindow: Bool { true }
+}
+
 // MARK: - 桌面浮窗内容
 
 struct PanelView: View {
     @ObservedObject var store: StatusStore
-    @State private var lastDrag = CGSize.zero
+    var bare = false  // true = 背景由外层 NSGlassEffectView 提供，SwiftUI 不再画背景
     @AppStorage("panelPinned") private var pinned = true
 
     var body: some View {
@@ -143,12 +177,7 @@ struct PanelView: View {
         .padding(.top, 12)
         .padding(.bottom, 10)
         .frame(width: 300)  // 固定宽度，长标题自动省略号
-        .background(
-            RoundedRectangle(cornerRadius: 16)
-                .fill(.ultraThinMaterial)
-                .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.white.opacity(0.08)))
-                .shadow(color: .black.opacity(0.4), radius: 16, y: 8)
-        )
+        .modifier(ConditionalGlass(bare: bare))
         .environment(\.colorScheme, .dark)
         .contextMenu {
             Button(pinned ? "取消置顶" : "置顶") {
@@ -159,23 +188,6 @@ struct PanelView: View {
             Button("退出 AIStatusBar") { NSApp.terminate(nil) }
         }
         .onAppear { applyLevel() }
-        .gesture(
-            DragGesture(minimumDistance: 3)
-                .onChanged { v in
-                    guard let w = NSApp.windows.first(where: { $0.identifier?.rawValue == "AIStatusPanel" }) else { return }
-                    var o = w.frame.origin
-                    o.x += v.translation.width - lastDrag.width
-                    o.y -= v.translation.height - lastDrag.height
-                    w.setFrameOrigin(o)
-                    lastDrag = v.translation
-                }
-                .onEnded { _ in
-                    lastDrag = .zero
-                    if let w = NSApp.windows.first(where: { $0.identifier?.rawValue == "AIStatusPanel" }) {
-                        UserDefaults.standard.set(NSStringFromPoint(w.frame.origin), forKey: "panelOrigin")
-                    }
-                }
-        )
     }
 
     private func applyLevel() {
@@ -206,7 +218,7 @@ struct PanelView: View {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var panel: NSPanel!
-    private var hosting: NSHostingView<PanelView>!
+    private var hosting: DraggableHostingView<PanelView>!
     private var store: StatusStore!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -228,14 +240,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: 菜单栏标题
 
+    /// 菜单栏富文本徽标：字母(系统色) + 小圆点(状态色) + 任务数
+    private func badgeTitle(_ tools: [ToolStatus]) -> NSAttributedString {
+        let out = NSMutableAttributedString()
+        let letterAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .medium),
+        ]
+        for (i, t) in tools.enumerated() {
+            out.append(NSAttributedString(string: t.letter, attributes: letterAttrs))
+            let dotColor: NSColor
+            switch t.state {
+            case "busy": dotColor = .systemGreen
+            case "idle": dotColor = .systemYellow
+            default: dotColor = .systemGray
+            }
+            out.append(NSAttributedString(string: "●", attributes: [
+                .font: NSFont.systemFont(ofSize: 7, weight: .bold),
+                .foregroundColor: dotColor,
+                .baselineOffset: 2.5,
+                .kern: -1,
+            ]))
+            if t.state == "busy" {
+                out.append(NSAttributedString(string: "\(t.busyCount)", attributes: [
+                    .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .bold),
+                    .foregroundColor: NSColor.systemGreen,
+                ]))
+            }
+            if i < tools.count - 1 {
+                out.append(NSAttributedString(string: "  ", attributes: letterAttrs))
+            }
+        }
+        return out
+    }
+
     @objc private func onStatusUpdated() {
         guard let data = store.data else { return }
-        let badge: (ToolStatus) -> String = { t in
-            t.state == "busy" ? "\(t.letter)🟢\(t.busyCount)" : "\(t.letter)\(self.mark(t.state))"
-        }
         let visible = data.tools.filter { $0.state != "off" }
         // 全部未运行时保留一个占位徽标，保证菜单入口还在
-        statusItem.button?.title = visible.isEmpty ? "AI⚪️" : visible.map(badge).joined(separator: " ")
+        statusItem.button?.attributedTitle = visible.isEmpty
+            ? badgeTitle([ToolStatus(key: "_", letter: "AI", name: "", state: "off",
+                                     busyCount: 0, busyTitles: [], detail: "",
+                                     latestTitle: nil, latestAge: nil)])
+            : badgeTitle(visible)
 
         // 浮窗尺寸跟随内容
         hosting.layout()
@@ -304,11 +350,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                 action: #selector(togglePanel), keyEquivalent: "p")
         toggle.target = self
         menu.addItem(toggle)
+        let pinned = UserDefaults.standard.object(forKey: "panelPinned") == nil
+            ? true : UserDefaults.standard.bool(forKey: "panelPinned")
+        let pin = NSMenuItem(title: "置顶桌面卡片", action: #selector(togglePin), keyEquivalent: "t")
+        pin.target = self
+        pin.state = pinned ? .on : .off
+        menu.addItem(pin)
         let refresh = NSMenuItem(title: "刷新", action: #selector(doRefresh), keyEquivalent: "r")
         refresh.target = self
         menu.addItem(refresh)
         menu.addItem(.separator())
-        let legend = NSMenuItem(title: "C=Codex桌面/IDE  X=Codex CLI  K=Kimi  L=Claude  Z=ZCode", action: nil, keyEquivalent: "")
+        let legend = NSMenuItem(title: "C=Codex App  X=Codex CLI  K=Kimi  L=Claude  Z=ZCode", action: nil, keyEquivalent: "")
         legend.isEnabled = false
         legend.attributedTitle = NSAttributedString(string: legend.title, attributes: [
             .font: NSFont.systemFont(ofSize: 10),
@@ -322,11 +374,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: 桌面浮窗
 
     private func buildPanel() {
-        hosting = NSHostingView(rootView: PanelView(store: store))
+        // macOS 26+：用 AppKit 官方液态玻璃 NSGlassEffectView 做容器
+        let systemGlass: Bool
+        if #available(macOS 26.0, *) { systemGlass = true } else { systemGlass = false }
+        hosting = DraggableHostingView(rootView: PanelView(store: store, bare: systemGlass))
+        hosting.wantsLayer = true
+        hosting.layer?.backgroundColor = NSColor.clear.cgColor  // 防止透明窗口边缘泛灰
         panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 320, height: 200),
                         styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.identifier = NSUserInterfaceItemIdentifier("AIStatusPanel")
-        panel.contentView = hosting
+        if #available(macOS 26.0, *) {
+            let glass = NSGlassEffectView(frame: NSRect(x: 0, y: 0, width: 320, height: 200))
+            glass.cornerRadius = 18
+            glass.contentView = hosting
+            panel.contentView = glass
+        } else {
+            panel.contentView = hosting
+        }
         let pinned = UserDefaults.standard.object(forKey: "panelPinned") == nil
             ? true : UserDefaults.standard.bool(forKey: "panelPinned")
         panel.isFloatingPanel = pinned
@@ -337,6 +401,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.hasShadow = false
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
+        panel.isMovableByWindowBackground = true  // 原生拖动：系统处理，不抖不丢帧
+        // 拖动结束（含实时拖动过程中）持久化位置
+        NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification,
+                                               object: panel, queue: .main) { [weak self] _ in
+            guard let f = self?.panel.frame else { return }
+            UserDefaults.standard.set(NSStringFromPoint(f.origin), forKey: "panelOrigin")
+        }
 
         hosting.layout()
         panel.setContentSize(hosting.fittingSize)
@@ -359,6 +430,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let show = !panel.isVisible
         UserDefaults.standard.set(show, forKey: "panelVisible")
         if show { panel.orderFront(nil) } else { panel.orderOut(nil) }
+    }
+
+    @objc private func togglePin() {
+        let current = UserDefaults.standard.object(forKey: "panelPinned") == nil
+            ? true : UserDefaults.standard.bool(forKey: "panelPinned")
+        let pinned = !current
+        UserDefaults.standard.set(pinned, forKey: "panelPinned")
+        panel.isFloatingPanel = pinned
+        panel.level = pinned ? .floating : .normal
+        if pinned {
+            panel.orderFront(nil)  // 置顶时顺手提到最前，避免找不到
+        }
     }
 
     @objc private func doRefresh() {

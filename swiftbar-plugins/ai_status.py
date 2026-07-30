@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""AI CLI 状态采集核心：Codex 桌面/IDE、Codex CLI、Kimi Code、ZCode。
+"""AI CLI 状态采集核心：Codex App、Codex CLI、Kimi Code、Claude Code、ZCode。
 默认输出 SwiftBar 格式，--json 输出 JSON 供 Übersicht 小组件使用。"""
 
 import glob
@@ -345,15 +345,14 @@ def collect():
         }
 
     tools = [
-        tool("codex-ide", "C", "Codex 桌面/IDE", cs_ide, codex["ide"]["busy"],
+        tool("codex-ide", "C", "Codex App", cs_ide, codex["ide"]["busy"],
              codex["ide"]["latest"], "App 在线" if codex_app_n else "无进程"),
         tool("codex-cli", "X", "Codex CLI", cs_cli, codex["cli"]["busy"],
              codex["cli"]["latest"], f"{codex_n} 个进程"),
         tool("kimi", "K", "Kimi Code", ks, kimi_busy, kimi_latest, f"{kimi_n} 个进程"),
         tool("claude", "L", "Claude Code", ls_, claude_busy, claude_latest, f"{claude_n} 个进程"),
         tool("zcode", "Z", "ZCode", zs, zcode_running, zcode_latest,
-             " + ".join(([("App")] if zcode_app else []) +
-                        ([f"{zcode_cli_n} CLI"] if zcode_cli_n else [])) or "无进程"),
+             "App 在线" if zcode_app else "无进程"),
     ]
     return {"updated_at": datetime.now().strftime("%H:%M:%S"), "tools": tools}
 
@@ -381,7 +380,7 @@ def render_swiftbar(data):
         if t["latest_title"] and not t["busy_titles"]:
             out.append(f"最近任务：{t['latest_title']} · {t['latest_age']} | size=11 color=gray")
         out.append("---")
-    out.append("C=Codex桌面/IDE  X=Codex CLI  K=Kimi  L=Claude  Z=ZCode | size=10 color=gray")
+    out.append("C=Codex App  X=Codex CLI  K=Kimi  L=Claude  Z=ZCode | size=10 color=gray")
     out.append("🟢工作中  🟡空闲  ⚪️未运行 | size=10 color=gray")
     out.append("刷新 | refresh=true")
     return "\n".join(out)
