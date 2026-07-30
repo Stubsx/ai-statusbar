@@ -88,7 +88,7 @@ struct GlassCard: ViewModifier {
                 RoundedRectangle(cornerRadius: 18, style: .continuous)
                     .fill(.ultraThinMaterial)
                     .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(Color.white.opacity(0.08)))
+                        .stroke(Color.primary.opacity(0.12)))
                     .shadow(color: .black.opacity(0.4), radius: 16, y: 8)
             )
     }
@@ -126,7 +126,7 @@ struct PanelView: View {
                 Text("AI AGENTS")
                     .font(.system(size: 11, weight: .semibold))
                     .tracking(1)
-                    .foregroundColor(.white.opacity(0.45))
+                    .foregroundColor(.secondary)
                 Spacer()
                 tabButton("状态", "status")
                 tabButton("用量", "usage")
@@ -140,7 +140,7 @@ struct PanelView: View {
                 if visible.isEmpty {
                     Text("全部未运行")
                         .font(.system(size: 11))
-                        .foregroundColor(.white.opacity(0.35))
+                        .foregroundColor(.secondary.opacity(0.7))
                         .padding(.vertical, 4)
                 }
                 ForEach(visible, id: \.key) { t in
@@ -155,7 +155,7 @@ struct PanelView: View {
                             Spacer()
                             Text(t.state == "busy" ? label(for: t.state) : "\(label(for: t.state)) · \(t.detail)")
                                 .font(.system(size: 11))
-                                .foregroundColor(.white.opacity(0.55))
+                                .foregroundColor(.secondary)
                             if t.state == "busy" {
                                 Text("\(t.busyCount)")
                                     .font(.system(size: 11, weight: .bold))
@@ -175,7 +175,7 @@ struct PanelView: View {
                         if t.busyTitles.isEmpty, let latest = t.latestTitle {
                             Text("最近：\(latest) · \(t.latestAge ?? "")")
                                 .font(.system(size: 10))
-                                .foregroundColor(.white.opacity(0.35))
+                                .foregroundColor(.secondary.opacity(0.7))
                                 .lineLimit(1)
                                 .truncationMode(.tail)
                                 .padding(.leading, 18)
@@ -186,7 +186,7 @@ struct PanelView: View {
             } else {
                 Text("加载中…")
                     .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.55))
+                    .foregroundColor(.secondary)
             }
         }
         .padding(.horizontal, 16)
@@ -194,7 +194,6 @@ struct PanelView: View {
         .padding(.bottom, 10)
         .frame(width: 300)  // 固定宽度，长标题自动省略号
         .modifier(ConditionalGlass(bare: bare))
-        .environment(\.colorScheme, .dark)
         .contextMenu {
             Button(pinned ? "取消置顶" : "置顶") {
                 pinned.toggle()
@@ -210,10 +209,10 @@ struct PanelView: View {
         Button(action: { tab = id }) {
             Text(title)
                 .font(.system(size: 10, weight: tab == id ? .semibold : .regular))
-                .foregroundColor(tab == id ? .white.opacity(0.9) : .white.opacity(0.4))
+                .foregroundColor(tab == id ? Color.primary : Color.secondary)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 3)
-                .background(Capsule().fill(tab == id ? Color.white.opacity(0.16) : Color.white.opacity(0.06)))
+                .background(Capsule().fill(tab == id ? Color.primary.opacity(0.16) : Color.primary.opacity(0.06)))
         }
         .buttonStyle(.plain)
     }
@@ -227,12 +226,12 @@ struct PanelView: View {
                     Spacer()
                     Text("输入 / 缓存 / 输出")
                         .font(.system(size: 9))
-                        .foregroundColor(.white.opacity(0.35))
+                        .foregroundColor(.secondary.opacity(0.7))
                 }
-                .foregroundColor(.white.opacity(0.6))
+                .foregroundColor(.secondary)
                 .padding(.bottom, 4)
                 usageRow("总计", u.total, bold: true)
-                Divider().background(Color.white.opacity(0.1))
+                Divider().background(Color.primary.opacity(0.1))
                 ForEach(["codex", "kimi", "claude", "zcode", "hermes"], id: \.self) { key in
                     if let e = u.tools[key] {
                         usageRow(usageName(key), e, bold: false)
@@ -241,7 +240,7 @@ struct PanelView: View {
             } else {
                 Text("统计中…（首次全量索引约需几秒）")
                     .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.55))
+                    .foregroundColor(.secondary)
             }
         }
     }
@@ -250,11 +249,11 @@ struct PanelView: View {
         HStack {
             Text(name)
                 .font(.system(size: 12, weight: bold ? .semibold : .medium))
-                .foregroundColor(bold ? .white.opacity(0.95) : .white.opacity(0.8))
+                .foregroundColor(bold ? Color.primary : Color.primary.opacity(0.8))
             Spacer()
             Text("\(fmt(e.input)) / \(fmt(e.cache)) / \(fmt(e.output))")
                 .font(.system(size: 11, weight: bold ? .semibold : .regular).monospacedDigit())
-                .foregroundColor(bold ? .white.opacity(0.9) : .white.opacity(0.6))
+                .foregroundColor(bold ? Color.primary.opacity(0.9) : Color.secondary)
         }
         .padding(.vertical, 4)
     }
