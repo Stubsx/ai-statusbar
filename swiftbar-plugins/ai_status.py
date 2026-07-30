@@ -12,12 +12,25 @@ import sys
 import time
 from datetime import datetime, timezone
 
+def latest_glob(pattern):
+    """匹配一组版本化路径，取最近修改的一个（如 state_5.sqlite、v2/）。"""
+    matches = glob.glob(pattern)
+    if not matches:
+        return None
+    try:
+        return max(matches, key=os.path.getmtime)
+    except Exception:
+        return matches[0]
+
+
 HOME = os.path.expanduser("~")
 CODEX_INDEX = os.path.join(HOME, ".codex", "session_index.jsonl")
-CODEX_DB = os.path.join(HOME, ".codex", "state_5.sqlite")
+CODEX_DB = latest_glob(os.path.join(HOME, ".codex", "state_*.sqlite")) \
+    or os.path.join(HOME, ".codex", "state_5.sqlite")
 KIMI_SESSIONS = os.path.join(HOME, ".kimi-code", "sessions")
 CLAUDE_PROJECTS = os.path.join(HOME, ".claude", "projects")
-ZCODE_DB = os.path.join(HOME, ".zcode", "v2", "tasks-index.sqlite")
+ZCODE_DB = latest_glob(os.path.join(HOME, ".zcode", "v*", "tasks-index.sqlite")) \
+    or os.path.join(HOME, ".zcode", "v2", "tasks-index.sqlite")
 ZCODE_CLI = os.path.join(HOME, ".zcode", "cli")
 ZCODE_BUSY_SEC = 300  # model-io/artifacts 5 分钟内有写入算工作中
 
@@ -86,6 +99,9 @@ def codex_status():
     # 桌面版/IDE 版的线程标题都在 state_5.sqlite 的 threads 表里
     try:
         db = sqlite3.connect(f"file:{CODEX_DB}?mode=ro", uri=True)
+        cols = {r[1] for r in db.execute("PRAGMA table_info(threads)")}
+        if not {"id", "title", "updated_at", "source"} <= cols:
+            raise RuntimeError(f"threads 表结构不兼容: {sorted(cols)}")
         for tid, title, updated, source in db.execute(
                 "SELECT id, title, updated_at, source FROM threads WHERE archived=0"):
             if tid:
@@ -260,6 +276,9 @@ def zcode_status():
     try:
         db = sqlite3.connect(f"file:{ZCODE_DB}?mode=ro", uri=True)
         cur = db.cursor()
+        cols = {r[1] for r in cur.execute("PRAGMA table_info(tasks)")}
+        if not {"task_id", "title", "updated_at"} <= cols:
+            raise RuntimeError(f"tasks 表结构不兼容: {sorted(cols)}")
         cur.execute("SELECT task_id, title FROM tasks WHERE deleted=0")
         titles = dict(cur.fetchall())
         cur.execute("""SELECT title, updated_at/1000 FROM tasks
