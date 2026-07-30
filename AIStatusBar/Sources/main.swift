@@ -21,10 +21,18 @@ struct UsageEntry: Codable {
     let cache: Int
 }
 
+struct HeatDay: Codable {
+    let date: String
+    let total: Int
+    let future: Bool
+}
+
 struct UsageData: Codable {
     let date: String
     let tools: [String: UsageEntry]
     let total: UsageEntry
+    let heatmap: [HeatDay]?
+    let heatmax: Int?
 }
 
 struct StatusData: Codable {
@@ -130,10 +138,13 @@ struct PanelView: View {
                 Spacer()
                 tabButton("状态", "status")
                 tabButton("用量", "usage")
+                tabButton("活跃", "heat")
             }
             .padding(.bottom, 8)
 
-            if tab == "usage" {
+            if tab == "heat" {
+                heatView
+            } else if tab == "usage" {
                 usageView
             } else if let tools = store.data?.tools {
                 let visible = tools.filter { $0.state != "off" }  // 未运行的不显示
@@ -256,6 +267,79 @@ struct PanelView: View {
                 .foregroundColor(bold ? Color.primary.opacity(0.9) : Color.secondary)
         }
         .padding(.vertical, 4)
+    }
+
+    // MARK: 活跃热力图（GitHub 风格：列=周，行=周一~周日）
+
+    @State private var hoveredDay: HeatDay? = nil
+
+    private var heatView: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let h = store.data?.usage?.heatmap, !h.isEmpty {
+                let heatmax = store.data?.usage?.heatmax ?? 0
+                let cols = h.count / 7
+                // 网格：固定尺寸方块，统一填充样式保证排列均匀
+                HStack(spacing: 3) {
+                    ForEach(0..<cols, id: \.self) { c in
+                        VStack(spacing: 3) {
+                            ForEach(0..<7, id: \.self) { r in
+                                let day = h[c * 7 + r]
+                                RoundedRectangle(cornerRadius: 3, style: .continuous)
+                                    .fill(heatColor(day: day, max: heatmax))
+                                    .frame(width: 15, height: 15)
+                                    .onHover { inside in
+                                        hoveredDay = inside ? day : nil
+                                    }
+                            }
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .center)
+
+                // 底部信息行：hover 显示当天详情，否则显示图例（高度固定不跳动）
+                HStack {
+                    if let d = hoveredDay {
+                        Text("\(d.date) · \(fmt(d.total)) tokens")
+                            .font(.system(size: 10, weight: .medium).monospacedDigit())
+                            .foregroundColor(.secondary)
+                    } else {
+                        Text("较少")
+                            .font(.system(size: 9))
+                            .foregroundColor(.secondary.opacity(0.7))
+                        ForEach(0..<5, id: \.self) { lv in
+                            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                                .fill(heatColor(level: lv))
+                                .frame(width: 9, height: 9)
+                        }
+                        Text("较多")
+                            .font(.system(size: 9))
+                            .foregroundColor(.secondary.opacity(0.7))
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .center)
+                .frame(height: 14)
+            } else {
+                Text("统计中…")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(.top, 2)
+    }
+
+    /// 统一着色：future 透明，level 0 浅灰实心，1~4 蓝色递增（无描边，避免视觉错位）
+    private func heatColor(day: HeatDay, max heatmax: Int) -> Color {
+        day.future ? Color.clear : heatColor(level: heatLevel(day.total, heatmax))
+    }
+
+    private func heatColor(level: Int) -> Color {
+        level == 0 ? Color.primary.opacity(0.1) : Color.blue.opacity(0.22 + 0.195 * Double(level))
+    }
+
+    private func heatLevel(_ v: Int, _ maxV: Int) -> Int {
+        if v <= 0 || maxV <= 0 { return 0 }
+        let r = log(1 + Double(v)) / log(1 + Double(maxV))  // 对数分档，兼顾大小量级的日子
+        return min(4, max(1, Int((r * 4).rounded(.up))))
     }
 
     private func usageName(_ key: String) -> String {
@@ -481,6 +565,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
         panel.isMovableByWindowBackground = true  // 原生拖动：系统处理，不抖不丢帧
+        panel.acceptsMouseMovedEvents = true    // 保证热力图 hover 生效
         // 拖动结束（含实时拖动过程中）持久化位置
         NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification,
                                                object: panel, queue: .main) { [weak self] _ in

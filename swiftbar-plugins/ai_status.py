@@ -10,7 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 def latest_glob(pattern):
     """匹配一组版本化路径，取最近修改的一个（如 state_5.sqlite、v2/）。"""
@@ -349,7 +349,7 @@ def zcode_status():
 # ---------- Token 用量统计（增量扫描，缓存于本地 sqlite） ----------
 USAGE_DIR = os.path.join(HOME, ".ai-statusbar")
 USAGE_DB = os.path.join(USAGE_DIR, "usage.sqlite")
-USAGE_MAX_AGE = 35 * 86400  # 只索引最近 35 天的日志文件
+USAGE_MAX_AGE = 70 * 86400  # 只索引最近 70 天的日志文件（热力图需要 10 周）
 
 
 def _usage_db():
@@ -533,7 +533,34 @@ def collect_usage():
         total["input"] += inp
         total["output"] += outp
         total["cache"] += cache
-    return {"date": datetime.now().strftime("%-m月%-d日"), "tools": tools, "total": total}
+
+    # 热力图：近 10 周逐天 token 总量（输入+输出，缓存不计避免重复），起点对齐到周一
+    heatmap, heatmax = [], 0
+    try:
+        db = _usage_db()
+        per_day = dict(db.execute(
+            "SELECT date, SUM(input + output) FROM daily GROUP BY date").fetchall())
+        db.close()
+        start_ts = NOW - 69 * 86400
+        start = datetime.fromtimestamp(start_ts)
+        start -= timedelta(days=start.weekday())  # 对齐周一
+        days = []
+        d = start
+        end = datetime.now()
+        while d <= end:
+            days.append(d)
+            d += timedelta(days=1)
+        while len(days) % 7:  # 凑满整周
+            days.append(days[-1] + timedelta(days=1))
+        for d in days:
+            key = d.strftime("%Y-%m-%d")
+            v = per_day.get(key, 0)
+            heatmap.append({"date": key, "total": v, "future": d.date() > end.date()})
+            heatmax = max(heatmax, v)
+    except Exception:
+        pass
+    return {"date": datetime.now().strftime("%-m月%-d日"), "tools": tools, "total": total,
+            "heatmap": heatmap, "heatmax": heatmax}
 
 
 def state_of(proc_on, busy):
