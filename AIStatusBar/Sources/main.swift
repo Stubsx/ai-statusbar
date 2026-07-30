@@ -277,6 +277,7 @@ struct PanelView: View {
         VStack(alignment: .leading, spacing: 8) {
             if let h = store.data?.usage?.heatmap, !h.isEmpty {
                 let heatmax = store.data?.usage?.heatmax ?? 0
+                let heatmin = h.filter { $0.total > 0 }.map { $0.total }.min() ?? 0
                 let cols = h.count / 7
                 // 网格：固定尺寸方块，统一填充样式保证排列均匀
                 HStack(spacing: 3) {
@@ -285,7 +286,7 @@ struct PanelView: View {
                             ForEach(0..<7, id: \.self) { r in
                                 let day = h[c * 7 + r]
                                 RoundedRectangle(cornerRadius: 3, style: .continuous)
-                                    .fill(heatColor(day: day, max: heatmax))
+                                    .fill(heatColor(day: day, min: heatmin, max: heatmax))
                                     .frame(width: 15, height: 15)
                                     .onHover { inside in
                                         hoveredDay = inside ? day : nil
@@ -306,11 +307,14 @@ struct PanelView: View {
                         Text("较少")
                             .font(.system(size: 9))
                             .foregroundColor(.secondary.opacity(0.7))
-                        ForEach(0..<5, id: \.self) { lv in
-                            RoundedRectangle(cornerRadius: 2, style: .continuous)
-                                .fill(heatColor(level: lv))
-                                .frame(width: 9, height: 9)
-                        }
+                        RoundedRectangle(cornerRadius: 2, style: .continuous)
+                            .fill(Color.primary.opacity(0.1))
+                            .frame(width: 9, height: 9)
+                        RoundedRectangle(cornerRadius: 4.5, style: .continuous)
+                            .fill(LinearGradient(
+                                colors: [Color.blue.opacity(0.15), Color.blue],
+                                startPoint: .leading, endPoint: .trailing))
+                            .frame(width: 36, height: 9)
                         Text("较多")
                             .font(.system(size: 9))
                             .foregroundColor(.secondary.opacity(0.7))
@@ -327,19 +331,18 @@ struct PanelView: View {
         .padding(.top, 2)
     }
 
-    /// 统一着色：future 透明，level 0 浅灰实心，1~4 蓝色递增（无描边，避免视觉错位）
-    private func heatColor(day: HeatDay, max heatmax: Int) -> Color {
-        day.future ? Color.clear : heatColor(level: heatLevel(day.total, heatmax))
+    /// 连续渐变：0 = 浅灰，非零按对数归一化连续映射蓝色透明度（不分档）
+    private func heatColor(day: HeatDay, min heatmin: Int, max heatmax: Int) -> Color {
+        if day.future { return Color.clear }
+        if day.total <= 0 || heatmax <= 0 { return Color.primary.opacity(0.1) }
+        return Color.blue.opacity(0.15 + 0.85 * heatRatio(day.total, min: heatmin, max: heatmax))
     }
 
-    private func heatColor(level: Int) -> Color {
-        level == 0 ? Color.primary.opacity(0.1) : Color.blue.opacity(0.22 + 0.195 * Double(level))
-    }
-
-    private func heatLevel(_ v: Int, _ maxV: Int) -> Int {
-        if v <= 0 || maxV <= 0 { return 0 }
-        let r = log(1 + Double(v)) / log(1 + Double(maxV))  // 对数分档，兼顾大小量级的日子
-        return min(4, max(1, Int((r * 4).rounded(.up))))
+    /// 以「最小非零日」为下界的对数归一化，输出 0~1
+    private func heatRatio(_ v: Int, min minV: Int, max maxV: Int) -> Double {
+        let lo = log(Double(max(minV, 1))), hi = log(Double(maxV))
+        if hi <= lo { return 1 }
+        return min(1, max(0, (log(Double(v)) - lo) / (hi - lo)))
     }
 
     private func usageName(_ key: String) -> String {
