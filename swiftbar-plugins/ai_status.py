@@ -475,7 +475,10 @@ def _usage_db():
         date TEXT, tool TEXT, input INT, output INT, cache INT,
         PRIMARY KEY(date, tool))""")
     db.execute("""CREATE TABLE IF NOT EXISTS offsets(
-        path TEXT PRIMARY KEY, offset INT, mtime REAL)""")
+        path TEXT PRIMARY KEY, offset INT, mtime REAL, last_key TEXT)""")
+    cols = {r[1] for r in db.execute("PRAGMA table_info(offsets)")}
+    if "last_key" not in cols:
+        db.execute("ALTER TABLE offsets ADD COLUMN last_key TEXT")
     return db
 
 
@@ -500,8 +503,9 @@ def _scan_file(db, path, tool, parse):
         return
     if NOW - mtime > USAGE_MAX_AGE:
         return
-    row = db.execute("SELECT offset, mtime FROM offsets WHERE path=?", (path,)).fetchone()
+    row = db.execute("SELECT offset, mtime, last_key FROM offsets WHERE path=?", (path,)).fetchone()
     offset = row[0] if row else 0
+    prev_key = row[2] if row else None
     if row and row[0] == size and row[1] == mtime:
         return  # 没变化
     if size < offset:
@@ -521,10 +525,15 @@ def _scan_file(db, path, tool, parse):
             continue
         r = parse(line)
         if r:
-            _add_usage(db, tool, *r)
-    db.execute("INSERT INTO offsets(path, offset, mtime) VALUES(?,?,?) "
-               "ON CONFLICT(path) DO UPDATE SET offset=excluded.offset, mtime=excluded.mtime",
-               (path, offset + end + 1, mtime))
+            # 相邻完全重复事件跳过（codex rollout 会重复写同一 token_count）
+            key = f"{r[1]}:{r[2]}:{r[3]}"
+            if key != prev_key:
+                _add_usage(db, tool, *r)
+                prev_key = key
+    db.execute("INSERT INTO offsets(path, offset, mtime, last_key) VALUES(?,?,?,?) "
+               "ON CONFLICT(path) DO UPDATE SET offset=excluded.offset, mtime=excluded.mtime, "
+               "last_key=excluded.last_key",
+               (path, offset + end + 1, mtime, prev_key))
 
 
 def _parse_codex(line):
