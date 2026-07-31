@@ -670,7 +670,7 @@ def collect_usage():
     try:
         db = _usage_db()
         per_day = dict(db.execute(
-            "SELECT date, SUM(input + output) FROM daily GROUP BY date").fetchall())
+            "SELECT date, SUM(input + output + cache) FROM daily GROUP BY date").fetchall())
         db.close()
         start_ts = NOW - 69 * 86400
         start = datetime.fromtimestamp(start_ts)
