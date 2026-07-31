@@ -65,6 +65,28 @@ def busy_sec(tool):
         return _DEFAULT_BUSY
 
 
+def api_conn_tools():
+    """探测 CLI 进程到远程 API 的 ESTABLISHED 连接（模型请求进行中必有）。
+    返回有活跃连接的工具名集合，如 {'kimi', 'claude'}。"""
+    found = set()
+    try:
+        out = subprocess.run(
+            ["lsof", "-nP", "-iTCP", "-sTCP:ESTABLISHED", "-a",
+             "-c", "codex", "-c", "kimi", "-c", "claude"],
+            capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            # 目标地址在最后一列（-> 后为远端），排除本地回环
+            if "->127.0.0.1" in line or "->[::1]" in line or "->localhost" in line:
+                continue
+            found.add(parts[0])
+    except Exception:
+        pass
+    return found
+
+
 def proc_count(basename, exclude_substrings=()):
     """按 argv[0] 的可执行文件名统计进程数，可按命令行内容排除。"""
     try:
@@ -193,16 +215,20 @@ def codex_status():
                         pending[cid] = True
                 elif t in ("function_call_output", "custom_tool_call_output"):
                     pending.pop(p.get("call_id"), None)
-        # turn 开启未收尾（最后事件是 task_started）或有未返回的工具调用，
-        # 且日志 5 分钟内有动静，才算工作中
-        if (last_task == "task_started" or pending) and NOW - mtime < busy_sec("codex"):
+        # 纯事件闭环：turn 开启未收尾（task_started 或有未返回的工具调用）
+        # 且对应进程还活着，就是工作中（卡几十分钟也算）；进程死了不算。
+        # 3 小时兜底：防止崩溃残留的未收尾 turn 永远显示工作中
+        alive = (n > 0) if kind == "cli" else (app_n > 0)
+        if (last_task == "task_started" or pending) and alive \
+                and NOW - mtime < max(busy_sec("codex"), 3 * 3600):
             r["busy"].append({"id": sid, "title": title})
     return n, app_n, res
 
 
 # ---------- Kimi Code ----------
-def kimi_status():
+def kimi_status(conns=frozenset()):
     n = proc_count("kimi")
+    keep_alive = "kimi" in conns  # 进程有到模型 API 的活跃连接 → 会话保活
     busy, latest = [], None
     for state_path in glob.glob(os.path.join(KIMI_SESSIONS, "*", "*", "state.json")):
         sdir = os.path.dirname(state_path)
@@ -217,7 +243,8 @@ def kimi_status():
         mtime = max(os.path.getmtime(w) for w in wires)
         if latest is None or mtime > latest[1]:
             latest = (title, mtime)
-        if NOW - mtime > busy_sec("kimi"):
+        # 保活只延长到 30 分钟窗口，防止历史中断会话被全部复活
+        if NOW - mtime > busy_sec("kimi") and not (keep_alive and NOW - mtime < 30 * 60):
             continue
         for w in wires:
             steps, tools = {}, {}
@@ -241,8 +268,9 @@ def kimi_status():
 
 
 # ---------- Claude Code ----------
-def claude_status():
+def claude_status(conns=frozenset()):
     n = proc_count("claude", ("Claude.app/",))  # 排除 Claude 桌面 App
+    keep_alive = "claude" in conns  # 进程有到模型 API 的活跃连接 → 会话保活
     busy, latest = [], None
     for f in glob.glob(os.path.join(CLAUDE_PROJECTS, "*", "*.jsonl")):
         try:
@@ -281,7 +309,10 @@ def claude_status():
             title = os.path.basename(os.path.dirname(f)).lstrip("-").rsplit("-", 1)[-1] or "(未命名会话)"
         if latest is None or mtime > latest[1]:
             latest = (title, mtime)
-        if NOW - mtime > busy_sec("claude") or last_msg is None:
+        # 保活只延长到 30 分钟窗口，防止历史中断会话被全部复活
+        if NOW - mtime > busy_sec("claude") and not (keep_alive and NOW - mtime < 30 * 60):
+            continue
+        if last_msg is None:
             continue
         t, kinds = last_msg
         # 最后是 user 消息（prompt 或 tool_result）说明模型正在生成；
@@ -598,8 +629,9 @@ def state_of(proc_on, busy):
 def collect():
     """采集所有工具状态，返回结构化 dict。"""
     codex_n, codex_app_n, codex = codex_status()
-    kimi_n, kimi_busy, kimi_latest = kimi_status()
-    claude_n, claude_busy, claude_latest = claude_status()
+    conns = api_conn_tools()  # 网络连接探测（B 方案）：模型请求进行中的进程有活跃连接
+    kimi_n, kimi_busy, kimi_latest = kimi_status(conns)
+    claude_n, claude_busy, claude_latest = claude_status(conns)
     hermes_n, hermes_gw, hermes_busy, hermes_latest, hermes_act = hermes_status()
     zcode_cli_n, zcode_app, zcode_running, zcode_latest, zcode_act = zcode_status()
 
