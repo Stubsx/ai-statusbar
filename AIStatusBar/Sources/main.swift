@@ -237,6 +237,7 @@ final class DraggableHostingView<Content: View>: NSHostingView<Content> {
 
 struct PanelView: View {
     @ObservedObject var store: StatusStore
+    @Environment(\.colorScheme) private var colorScheme
     var bare = false  // true = 背景由外层 NSGlassEffectView 提供，SwiftUI 不再画背景
     @AppStorage("panelPinned") private var pinned = true
     @AppStorage("panelTab") private var tab = "status"
@@ -389,8 +390,8 @@ struct PanelView: View {
     private var heatView: some View {
         VStack(alignment: .leading, spacing: 8) {
             if let h = store.data?.usage?.heatmap, !h.isEmpty {
-                let heatmax = store.data?.usage?.heatmax ?? 0
-                let heatmin = h.filter { $0.total > 0 }.map { $0.total }.min() ?? 0
+                let thresholds = heatThresholds(h)
+                let today = todayKey
                 let cols = h.count / 7
                 // 网格：固定尺寸方块，统一填充样式保证排列均匀
                 HStack(spacing: 3) {
@@ -399,8 +400,14 @@ struct PanelView: View {
                             ForEach(0..<7, id: \.self) { r in
                                 let day = h[c * 7 + r]
                                 RoundedRectangle(cornerRadius: 3, style: .continuous)
-                                    .fill(heatColor(day: day, min: heatmin, max: heatmax))
+                                    .fill(heatColor(day: day, thresholds: thresholds))
                                     .frame(width: 15, height: 15)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 3, style: .continuous)
+                                            .stroke(day.date == today && !day.future
+                                                    ? Color.primary.opacity(0.8) : Color.clear,
+                                                    lineWidth: 1)
+                                    )
                                     .onHover { inside in
                                         hoveredDay = inside ? day : nil
                                     }
@@ -413,7 +420,10 @@ struct PanelView: View {
                 // 底部信息行：hover 显示当天详情，否则显示图例（高度固定不跳动）
                 HStack {
                     if let d = hoveredDay {
-                        Text("\(d.date) · \(fmt(d.total)) tokens")
+                        let level = heatLevel(d.total, thresholds: thresholds)
+                        Text(d.total > 0
+                             ? "\(d.date) · \(fmt(d.total)) tokens · \(level)/5"
+                             : "\(d.date) · 无活动")
                             .font(.system(size: 10, weight: .medium).monospacedDigit())
                             .foregroundColor(.secondary)
                     } else {
@@ -423,11 +433,13 @@ struct PanelView: View {
                         RoundedRectangle(cornerRadius: 2, style: .continuous)
                             .fill(Color.primary.opacity(0.1))
                             .frame(width: 9, height: 9)
-                        RoundedRectangle(cornerRadius: 4.5, style: .continuous)
-                            .fill(LinearGradient(
-                                colors: [Color.blue.opacity(0.15), Color.blue],
-                                startPoint: .leading, endPoint: .trailing))
-                            .frame(width: 36, height: 9)
+                        HStack(spacing: 2) {
+                            ForEach(heatPalette.indices, id: \.self) { level in
+                                RoundedRectangle(cornerRadius: 2, style: .continuous)
+                                    .fill(heatPalette[level])
+                                    .frame(width: 9, height: 9)
+                            }
+                        }
                         Text("较多")
                             .font(.system(size: 9))
                             .foregroundColor(.secondary.opacity(0.7))
@@ -444,18 +456,56 @@ struct PanelView: View {
         .padding(.top, 2)
     }
 
-    /// 连续渐变：0 = 浅灰，非零按对数归一化连续映射蓝色透明度（不分档）
-    private func heatColor(day: HeatDay, min heatmin: Int, max heatmax: Int) -> Color {
+    /// 0 = 中性灰；非零日按近十周五分位数分为五级，避免极端值压缩色差。
+    private func heatColor(day: HeatDay, thresholds: [Int]) -> Color {
         if day.future { return Color.clear }
-        if day.total <= 0 || heatmax <= 0 { return Color.primary.opacity(0.1) }
-        return Color.blue.opacity(0.15 + 0.85 * heatRatio(day.total, min: heatmin, max: heatmax))
+        if day.total <= 0 { return Color.primary.opacity(0.1) }
+        return heatPalette[heatLevel(day.total, thresholds: thresholds) - 1]
     }
 
-    /// 以「最小非零日」为下界的对数归一化，输出 0~1
-    private func heatRatio(_ v: Int, min minV: Int, max maxV: Int) -> Double {
-        let lo = log(Double(max(minV, 1))), hi = log(Double(maxV))
-        if hi <= lo { return 1 }
-        return min(1, max(0, (log(Double(v)) - lo) / (hi - lo)))
+    private func heatLevel(_ value: Int, thresholds: [Int]) -> Int {
+        guard value > 0 else { return 0 }
+        return min(5, 1 + thresholds.filter { value > $0 }.count)
+    }
+
+    private func heatThresholds(_ days: [HeatDay]) -> [Int] {
+        let values = days.filter { !$0.future && $0.total > 0 }.map(\.total).sorted()
+        guard let only = values.first else { return [] }
+        guard values.count > 1 else { return Array(repeating: only, count: 4) }
+        return [0.2, 0.4, 0.6, 0.8].map { percentile in
+            let position = Double(values.count - 1) * percentile
+            let lower = Int(position.rounded(.down))
+            let upper = Int(position.rounded(.up))
+            let fraction = position - Double(lower)
+            return Int((Double(values[lower]) * (1 - fraction)
+                        + Double(values[upper]) * fraction).rounded())
+        }
+    }
+
+    /// 保持统一蓝色色相，在明暗模式下分别调校亮度与饱和度。
+    private var heatPalette: [Color] {
+        if colorScheme == .dark {
+            return [
+                Color(red: 0.08, green: 0.14, blue: 0.24),
+                Color(red: 0.10, green: 0.23, blue: 0.40),
+                Color(red: 0.12, green: 0.37, blue: 0.62),
+                Color(red: 0.15, green: 0.54, blue: 0.85),
+                Color(red: 0.39, green: 0.72, blue: 1.00),
+            ]
+        }
+        return [
+            Color(red: 0.91, green: 0.95, blue: 1.00),
+            Color(red: 0.73, green: 0.85, blue: 1.00),
+            Color(red: 0.46, green: 0.70, blue: 0.98),
+            Color(red: 0.18, green: 0.52, blue: 0.86),
+            Color(red: 0.03, green: 0.35, blue: 0.69),
+        ]
+    }
+
+    private var todayKey: String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: Date())
     }
 
     private func usageName(_ key: String) -> String {
