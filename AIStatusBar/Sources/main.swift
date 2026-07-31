@@ -110,7 +110,8 @@ final class StatusStore: ObservableObject {
     let scriptPath: String
     let settings: SettingsStore
     private var timer: Timer?
-    private var prevBusy: [String: [String]] = [:]  // 上一轮各工具的忙碌任务，用于检测「工作中→空闲」
+    private var prevBusy: [String: [String]] = [:]   // 上一轮各工具的忙碌任务（用于通知内容）
+    private var prevState: [String: String] = [:]    // 上一轮各工具的状态（用于检测「工作中→空闲」）
 
     init(scriptPath: String, settings: SettingsStore) {
         self.scriptPath = scriptPath
@@ -148,15 +149,17 @@ final class StatusStore: ObservableObject {
         }
     }
 
-    /// 某工具从「工作中」转为空闲/未运行 → 已完成消失的忙碌任务发系统通知
+    /// 某工具从「工作中」转为空闲/未运行时发通知。
+    /// 按状态转变判断（而不是按任务标题消失），避免标题中途改名造成误报。
     private func checkTransitions(_ decoded: StatusData) {
         for t in decoded.tools {
+            let prevSt = prevState[t.key]
             let prev = prevBusy[t.key] ?? []
-            let finished = prev.filter { !t.busyTitles.contains($0) }
             let skey = SettingsStore.settingKey(for: t.key)
-            if !finished.isEmpty && settings.notifyEnabled(for: skey) {
-                notify(tool: t.name, finished: finished)
+            if prevSt == "busy" && t.state != "busy" && !prev.isEmpty && settings.notifyEnabled(for: skey) {
+                notify(tool: t.name, finished: prev)
             }
+            prevState[t.key] = t.state
             prevBusy[t.key] = t.busyTitles
         }
     }
@@ -447,6 +450,8 @@ struct PanelView: View {
         guard let w = NSApp.windows.first(where: { $0.identifier?.rawValue == "AIStatusPanel" }) as? NSPanel else { return }
         w.isFloatingPanel = pinned
         w.level = pinned ? .floating : .normal
+        // 取消置顶时去掉全屏悬浮/跨 Space 行为，否则仍浮在全屏 App 之上
+        w.collectionBehavior = pinned ? [.canJoinAllSpaces, .fullScreenAuxiliary] : []
     }
 
     private func color(for state: String) -> Color {
@@ -838,7 +843,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ? true : UserDefaults.standard.bool(forKey: "panelPinned")
         panel.isFloatingPanel = pinned
         panel.level = pinned ? .floating : .normal
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.collectionBehavior = pinned ? [.canJoinAllSpaces, .fullScreenAuxiliary] : []
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = false
@@ -902,6 +907,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         UserDefaults.standard.set(pinned, forKey: "panelPinned")
         panel.isFloatingPanel = pinned
         panel.level = pinned ? .floating : .normal
+        // 取消置顶时去掉全屏悬浮/跨 Space 行为，否则仍浮在全屏 App 之上
+        panel.collectionBehavior = pinned ? [.canJoinAllSpaces, .fullScreenAuxiliary] : []
         if pinned {
             panel.orderFront(nil)  // 置顶时顺手提到最前，避免找不到
         }
