@@ -287,20 +287,26 @@ def kimi_status():
             if not events:
                 continue
             # 只统计最新一个 turn：被打断的旧 turn 会留下永不闭环的幽灵步骤
-            max_turn = max(e.get("turnId") or "" for e in events)
+            max_turn = max((e.get("turnId") or "" for e in events
+                            if e.get("turnId") is not None), default="")
+            if not max_turn:
+                continue
             steps, tools = {}, {}
             for ev in events:
+                t = ev.get("type", "")
+                # Kimi 的 tool.result 不带 turnId，只能用 toolCallId 与当前
+                # turn 已记录的 tool.call 配对；其他事件仍严格限定为最新 turn。
+                if t == "tool.result":
+                    tools.pop(ev.get("toolCallId"), None)
+                    continue
                 if (ev.get("turnId") or "") != max_turn:
                     continue
-                t = ev.get("type", "")
                 if t == "step.begin":
                     steps[ev.get("uuid")] = True
                 elif t == "step.end":  # step.end 的 uuid 与 step.begin 相同
                     steps.pop(ev.get("uuid"), None)
                 elif t == "tool.call":
                     tools[ev.get("toolCallId")] = True
-                elif t == "tool.result":
-                    tools.pop(ev.get("toolCallId"), None)
             if steps or tools:
                 busy.append({"id": os.path.basename(sdir), "title": title})
                 break
