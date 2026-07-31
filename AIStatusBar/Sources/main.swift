@@ -466,44 +466,171 @@ struct PanelView: View {
     }
 }
 
-// MARK: - 设置窗口
+// MARK: - 设置窗口（macOS 26 风格：隐藏标题栏 + 卡片分组）
 
 struct SettingsView: View {
     @ObservedObject var settings: SettingsStore
+    @State private var notifyDiag = ""
 
     var body: some View {
-        Form {
-            Section("空闲判定时间（无活动多久后算空闲）") {
-                Picker("统一设置", selection: $settings.defaultSec) {
-                    ForEach(SettingsStore.busyOptions, id: \.self) { sec in
-                        Text(SettingsStore.labelSec(sec)).tag(sec)
-                    }
+        VStack(spacing: 16) {
+            Text("设置")
+                .font(.system(size: 20, weight: .bold))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 22)
+                .padding(.top, 34)  // 给红绿灯按钮留位
+
+            // 空闲判定时间
+            card(title: "空闲判定时间", icon: "clock", subtitle: "无活动多久后算空闲") {
+                row("统一设置") {
+                    valuePicker($settings.defaultSec,
+                                options: SettingsStore.busyOptions.map { (SettingsStore.labelSec($0), $0) })
                 }
-                ForEach(SettingsStore.tools, id: \.0) { key, name in
-                    Picker(name, selection: perToolBinding(key)) {
-                        Text("跟随统一").tag(0)
-                        ForEach(SettingsStore.busyOptions, id: \.self) { sec in
-                            Text(SettingsStore.labelSec(sec)).tag(sec)
-                        }
+                divider
+                ForEach(Array(SettingsStore.tools.enumerated()), id: \.offset) { idx, tool in
+                    row(tool.1) {
+                        valuePicker(perToolBinding(tool.0),
+                                    options: [("跟随统一", 0)] + SettingsStore.busyOptions.map { (SettingsStore.labelSec($0), $0) })
                     }
+                    if idx < SettingsStore.tools.count - 1 { divider }
                 }
             }
-            Section("离线判定（进程在但无活动，超过后按未运行处理）") {
-                Picker("无活动超过", selection: $settings.offlineAfterSec) {
-                    ForEach(SettingsStore.offlineOptions, id: \.1) { label, sec in
-                        Text(label).tag(sec)
-                    }
+
+            // 离线判定
+            card(title: "离线判定", icon: "moon.zzz", subtitle: "进程在但无活动，超过后按未运行处理") {
+                row("无活动超过") {
+                    valuePicker($settings.offlineAfterSec, options: SettingsStore.offlineOptions)
                 }
             }
-            Section("通知提醒") {
-                Toggle("任务完成时提醒（工作中 → 空闲）", isOn: $settings.notifyEnabled)
-                ForEach(SettingsStore.tools, id: \.0) { key, name in
-                    Toggle(name, isOn: notifyBinding(key))
+
+            // 通知提醒
+            card(title: "通知提醒", icon: "bell.badge", subtitle: "任务完成（工作中 → 空闲）时推送") {
+                row("开启提醒") {
+                    Toggle("", isOn: $settings.notifyEnabled)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
                 }
-                .disabled(!settings.notifyEnabled)
+                divider
+                ForEach(Array(SettingsStore.tools.enumerated()), id: \.offset) { idx, tool in
+                    row(tool.1) {
+                        Toggle("", isOn: notifyBinding(tool.0))
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .controlSize(.small)
+                    }
+                    .opacity(settings.notifyEnabled ? 1 : 0.4)
+                    if idx < SettingsStore.tools.count - 1 { divider }
+                }
+                divider
+                HStack(spacing: 10) {
+                    Button("发送测试通知", action: testNotify)
+                        .controlSize(.small)
+                    if !notifyDiag.isEmpty {
+                        Text(notifyDiag)
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                            .lineLimit(2)
+                    }
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(.bottom, 18)
+        .frame(width: 470)
+    }
+
+    // MARK: 组件
+
+    private var divider: some View {
+        Divider().padding(.leading, 12).opacity(0.5)
+    }
+
+    @ViewBuilder
+    private func card<C: View>(title: String, icon: String, subtitle: String,
+                               @ViewBuilder content: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.system(size: 11, weight: .semibold))
+                Text(title)
+                    .font(.system(size: 12, weight: .semibold))
+                Text("· " + subtitle)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+            .foregroundColor(.primary.opacity(0.8))
+            .padding(.horizontal, 4)
+
+            VStack(spacing: 0) { content() }
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Color.primary.opacity(0.045))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
+                )
+        }
+        .padding(.horizontal, 20)
+    }
+
+    private func row<C: View>(_ title: String, @ViewBuilder control: () -> C) -> some View {
+        HStack {
+            Text(title)
+                .font(.system(size: 13))
+            Spacer()
+            control()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+    }
+
+    private func valuePicker(_ selection: Binding<Int>, options: [(String, Int)]) -> some View {
+        Picker("", selection: selection) {
+            ForEach(options, id: \.1) { label, sec in
+                Text(label).tag(sec)
             }
         }
-        .frame(width: 440, height: 330)
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .controlSize(.small)
+        .frame(width: 108)
+    }
+
+    // MARK: 动作
+
+    private func testNotify() {
+        let center = UNUserNotificationCenter.current()
+        center.getNotificationSettings { s in
+            let statusText = ["未请求过", "已被拒绝", "已允许", "临时允许", "未知"][min(s.authorizationStatus.rawValue, 4)]
+            if s.authorizationStatus == .denied {
+                DispatchQueue.main.async {
+                    self.notifyDiag = "授权被拒绝（系统设置→通知→AIStatusBar 开启）"
+                }
+                return
+            }
+            center.requestAuthorization(options: [.alert, .sound]) { _, err in
+                if let err = err {
+                    DispatchQueue.main.async { self.notifyDiag = "授权请求失败：\(err.localizedDescription)" }
+                    return
+                }
+                let content = UNMutableNotificationContent()
+                content.title = "AIStatusBar 测试通知"
+                content.body = "看到这条说明通知链路正常"
+                content.sound = .default
+                center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)) { err in
+                    DispatchQueue.main.async {
+                        self.notifyDiag = err.map { "发送失败：\($0.localizedDescription)" }
+                            ?? "已发送（\(statusText)）"
+                    }
+                }
+            }
+        }
     }
 
     private func perToolBinding(_ key: String) -> Binding<Int> {
@@ -746,10 +873,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func openSettings() {
         if settingsWindow == nil {
             let w = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 440, height: 330),
-                styleMask: [.titled, .closable],
+                contentRect: NSRect(x: 0, y: 0, width: 470, height: 640),
+                styleMask: [.titled, .closable, .fullSizeContentView],
                 backing: .buffered, defer: false)
             w.title = "AIStatusBar 设置"
+            w.titlebarAppearsTransparent = true
+            w.titleVisibility = .hidden
+            w.isMovableByWindowBackground = true
             w.contentView = NSHostingView(rootView: SettingsView(settings: settings))
             w.isReleasedWhenClosed = false
             w.center()
