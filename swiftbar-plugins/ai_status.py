@@ -65,6 +65,55 @@ def busy_sec(tool):
         return _DEFAULT_BUSY
 
 
+CONN_STATE = os.path.join(USAGE_DIR, "conn_state.json")
+CONN_PERSIST_SEC = 300  # 同一连接连续存在超过 5 分钟视为常驻（心跳/云同步），忽略
+
+
+def transient_conns(proc_names=(), pids=()):
+    """探测「非常驻」TCP 连接数：{进程名: 连接数}。
+    流式模型请求的连接随回合生灭；常驻连接（>5 分钟）被过滤。
+    跨 10 秒采样用 conn_state.json 记忆连接首次出现时间。"""
+    args = ["lsof", "-nP", "-iTCP", "-sTCP:ESTABLISHED", "-a"]
+    for n in proc_names:
+        args += ["-c", n]
+    for p in pids:
+        args += ["-p", str(p)]
+    try:
+        out = subprocess.run(args, capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return {}
+    cur = {}
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 9 or "->" not in parts[-1]:
+            continue
+        if "->127.0.0.1" in line or "->[::1]" in line or "->localhost" in line:
+            continue
+        local_port = parts[-1].split("->")[0].rsplit(":", 1)[-1]
+        cur.setdefault(parts[0], set()).add(local_port)
+    try:
+        state = json.load(open(CONN_STATE, encoding="utf-8"))
+    except Exception:
+        state = {}
+    busy = {}
+    for proc, ports in cur.items():
+        prev = state.get(proc, {})
+        new_prev, transient = {}, 0
+        for p in ports:
+            first_seen = prev.get(p, NOW)
+            new_prev[p] = first_seen
+            if NOW - first_seen < CONN_PERSIST_SEC:
+                transient += 1
+        state[proc] = new_prev
+        busy[proc] = transient
+    try:
+        os.makedirs(USAGE_DIR, exist_ok=True)
+        json.dump(state, open(CONN_STATE, "w"))
+    except Exception:
+        pass
+    return busy
+
+
 def api_conn_tools():
     """探测 CLI 进程到远程 API 的 ESTABLISHED 连接（模型请求进行中必有）。
     返回有活跃连接的工具名集合，如 {'kimi', 'claude'}。"""
@@ -351,6 +400,12 @@ def hermes_status():
             latest = (row[0], row[1])
         activity = db.execute("SELECT MAX(last_seen) FROM session_model_usage").fetchone()[0] or 0
         db.close()
+        # 连接补充：hermes python 进程有短命（非心跳）连接 = 有请求在途
+        if not busy:
+            pids = subprocess.run(["pgrep", "-f", "hermes_cli"],
+                                  capture_output=True, text=True).stdout.split()
+            if transient_conns(pids=pids).get("python", 0) > 0 and latest:
+                busy = [{"id": "conn-hermes", "title": latest[0]}]
     except Exception:
         activity = 0
     return app_n, gw_alive, busy, latest, activity
@@ -401,6 +456,10 @@ def zcode_status():
         sid, ts = max(activity.items(), key=lambda kv: kv[1])
         latest = (titles.get(sid, "(未知任务)"), ts)
     last_activity = max(activity.values()) if activity else 0
+    # 连接补充：ZCode App 有短命（非心跳）连接 = 有流式请求在途
+    if not running and app_on and latest:
+        if transient_conns(proc_names=["ZCode"]).get("ZCode", 0) > 0:
+            running.append({"id": "conn-zcode", "title": latest[0]})
     return cli_n, app_on, running, latest, last_activity
 
 
