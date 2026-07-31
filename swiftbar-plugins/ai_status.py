@@ -66,12 +66,14 @@ def busy_sec(tool):
 
 
 CONN_STATE = os.path.join(USAGE_DIR, "conn_state.json")
-CONN_PERSIST_SEC = 300  # 同一连接连续存在超过 5 分钟视为常驻（心跳/云同步），忽略
+CONN_PERSIST_SEC = 300   # 同一连接连续存在超过 5 分钟视为常驻（心跳/遥测），忽略
+CONN_MAX_AGE_SEC = 1800  # 模型请求连接最长认定 30 分钟
 
 
-def transient_conns(proc_names=(), pids=()):
+def transient_conns(proc_names=(), pids=(), max_age=CONN_PERSIST_SEC, min_age=15):
     """探测「非常驻」TCP 连接数：{进程名: 连接数}。
-    流式模型请求的连接随回合生灭；常驻连接（>5 分钟）被过滤。
+    流式模型请求的连接随回合生灭；存活 >max_age 秒的视为常驻（心跳/云同步）过滤，
+    存活 <min_age 秒的视为瞬时闪连（定期心跳）也过滤，只留中段 = 真实请求。
     跨 10 秒采样用 conn_state.json 记忆连接首次出现时间。"""
     args = ["lsof", "-nP", "-iTCP", "-sTCP:ESTABLISHED", "-a"]
     for n in proc_names:
@@ -102,7 +104,7 @@ def transient_conns(proc_names=(), pids=()):
         for p in ports:
             first_seen = prev.get(p, NOW)
             new_prev[p] = first_seen
-            if NOW - first_seen < CONN_PERSIST_SEC:
+            if min_age <= NOW - first_seen < max_age:
                 transient += 1
         state[proc] = new_prev
         busy[proc] = transient
@@ -112,28 +114,6 @@ def transient_conns(proc_names=(), pids=()):
     except Exception:
         pass
     return busy
-
-
-def api_conn_tools():
-    """探测 CLI 进程到远程 API 的 ESTABLISHED 连接（模型请求进行中必有）。
-    返回有活跃连接的工具名集合，如 {'kimi', 'claude'}。"""
-    found = set()
-    try:
-        out = subprocess.run(
-            ["lsof", "-nP", "-iTCP", "-sTCP:ESTABLISHED", "-a",
-             "-c", "codex", "-c", "kimi", "-c", "claude"],
-            capture_output=True, text=True, timeout=5).stdout
-        for line in out.splitlines()[1:]:
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-            # 目标地址在最后一列（-> 后为远端），排除本地回环
-            if "->127.0.0.1" in line or "->[::1]" in line or "->localhost" in line:
-                continue
-            found.add(parts[0])
-    except Exception:
-        pass
-    return found
 
 
 def proc_count(basename, exclude_substrings=()):
@@ -275,9 +255,11 @@ def codex_status():
 
 
 # ---------- Kimi Code ----------
-def kimi_status(conns=frozenset()):
+def kimi_status():
     n = proc_count("kimi")
-    keep_alive = "kimi" in conns  # 进程有到模型 API 的活跃连接 → 会话保活
+    # 窗口取 max(设置值, 30分钟)：wire 在请求开始就会写 llm.request，
+    # 未闭环的 step/tool_call 配 30 分钟窗可覆盖长卡顿，无需连接探测
+    window = max(busy_sec("kimi"), 30 * 60)
     busy, latest = [], None
     for state_path in glob.glob(os.path.join(KIMI_SESSIONS, "*", "*", "state.json")):
         sdir = os.path.dirname(state_path)
@@ -292,8 +274,7 @@ def kimi_status(conns=frozenset()):
         mtime = max(os.path.getmtime(w) for w in wires)
         if latest is None or mtime > latest[1]:
             latest = (title, mtime)
-        # 保活只延长到 30 分钟窗口，防止历史中断会话被全部复活
-        if NOW - mtime > busy_sec("kimi") and not (keep_alive and NOW - mtime < 30 * 60):
+        if NOW - mtime > window:
             continue
         for w in wires:
             steps, tools = {}, {}
@@ -317,9 +298,10 @@ def kimi_status(conns=frozenset()):
 
 
 # ---------- Claude Code ----------
-def claude_status(conns=frozenset()):
+def claude_status():
     n = proc_count("claude", ("Claude.app/",))  # 排除 Claude 桌面 App
-    keep_alive = "claude" in conns  # 进程有到模型 API 的活跃连接 → 会话保活
+    # 同 Kimi：事件闭环 + max(设置值, 30分钟) 窗口覆盖长卡顿
+    window = max(busy_sec("claude"), 30 * 60)
     busy, latest = [], None
     for f in glob.glob(os.path.join(CLAUDE_PROJECTS, "*", "*.jsonl")):
         try:
@@ -358,8 +340,7 @@ def claude_status(conns=frozenset()):
             title = os.path.basename(os.path.dirname(f)).lstrip("-").rsplit("-", 1)[-1] or "(未命名会话)"
         if latest is None or mtime > latest[1]:
             latest = (title, mtime)
-        # 保活只延长到 30 分钟窗口，防止历史中断会话被全部复活
-        if NOW - mtime > busy_sec("claude") and not (keep_alive and NOW - mtime < 30 * 60):
+        if NOW - mtime > window:
             continue
         if last_msg is None:
             continue
@@ -703,9 +684,8 @@ def state_of(proc_on, busy):
 def collect():
     """采集所有工具状态，返回结构化 dict。"""
     codex_n, codex_app_n, codex = codex_status()
-    conns = api_conn_tools()  # 网络连接探测（B 方案）：模型请求进行中的进程有活跃连接
-    kimi_n, kimi_busy, kimi_latest = kimi_status(conns)
-    claude_n, claude_busy, claude_latest = claude_status(conns)
+    kimi_n, kimi_busy, kimi_latest = kimi_status()
+    claude_n, claude_busy, claude_latest = claude_status()
     hermes_n, hermes_gw, hermes_busy, hermes_latest, hermes_act = hermes_status()
     zcode_cli_n, zcode_app, zcode_running, zcode_latest, zcode_act = zcode_status()
 
