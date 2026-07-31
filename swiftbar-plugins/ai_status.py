@@ -196,7 +196,7 @@ def codex_status():
         # turn 开启未收尾（最后事件是 task_started）或有未返回的工具调用，
         # 且日志 5 分钟内有动静，才算工作中
         if (last_task == "task_started" or pending) and NOW - mtime < busy_sec("codex"):
-            r["busy"].append(title)
+            r["busy"].append({"id": sid, "title": title})
     return n, app_n, res
 
 
@@ -235,7 +235,7 @@ def kimi_status():
                 elif t == "tool.result":
                     tools.pop(ev.get("toolCallId"), None)
             if steps or tools:
-                busy.append(title)
+                busy.append({"id": os.path.basename(sdir), "title": title})
                 break
     return n, busy, latest
 
@@ -288,7 +288,7 @@ def claude_status():
         # 最后是带 tool_use 的 assistant 消息说明工具正在执行；
         # 最后是纯文本 assistant 消息 = 回合结束，空闲
         if t == "user" or "tool_use" in kinds:
-            busy.append(title)
+            busy.append({"id": os.path.basename(f).replace(".jsonl", ""), "title": title})
     return n, busy, latest
 
 
@@ -307,9 +307,9 @@ def hermes_status():
         ucols = {r[1] for r in db.execute("PRAGMA table_info(session_model_usage)")}
         if not {"id", "title", "started_at"} <= cols or "last_seen" not in ucols:
             raise RuntimeError("hermes state.db 表结构不兼容")
-        # 工作中：5 分钟内有 API 调用的会话
-        busy = [r[0] for r in db.execute("""
-            SELECT DISTINCT s.title FROM sessions s
+        # 工作中：5 分钟内有 API 调用的会话（按会话 ID 追踪）
+        busy = [{"id": r[0], "title": r[1]} for r in db.execute("""
+            SELECT DISTINCT s.id, s.title FROM sessions s
             JOIN session_model_usage u ON u.session_id = s.id
             WHERE u.last_seen > ? AND s.archived = 0 AND s.title IS NOT NULL AND s.title != ''
             ORDER BY u.last_seen DESC""", (NOW - busy_sec("hermes"),))]
@@ -365,7 +365,7 @@ def zcode_status():
     running = []
     for sid, ts in sorted(activity.items(), key=lambda kv: -kv[1]):
         if NOW - ts < busy_sec("zcode"):
-            running.append(titles.get(sid, "(未知任务)"))
+            running.append({"id": sid, "title": titles.get(sid, "(未知任务)")})
     if latest is None and activity:
         sid, ts = max(activity.items(), key=lambda kv: kv[1])
         latest = (titles.get(sid, "(未知任务)"), ts)
@@ -610,7 +610,7 @@ def collect():
     hs = state_of(hermes_n > 0 or hermes_gw, hermes_busy)
     zs = state_of(zcode_cli_n > 0 or zcode_app, zcode_running)
 
-    def tool(key, letter, name, st, busy_titles, latest, detail_off, activity):
+    def tool(key, letter, name, st, busy_items, latest, detail_off, activity):
         # 长时间无活动（默认 3 小时）即使进程在也按未运行处理，0=不启用
         if st == "idle" and _OFFLINE_AFTER > 0 and activity and NOW - activity > _OFFLINE_AFTER:
             st = "off"
@@ -619,9 +619,9 @@ def collect():
             "letter": letter,
             "name": name,
             "state": st,
-            "busy_count": len(busy_titles),
-            "busy_titles": busy_titles[:5],
-            "detail": f"{len(busy_titles)} 个任务" if st == "busy" else detail_off,
+            "busy_count": len(busy_items),
+            "busy_items": busy_items[:5],
+            "detail": f"{len(busy_items)} 个任务" if st == "busy" else detail_off,
             "latest_title": latest[0] if latest else None,
             "latest_age": age_str(latest[1]) if latest else None,
         }
@@ -663,9 +663,9 @@ def render_swiftbar(data):
     out.append("---")
     for t in data["tools"]:
         out.append(f"{mark(t['state'])} {t['name']}：{label[t['state']]}（{t['detail']}）")
-        for title in t["busy_titles"][:3]:
-            out.append(f"▶ {title} | size=11 color=green")
-        if t["latest_title"] and not t["busy_titles"]:
+        for item in t["busy_items"][:3]:
+            out.append(f"▶ {item['title']} | size=11 color=green")
+        if t["latest_title"] and not t["busy_items"]:
             out.append(f"最近任务：{t['latest_title']} · {t['latest_age']} | size=11 color=gray")
         out.append("---")
     out.append("C=Codex App  X=Codex CLI  K=Kimi  L=Claude  H=Hermes  Z=ZCode | size=10 color=gray")

@@ -4,13 +4,18 @@ import UserNotifications
 
 // MARK: - 数据模型（对应 ai_status.py --json 的输出）
 
+struct BusyItem: Codable, Hashable {
+    let id: String
+    let title: String
+}
+
 struct ToolStatus: Codable {
     let key: String
     let letter: String
     let name: String
     let state: String          // busy / idle / off
     let busyCount: Int
-    let busyTitles: [String]
+    let busyItems: [BusyItem]
     let detail: String
     let latestTitle: String?
     let latestAge: String?
@@ -110,8 +115,6 @@ final class StatusStore: ObservableObject {
     let scriptPath: String
     let settings: SettingsStore
     private var timer: Timer?
-    private var prevBusy: [String: [String]] = [:]   // 上一轮各工具的忙碌任务（用于通知内容）
-    private var prevState: [String: String] = [:]    // 上一轮各工具的状态（用于检测「工作中→空闲」）
 
     init(scriptPath: String, settings: SettingsStore) {
         self.scriptPath = scriptPath
@@ -149,18 +152,38 @@ final class StatusStore: ObservableObject {
         }
     }
 
-    /// 某工具从「工作中」转为空闲/未运行时发通知。
-    /// 按状态转变判断（而不是按任务标题消失），避免标题中途改名造成误报。
+    /// 会话级完成通知：按稳定会话 ID 追踪忙碌任务，某会话连续消失 N 轮才判定完成。
+    /// 标题中途改名不会误报（ID 不变）；短暂卡顿掉线有宽限，不抖动。
+    private static let finishGraceRounds = 3  // 连续消失 3 轮（约 30s）才通知
+    private var trackedBusy: [String: [String: String]] = [:]   // toolKey -> (sessionId -> title)
+    private var missingRounds: [String: [String: Int]] = [:]    // toolKey -> (sessionId -> 连续缺失轮数)
+
     private func checkTransitions(_ decoded: StatusData) {
         for t in decoded.tools {
-            let prevSt = prevState[t.key]
-            let prev = prevBusy[t.key] ?? []
             let skey = SettingsStore.settingKey(for: t.key)
-            if prevSt == "busy" && t.state != "busy" && !prev.isEmpty && settings.notifyEnabled(for: skey) {
-                notify(tool: t.name, finished: prev)
+            let current = Dictionary(uniqueKeysWithValues: t.busyItems.map { ($0.id, $0.title) })
+            let prev = trackedBusy[t.key] ?? [:]
+
+            // 消失的会话累计缺失轮数；重新出现的清零
+            var missing = missingRounds[t.key] ?? [:]
+            for id in prev.keys where current[id] == nil {
+                missing[id] = (missing[id] ?? 0) + 1
             }
-            prevState[t.key] = t.state
-            prevBusy[t.key] = t.busyTitles
+            for id in current.keys { missing.removeValue(forKey: id) }
+
+            // 达到宽限轮数 → 判定完成，发通知（用最新标题），并从追踪表移除防止重复通知
+            let finished = missing.filter { $0.value >= Self.finishGraceRounds }.map(\.key)
+            if !finished.isEmpty {
+                for id in finished { missing.removeValue(forKey: id) }
+                if settings.notifyEnabled(for: skey) {
+                    let titles = finished.map { prev[$0] ?? "(任务)" }
+                    notify(tool: t.name, finished: titles)
+                }
+            }
+            missingRounds[t.key] = missing
+            var newTracked = current.merging(prev.filter { current[$0.key] == nil }) { new, _ in new }
+            for id in finished { newTracked.removeValue(forKey: id) }
+            trackedBusy[t.key] = newTracked
         }
     }
 
@@ -265,15 +288,15 @@ struct PanelView: View {
                         }
                         .padding(.vertical, 4)
 
-                        ForEach(t.busyTitles, id: \.self) { title in
-                            Text("▶ \(title)")
+                        ForEach(t.busyItems, id: \.id) { item in
+                            Text("▶ \(item.title)")
                                 .font(.system(size: 11))
                                 .foregroundColor(Color(red: 0.19, green: 0.82, blue: 0.35).opacity(0.85))
                                 .lineLimit(1)
                                 .truncationMode(.tail)
                                 .padding(.leading, 18)
                         }
-                        if t.busyTitles.isEmpty, let latest = t.latestTitle {
+                        if t.busyItems.isEmpty, let latest = t.latestTitle {
                             Text("最近：\(latest) · \(t.latestAge ?? "")")
                                 .font(.system(size: 10))
                                 .foregroundColor(.secondary.opacity(0.7))
@@ -724,7 +747,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 全部未运行时保留一个占位徽标，保证菜单入口还在
         statusItem.button?.attributedTitle = visible.isEmpty
             ? badgeTitle([ToolStatus(key: "_", letter: "AI", name: "", state: "off",
-                                     busyCount: 0, busyTitles: [], detail: "",
+                                     busyCount: 0, busyItems: [], detail: "",
                                      latestTitle: nil, latestAge: nil)])
             : badgeTitle(visible)
 
@@ -770,8 +793,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                         action: nil, keyEquivalent: "")
                 header.isEnabled = false
                 menu.addItem(header)
-                for title in t.busyTitles.prefix(3) {
-                    let item = NSMenuItem(title: "▶ \(truncate(title))", action: nil, keyEquivalent: "")
+                for busy in t.busyItems.prefix(3) {
+                    let item = NSMenuItem(title: "▶ \(truncate(busy.title))", action: nil, keyEquivalent: "")
                     item.isEnabled = false
                     item.attributedTitle = NSAttributedString(string: item.title, attributes: [
                         .font: NSFont.systemFont(ofSize: 11),
@@ -779,7 +802,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     ])
                     menu.addItem(item)
                 }
-                if t.busyTitles.isEmpty, let latest = t.latestTitle {
+                if t.busyItems.isEmpty, let latest = t.latestTitle {
                     let item = NSMenuItem(title: "最近任务：\(truncate(latest, 34)) · \(t.latestAge ?? "")", action: nil, keyEquivalent: "")
                     item.isEnabled = false
                     item.attributedTitle = NSAttributedString(string: item.title, attributes: [
