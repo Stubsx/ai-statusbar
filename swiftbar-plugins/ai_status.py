@@ -47,12 +47,14 @@ DEFAULT_BUSY_SEC = 300  # 默认 5 分钟
 def _load_busy_settings():
     try:
         s = json.load(open(SETTINGS_PATH, encoding="utf-8"))
-        return int(s.get("default_busy_sec", DEFAULT_BUSY_SEC)), dict(s.get("per_tool", {}))
+        return (int(s.get("default_busy_sec", DEFAULT_BUSY_SEC)),
+                dict(s.get("per_tool", {})),
+                int(s.get("offline_after_sec", 10800)))  # 默认 3 小时无活动算未运行，0=从不
     except Exception:
-        return DEFAULT_BUSY_SEC, {}
+        return DEFAULT_BUSY_SEC, {}, 10800
 
 
-_DEFAULT_BUSY, _PER_TOOL_BUSY = _load_busy_settings()
+_DEFAULT_BUSY, _PER_TOOL_BUSY, _OFFLINE_AFTER = _load_busy_settings()
 
 
 def busy_sec(tool):
@@ -147,8 +149,8 @@ def codex_status():
         except Exception:
             pass
 
-    res = {"cli": {"busy": [], "latest": None},
-           "ide": {"busy": [], "latest": None}}
+    res = {"cli": {"busy": [], "latest": None, "activity": 0},
+           "ide": {"busy": [], "latest": None, "activity": 0}}
     files = glob.glob(os.path.join(HOME, ".codex", "sessions", "*", "*", "*", "*.jsonl"))
     files = [f for f in files if NOW - os.path.getmtime(f) < 86400]
     for f in files:
@@ -160,6 +162,7 @@ def codex_status():
         r = res[kind]
         if r["latest"] is None or ts > r["latest"][1]:
             r["latest"] = (title, ts)
+        r["activity"] = max(r["activity"], mtime, ts)
         last_task, pending = None, {}
         try:
             with open(f, encoding="utf-8", errors="ignore") as fh:
@@ -315,10 +318,11 @@ def hermes_status():
             ORDER BY started_at DESC LIMIT 1""").fetchone()
         if row:
             latest = (row[0], row[1])
+        activity = db.execute("SELECT MAX(last_seen) FROM session_model_usage").fetchone()[0] or 0
         db.close()
     except Exception:
-        pass
-    return app_n, gw_alive, busy, latest
+        activity = 0
+    return app_n, gw_alive, busy, latest, activity
 
 
 # ---------- ZCode ----------
@@ -365,7 +369,8 @@ def zcode_status():
     if latest is None and activity:
         sid, ts = max(activity.items(), key=lambda kv: kv[1])
         latest = (titles.get(sid, "(未知任务)"), ts)
-    return cli_n, app_on, running, latest
+    last_activity = max(activity.values()) if activity else 0
+    return cli_n, app_on, running, latest, last_activity
 
 
 # ---------- Token 用量统计（增量扫描，缓存于本地 sqlite） ----------
@@ -595,8 +600,8 @@ def collect():
     codex_n, codex_app_n, codex = codex_status()
     kimi_n, kimi_busy, kimi_latest = kimi_status()
     claude_n, claude_busy, claude_latest = claude_status()
-    hermes_n, hermes_gw, hermes_busy, hermes_latest = hermes_status()
-    zcode_cli_n, zcode_app, zcode_running, zcode_latest = zcode_status()
+    hermes_n, hermes_gw, hermes_busy, hermes_latest, hermes_act = hermes_status()
+    zcode_cli_n, zcode_app, zcode_running, zcode_latest, zcode_act = zcode_status()
 
     cs_ide = state_of(codex_app_n > 0, codex["ide"]["busy"])
     cs_cli = state_of(codex_n > 0, codex["cli"]["busy"])
@@ -605,7 +610,10 @@ def collect():
     hs = state_of(hermes_n > 0 or hermes_gw, hermes_busy)
     zs = state_of(zcode_cli_n > 0 or zcode_app, zcode_running)
 
-    def tool(key, letter, name, st, busy_titles, latest, detail_off):
+    def tool(key, letter, name, st, busy_titles, latest, detail_off, activity):
+        # 长时间无活动（默认 3 小时）即使进程在也按未运行处理，0=不启用
+        if st == "idle" and _OFFLINE_AFTER > 0 and activity and NOW - activity > _OFFLINE_AFTER:
+            st = "off"
         return {
             "key": key,
             "letter": letter,
@@ -620,15 +628,17 @@ def collect():
 
     tools = [
         tool("codex-ide", "C", "Codex App", cs_ide, codex["ide"]["busy"],
-             codex["ide"]["latest"], "App 在线" if codex_app_n else "无进程"),
+             codex["ide"]["latest"], "App 在线" if codex_app_n else "无进程", codex["ide"]["activity"]),
         tool("codex-cli", "X", "Codex CLI", cs_cli, codex["cli"]["busy"],
-             codex["cli"]["latest"], f"{codex_n} 个进程"),
-        tool("kimi", "K", "Kimi Code", ks, kimi_busy, kimi_latest, f"{kimi_n} 个进程"),
-        tool("claude", "L", "Claude Code", ls_, claude_busy, claude_latest, f"{claude_n} 个进程"),
+             codex["cli"]["latest"], f"{codex_n} 个进程", codex["cli"]["activity"]),
+        tool("kimi", "K", "Kimi Code", ks, kimi_busy, kimi_latest, f"{kimi_n} 个进程",
+             kimi_latest[1] if kimi_latest else 0),
+        tool("claude", "L", "Claude Code", ls_, claude_busy, claude_latest, f"{claude_n} 个进程",
+             claude_latest[1] if claude_latest else 0),
         tool("hermes", "H", "Hermes", hs, hermes_busy, hermes_latest,
-             "在线" if (hermes_n or hermes_gw) else "无进程"),
+             "在线" if (hermes_n or hermes_gw) else "无进程", hermes_act),
         tool("zcode", "Z", "ZCode", zs, zcode_running, zcode_latest,
-             "App 在线" if zcode_app else "无进程"),
+             "App 在线" if zcode_app else "无进程", zcode_act),
     ]
     return {"updated_at": datetime.now().strftime("%H:%M:%S"),
             "tools": tools,

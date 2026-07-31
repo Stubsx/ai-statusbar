@@ -1,5 +1,6 @@
 import Cocoa
 import SwiftUI
+import UserNotifications
 
 // MARK: - 数据模型（对应 ai_status.py --json 的输出）
 
@@ -45,15 +46,76 @@ extension Notification.Name {
     static let statusUpdated = Notification.Name("statusUpdated")
 }
 
+// MARK: - 设置（持久化到 ~/.ai-statusbar/settings.json，与采集端共享）
+
+final class SettingsStore: ObservableObject {
+    static let tools = [("codex", "Codex"), ("kimi", "Kimi Code"), ("claude", "Claude Code"),
+                        ("hermes", "Hermes"), ("zcode", "ZCode")]
+    static let busyOptions = [60, 180, 300, 600, 900, 1800]
+    static let offlineOptions: [(String, Int)] = [("1 小时", 3600), ("2 小时", 7200), ("3 小时", 10800),
+                                                  ("6 小时", 21600), ("12 小时", 43200), ("从不", 0)]
+
+    @Published var defaultSec = 300 { didSet { save() } }
+    @Published var perTool: [String: Int] = [:] { didSet { save() } }
+    @Published var offlineAfterSec = 10800 { didSet { save() } }
+    @Published var notifyEnabled = true { didSet { save() } }
+    @Published var notifyTools: [String: Bool] = [:] { didSet { save() } }
+
+    private let path = NSHomeDirectory() + "/.ai-statusbar/settings.json"
+
+    init() { load() }
+
+    func busySec(for key: String) -> Int { perTool[key] ?? defaultSec }
+    func notifyEnabled(for key: String) -> Bool { notifyEnabled && (notifyTools[key] ?? true) }
+
+    /// UI 用的工具 key（codex-ide/codex-cli）映射到设置 key（codex）
+    static func settingKey(for toolKey: String) -> String {
+        toolKey.hasPrefix("codex") ? "codex" : toolKey
+    }
+
+    static func labelSec(_ sec: Int) -> String {
+        sec < 3600 ? "\(sec / 60) 分钟" : "\(sec / 3600) 小时"
+    }
+
+    private func load() {
+        guard let data = FileManager.default.contents(atPath: path),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        if let v = obj["default_busy_sec"] as? Int { defaultSec = v }
+        if let p = obj["per_tool"] as? [String: Int] { perTool = p }
+        if let v = obj["offline_after_sec"] as? Int { offlineAfterSec = v }
+        if let n = obj["notify"] as? [String: Any] {
+            if let e = n["enabled"] as? Bool { notifyEnabled = e }
+            if let t = n["tools"] as? [String: Bool] { notifyTools = t }
+        }
+    }
+
+    private func save() {
+        let obj: [String: Any] = [
+            "default_busy_sec": defaultSec,
+            "per_tool": perTool,
+            "offline_after_sec": offlineAfterSec,
+            "notify": ["enabled": notifyEnabled, "tools": notifyTools],
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: obj, options: .prettyPrinted) else { return }
+        try? FileManager.default.createDirectory(atPath: NSHomeDirectory() + "/.ai-statusbar",
+                                                 withIntermediateDirectories: true)
+        try? data.write(to: URL(fileURLWithPath: path))
+    }
+}
+
 // MARK: - 状态采集
 
 final class StatusStore: ObservableObject {
     @Published var data: StatusData?
     let scriptPath: String
+    let settings: SettingsStore
     private var timer: Timer?
+    private var prevBusy: [String: [String]] = [:]  // 上一轮各工具的忙碌任务，用于检测「工作中→空闲」
 
-    init(scriptPath: String) {
+    init(scriptPath: String, settings: SettingsStore) {
         self.scriptPath = scriptPath
+        self.settings = settings
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
     func start() {
@@ -80,9 +142,34 @@ final class StatusStore: ObservableObject {
             guard let decoded = try? decoder.decode(StatusData.self, from: raw) else { return }
             DispatchQueue.main.async {
                 self.data = decoded
+                self.checkTransitions(decoded)
                 NotificationCenter.default.post(name: .statusUpdated, object: nil)
             }
         }
+    }
+
+    /// 某工具从「工作中」转为空闲/未运行 → 已完成消失的忙碌任务发系统通知
+    private func checkTransitions(_ decoded: StatusData) {
+        for t in decoded.tools {
+            let prev = prevBusy[t.key] ?? []
+            let finished = prev.filter { !t.busyTitles.contains($0) }
+            let skey = SettingsStore.settingKey(for: t.key)
+            if !finished.isEmpty && settings.notifyEnabled(for: skey) {
+                notify(tool: t.name, finished: finished)
+            }
+            prevBusy[t.key] = t.busyTitles
+        }
+    }
+
+    private func notify(tool: String, finished: [String]) {
+        let content = UNMutableNotificationContent()
+        content.title = "\(tool) 进入空闲"
+        var body = "已完成：" + finished.joined(separator: "、")
+        if body.count > 120 { body = String(body.prefix(119)) + "…" }
+        content.body = body
+        content.sound = .default
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
     }
 }
 
@@ -379,6 +466,64 @@ struct PanelView: View {
     }
 }
 
+// MARK: - 设置窗口
+
+struct SettingsView: View {
+    @ObservedObject var settings: SettingsStore
+
+    var body: some View {
+        Form {
+            Section("空闲判定时间（无活动多久后算空闲）") {
+                Picker("统一设置", selection: $settings.defaultSec) {
+                    ForEach(SettingsStore.busyOptions, id: \.self) { sec in
+                        Text(SettingsStore.labelSec(sec)).tag(sec)
+                    }
+                }
+                ForEach(SettingsStore.tools, id: \.0) { key, name in
+                    Picker(name, selection: perToolBinding(key)) {
+                        Text("跟随统一").tag(0)
+                        ForEach(SettingsStore.busyOptions, id: \.self) { sec in
+                            Text(SettingsStore.labelSec(sec)).tag(sec)
+                        }
+                    }
+                }
+            }
+            Section("离线判定（进程在但无活动，超过后按未运行处理）") {
+                Picker("无活动超过", selection: $settings.offlineAfterSec) {
+                    ForEach(SettingsStore.offlineOptions, id: \.1) { label, sec in
+                        Text(label).tag(sec)
+                    }
+                }
+            }
+            Section("通知提醒") {
+                Toggle("任务完成时提醒（工作中 → 空闲）", isOn: $settings.notifyEnabled)
+                ForEach(SettingsStore.tools, id: \.0) { key, name in
+                    Toggle(name, isOn: notifyBinding(key))
+                }
+                .disabled(!settings.notifyEnabled)
+            }
+        }
+        .frame(width: 440, height: 330)
+    }
+
+    private func perToolBinding(_ key: String) -> Binding<Int> {
+        Binding(
+            get: { self.settings.perTool[key] ?? 0 },
+            set: { v in
+                if v == 0 { self.settings.perTool.removeValue(forKey: key) }
+                else { self.settings.perTool[key] = v }
+            }
+        )
+    }
+
+    private func notifyBinding(_ key: String) -> Binding<Bool> {
+        Binding(
+            get: { self.settings.notifyTools[key] ?? true },
+            set: { self.settings.notifyTools[key] = $0 }
+        )
+    }
+}
+
 // MARK: - AppDelegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -386,11 +531,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var panel: NSPanel!
     private var hosting: DraggableHostingView<PanelView>!
     private var store: StatusStore!
+    private let settings = SettingsStore()
+    private var settingsWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let scriptPath = Bundle.main.path(forResource: "ai_status", ofType: "py")
             ?? (NSHomeDirectory() + "/Desktop/未命名文件夹/swiftbar-plugins/ai_status.py")
-        store = StatusStore(scriptPath: scriptPath)
+        store = StatusStore(scriptPath: scriptPath, settings: settings)
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "AI …"
@@ -512,7 +659,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 menu.addItem(.separator())
             }
         }
-        menu.addItem(busyMenu())
+        let settingsItem = NSMenuItem(title: "设置…", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
         let toggle = NSMenuItem(title: UserDefaults.standard.bool(forKey: "panelVisible") ? "隐藏桌面卡片" : "显示桌面卡片",
                                 action: #selector(togglePanel), keyEquivalent: "p")
         toggle.target = self
@@ -594,96 +743,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    // MARK: 空闲判定时间设置（写入 ~/.ai-statusbar/settings.json，采集端每次运行读取）
-
-    private static let busyOptions = [60, 180, 300, 600, 900, 1800]
-    private static let busyTools = [("codex", "Codex"), ("kimi", "Kimi Code"), ("claude", "Claude Code"),
-                                    ("hermes", "Hermes"), ("zcode", "ZCode")]
-    private var settingsPath: String { NSHomeDirectory() + "/.ai-statusbar/settings.json" }
-
-    private func labelSec(_ sec: Int) -> String {
-        sec < 3600 ? "\(sec / 60) 分钟" : "\(sec / 3600) 小时"
-    }
-
-    private func loadBusySettings() -> (defaultSec: Int, perTool: [String: Int]) {
-        guard let data = FileManager.default.contents(atPath: settingsPath),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return (300, [:])
+    @objc private func openSettings() {
+        if settingsWindow == nil {
+            let w = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 440, height: 330),
+                styleMask: [.titled, .closable],
+                backing: .buffered, defer: false)
+            w.title = "AIStatusBar 设置"
+            w.contentView = NSHostingView(rootView: SettingsView(settings: settings))
+            w.isReleasedWhenClosed = false
+            w.center()
+            settingsWindow = w
         }
-        let def = obj["default_busy_sec"] as? Int ?? 300
-        var per: [String: Int] = [:]
-        if let p = obj["per_tool"] as? [String: Int] { per = p }
-        return (def, per)
-    }
-
-    private func saveBusySettings(defaultSec: Int, perTool: [String: Int]) {
-        let obj: [String: Any] = ["default_busy_sec": defaultSec, "per_tool": perTool]
-        guard let data = try? JSONSerialization.data(withJSONObject: obj, options: .prettyPrinted) else { return }
-        try? FileManager.default.createDirectory(atPath: NSHomeDirectory() + "/.ai-statusbar",
-                                                 withIntermediateDirectories: true)
-        try? data.write(to: URL(fileURLWithPath: settingsPath))
-    }
-
-    private func busyMenu() -> NSMenuItem {
-        let (def, per) = loadBusySettings()
-        let root = NSMenuItem(title: "空闲判定时间", action: nil, keyEquivalent: "")
-        let m = NSMenu()
-
-        let unified = NSMenuItem(title: "统一设置（所有工具）", action: nil, keyEquivalent: "")
-        let um = NSMenu()
-        for sec in Self.busyOptions {
-            let it = NSMenuItem(title: labelSec(sec), action: #selector(setBusyUnified(_:)), keyEquivalent: "")
-            it.target = self
-            it.representedObject = sec
-            it.state = (per.isEmpty && def == sec) ? .on : .off
-            um.addItem(it)
-        }
-        unified.submenu = um
-        m.addItem(unified)
-        m.addItem(.separator())
-
-        for (key, name) in Self.busyTools {
-            let t = NSMenuItem(title: name, action: nil, keyEquivalent: "")
-            let tm = NSMenu()
-            let cur = per[key]
-            let follow = NSMenuItem(title: "跟随统一（\(labelSec(def))）", action: #selector(setBusyPerTool(_:)), keyEquivalent: "")
-            follow.target = self
-            follow.representedObject = ["tool": key, "sec": -1] as [String: Any]
-            follow.state = cur == nil ? .on : .off
-            tm.addItem(follow)
-            tm.addItem(.separator())
-            for sec in Self.busyOptions {
-                let it = NSMenuItem(title: labelSec(sec), action: #selector(setBusyPerTool(_:)), keyEquivalent: "")
-                it.target = self
-                it.representedObject = ["tool": key, "sec": sec] as [String: Any]
-                it.state = cur == sec ? .on : .off
-                tm.addItem(it)
-            }
-            t.submenu = tm
-            m.addItem(t)
-        }
-        root.submenu = m
-        return root
-    }
-
-    @objc private func setBusyUnified(_ sender: NSMenuItem) {
-        guard let sec = sender.representedObject as? Int else { return }
-        saveBusySettings(defaultSec: sec, perTool: [:])  // 统一改：清除所有单独设置
-        store.refresh()
-    }
-
-    @objc private func setBusyPerTool(_ sender: NSMenuItem) {
-        guard let info = sender.representedObject as? [String: Any],
-              let key = info["tool"] as? String else { return }
-        let (def, per0) = loadBusySettings()
-        var per = per0
-        if let sec = info["sec"] as? Int, sec > 0 {
-            per[key] = sec
-        } else {
-            per.removeValue(forKey: key)
-        }
-        saveBusySettings(defaultSec: def, perTool: per)
-        store.refresh()
+        NSApp.activate(ignoringOtherApps: true)
+        settingsWindow?.makeKeyAndOrderFront(nil)
     }
 
     @objc private func togglePanel() {
