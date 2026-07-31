@@ -277,16 +277,26 @@ def kimi_status():
         if NOW - mtime > window:
             continue
         for w in wires:
-            steps, tools = {}, {}
+            events = []
             for d in iter_jsonl(read_tail(w)):
                 if d.get("type") != "context.append_loop_event":
                     continue
                 ev = d.get("event", {})
+                if ev.get("type") in ("step.begin", "step.end", "tool.call", "tool.result"):
+                    events.append(ev)
+            if not events:
+                continue
+            # 只统计最新一个 turn：被打断的旧 turn 会留下永不闭环的幽灵步骤
+            max_turn = max(e.get("turnId") or "" for e in events)
+            steps, tools = {}, {}
+            for ev in events:
+                if (ev.get("turnId") or "") != max_turn:
+                    continue
                 t = ev.get("type", "")
                 if t == "step.begin":
                     steps[ev.get("uuid")] = True
-                elif t == "step.end":
-                    steps.pop(ev.get("stepUuid", ev.get("uuid")), None)
+                elif t == "step.end":  # step.end 的 uuid 与 step.begin 相同
+                    steps.pop(ev.get("uuid"), None)
                 elif t == "tool.call":
                     tools[ev.get("toolCallId")] = True
                 elif t == "tool.result":
