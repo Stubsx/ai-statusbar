@@ -551,7 +551,10 @@ def _parse_codex(line):
     except Exception:
         return None
     u = p.get("info", {}).get("last_token_usage", {})
-    return (ts, u.get("input_tokens", 0), u.get("output_tokens", 0), u.get("cached_input_tokens", 0))
+    inp = u.get("input_tokens", 0)
+    cache = u.get("cached_input_tokens", 0)
+    # 统一口径：输入 = 非缓存新增输入（cached_input 是 input 的子集，剔除）
+    return (ts, max(0, inp - cache), u.get("output_tokens", 0), cache)
 
 
 def _parse_kimi(line):
@@ -600,7 +603,10 @@ def _parse_zcode(line):
         ts = datetime.fromisoformat(ca.replace("Z", "+00:00")).timestamp()
     except Exception:
         return None
-    return (ts, u.get("inputTokens", 0), u.get("outputTokens", 0), u.get("cacheReadTokens", 0))
+    inp = u.get("inputTokens", 0)
+    cache = u.get("cacheReadTokens", 0)
+    # 统一口径：输入 = 非缓存新增输入（inputTokens 含 cacheReadTokens，剔除）
+    return (ts, max(0, inp - cache), u.get("outputTokens", 0), cache)
 
 
 def collect_usage():
