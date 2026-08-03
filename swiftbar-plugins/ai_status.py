@@ -695,20 +695,10 @@ def zcode_quota():
             except Exception:
                 resets_at = 0
             pct = lim.get("percentage", 0)
+            # TIME_LIMIT（工具调用额度）不展示，只保留 TOKENS_LIMIT 配额窗口
             if lim.get("type") == "TOKENS_LIMIT":
                 label = f"{int(lim.get('number', 0))}小时"
                 windows.append({"kind": "5h", "label": label,
-                                "used_percent": round(float(pct or 0), 1),
-                                "resets_at": resets_at})
-            elif lim.get("type") == "TIME_LIMIT":
-                # 工具调用额度：优先按 currentValue/usage 计算
-                try:
-                    cur, total = float(lim["currentValue"]), float(lim["usage"])
-                    if total > 0:
-                        pct = 100.0 * cur / total
-                except Exception:
-                    pass
-                windows.append({"kind": "custom", "label": "工具调用",
                                 "used_percent": round(float(pct or 0), 1),
                                 "resets_at": resets_at})
         if not windows:
