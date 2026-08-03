@@ -343,7 +343,7 @@ struct PanelView: View {
                 applyLevel()
             }
             Divider()
-            Button("退出 AIStatusBar") { NSApp.terminate(nil) }
+            Button("退出灵眸") { NSApp.terminate(nil) }
         }
         .onAppear { applyLevel() }
     }
@@ -798,7 +798,7 @@ struct SettingsView: View {
             let statusText = ["未请求过", "已被拒绝", "已允许", "临时允许", "未知"][min(s.authorizationStatus.rawValue, 4)]
             if s.authorizationStatus == .denied {
                 DispatchQueue.main.async {
-                    self.notifyDiag = "授权被拒绝（系统设置→通知→AIStatusBar 开启）"
+                    self.notifyDiag = "授权被拒绝（系统设置→通知→灵眸 开启）"
                 }
                 return
             }
@@ -808,7 +808,7 @@ struct SettingsView: View {
                     return
                 }
                 let content = UNMutableNotificationContent()
-                content.title = "AIStatusBar 测试通知"
+                content.title = "灵眸 测试通知"
                 content.body = "看到这条说明通知链路正常"
                 content.sound = .default
                 center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)) { err in
@@ -1150,7 +1150,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 contentRect: NSRect(x: 0, y: 0, width: 470, height: 640),
                 styleMask: [.titled, .closable, .fullSizeContentView],
                 backing: .buffered, defer: false)
-            w.title = "AIStatusBar 设置"
+            w.title = "灵眸 设置"
             w.titlebarAppearsTransparent = true
             w.titleVisibility = .hidden
             w.isMovableByWindowBackground = true
