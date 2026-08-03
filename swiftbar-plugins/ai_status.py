@@ -493,21 +493,31 @@ def _quota_window(minutes, used_percent, resets_at):
 
 
 def codex_quota():
-    """从 mtime 最新的会话 jsonl 尾部找最后一条 token_count 事件里的 rate_limits。"""
+    """扫描最近 14 天会话 jsonl（各读尾部 256KB），记录每个 limit_id 池最新的
+    rate_limits；优先选标准池 limit_id="codex"，没有才退到最新的其他池。"""
     try:
-        files = glob.glob(os.path.join(HOME, ".codex", "sessions", "*", "*", "*", "*.jsonl"))
-        if not files:
-            return None
-        latest = max(files, key=os.path.getmtime)
-        found = None
-        for d in iter_jsonl(read_tail(latest)):
-            p = d.get("payload", {})
-            if isinstance(p, dict) and p.get("type") == "token_count":
+        files = [f for f in glob.glob(os.path.join(HOME, ".codex", "sessions", "*", "*", "*", "*.jsonl"))
+                 if NOW - os.path.getmtime(f) < 14 * 86400]
+        pools = {}  # limit_id -> (事件时间戳, rate_limits)
+        for f in files:
+            for d in iter_jsonl(read_tail(f)):
+                p = d.get("payload", {})
+                if not isinstance(p, dict) or p.get("type") != "token_count":
+                    continue
                 rl = p.get("rate_limits")
-                if isinstance(rl, dict):
-                    found = rl
-        if not found:
+                if not isinstance(rl, dict):
+                    continue
+                try:
+                    ts = datetime.fromisoformat(
+                        d.get("timestamp", "").replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    ts = 0
+                lid = rl.get("limit_id") or "codex"
+                if lid not in pools or ts > pools[lid][0]:
+                    pools[lid] = (ts, rl)
+        if not pools:
             return None
+        ts, found = pools.get("codex") or max(pools.values(), key=lambda kv: kv[0])
         windows = []
         for key in ("primary", "secondary"):
             w = found.get(key)
@@ -604,9 +614,65 @@ def kimi_quota():
         return None
 
 
+ZCODE_PROVIDERS = os.path.join(HOME, ".zcode", "v2", "model-providers.json")
+# 备选 provider（name, 限额 API 主机）
+ZCODE_QUOTA_SOURCES = [("Bigmodel - Coding Plan", "https://open.bigmodel.cn"),
+                       ("Z.AI - Coding Plan", "https://api.z.ai")]
+
+
 def zcode_quota():
-    """ZCode 限额端点均拒绝其 OAuth token，暂不支持。"""
-    return None
+    """用 model-providers.json 里 Coding Plan 的 apiKey 查智谱限额接口。"""
+    try:
+        providers = json.load(open(ZCODE_PROVIDERS, encoding="utf-8"))
+        if not isinstance(providers, list):
+            return None
+        key, base = None, None
+        for name, host in ZCODE_QUOTA_SOURCES:
+            for p in providers:
+                if isinstance(p, dict) and p.get("name") == name and p.get("apiKey"):
+                    key, base = p["apiKey"], host
+                    break
+            if key:
+                break
+        if not key:
+            return None
+        req = urllib.request.Request(base + "/api/monitor/usage/quota/limit")
+        req.add_header("Authorization", f"Bearer {key}")
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if data.get("code") != 200 or not isinstance(data.get("data"), dict):
+            return None
+        windows = []
+        for lim in data["data"].get("limits") or []:
+            if not isinstance(lim, dict):
+                continue
+            try:
+                resets_at = int(lim.get("nextResetTime", 0)) // 1000  # 毫秒→秒
+            except Exception:
+                resets_at = 0
+            pct = lim.get("percentage", 0)
+            if lim.get("type") == "TOKENS_LIMIT":
+                label = f"{int(lim.get('number', 0))}小时"
+                windows.append({"kind": "5h", "label": label,
+                                "used_percent": round(float(pct or 0), 1),
+                                "resets_at": resets_at})
+            elif lim.get("type") == "TIME_LIMIT":
+                # 工具调用额度：优先按 currentValue/usage 计算
+                try:
+                    cur, total = float(lim["currentValue"]), float(lim["usage"])
+                    if total > 0:
+                        pct = 100.0 * cur / total
+                except Exception:
+                    pass
+                windows.append({"kind": "custom", "label": "工具调用",
+                                "used_percent": round(float(pct or 0), 1),
+                                "resets_at": resets_at})
+        if not windows:
+            return None
+        return {"plan": data["data"].get("level"), "windows": windows,
+                "updated_at": int(NOW)}
+    except Exception:
+        return None
 
 
 def collect_quota():
