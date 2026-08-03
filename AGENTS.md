@@ -14,7 +14,7 @@ open AIStatusBar/AIStatusBar.app
 ./scripts/build-dmg.sh
 ```
 
-The first two commands validate collector output and syntax. `build.sh` compiles a universal `arm64`/`x86_64` app, copies the collector into the bundle, and ad-hoc signs it. `build-dmg.sh` rebuilds and creates a versioned installer in `dist/`.
+The first two commands validate collector output and syntax. `build.sh` compiles a universal `arm64`/`x86_64` app, copies the collector into the bundle, and signs it with the stable self-signed `Lingmou Local` identity (falls back to ad-hoc when the certificate is absent, e.g. on another machine). The stable identity keeps TCC grants (screen recording, notifications) valid across rebuilds. `build-dmg.sh` rebuilds and creates a versioned installer in `dist/`.
 
 ## Coding Style & Naming Conventions
 
