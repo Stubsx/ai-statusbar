@@ -290,9 +290,11 @@ def kimi_status():
             if not events:
                 continue
             # 只统计最新一个 turn：被打断的旧 turn 会留下永不闭环的幽灵步骤
-            max_turn = max((e.get("turnId") or "" for e in events
-                            if e.get("turnId") is not None), default="")
-            if not max_turn:
+            # turnId 是字符串（"9"、"10"、"11"），不能用 max()：字符串排序
+            # 会把 "9" 误判为最新。wire 本身按时间追加，取最后一个即可。
+            latest_turn = next((e.get("turnId") for e in reversed(events)
+                                if e.get("turnId") is not None), None)
+            if latest_turn is None:
                 continue
             steps, tools = {}, {}
             for ev in events:
@@ -302,7 +304,7 @@ def kimi_status():
                 if t == "tool.result":
                     tools.pop(ev.get("toolCallId"), None)
                     continue
-                if (ev.get("turnId") or "") != max_turn:
+                if ev.get("turnId") != latest_turn:
                     continue
                 if t == "step.begin":
                     steps[ev.get("uuid")] = True
