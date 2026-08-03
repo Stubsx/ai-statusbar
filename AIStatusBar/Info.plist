@@ -5,7 +5,7 @@
     <key>CFBundleName</key>
     <string>AIStatusBar</string>
     <key>CFBundleDisplayName</key>
-    <string>AI Status Bar</string>
+    <string>灵眸</string>
     <key>CFBundleIdentifier</key>
     <string>com.jabber1.aistatusbar</string>
     <key>CFBundleExecutable</key>
