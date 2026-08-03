@@ -444,6 +444,13 @@ def zcode_status():
         if sid.startswith("sess_subagent_"):
             continue
         activity[sid] = max(activity.get(sid, 0), os.path.getmtime(d))
+    # 子智能体转录 agents/<父会话>/<agent>/transcript.jsonl：
+    # 主会话等待子智能体时自身文件不更新，需把子智能体活动归到父会话
+    for f in glob.glob(os.path.join(ZCODE_CLI, "agents", "sess_*", "*", "transcript.jsonl")):
+        sid = os.path.basename(os.path.dirname(os.path.dirname(f)))
+        if sid.startswith("sess_subagent_"):
+            continue
+        activity[sid] = max(activity.get(sid, 0), os.path.getmtime(f))
 
     running = []
     for sid, ts in sorted(activity.items(), key=lambda kv: -kv[1]):
