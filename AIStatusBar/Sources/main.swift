@@ -647,6 +647,7 @@ struct PanelView: View {
 struct SettingsView: View {
     @ObservedObject var settings: SettingsStore
     @State private var notifyDiag = ""
+    @AppStorage("panelAdaptiveAppearance") private var adaptiveAppearance = true
 
     var body: some View {
         VStack(spacing: 16) {
@@ -676,6 +677,16 @@ struct SettingsView: View {
             card(title: "离线判定", icon: "moon.zzz", subtitle: "进程在但无活动，超过后按未运行处理") {
                 row("无活动超过") {
                     valuePicker($settings.offlineAfterSec, options: SettingsStore.offlineOptions)
+                }
+            }
+
+            // 面板外观
+            card(title: "面板外观", icon: "circle.lefthalf.filled", subtitle: "浮在浅色内容上自动切换深色配色") {
+                row("面板配色跟随背景") {
+                    Toggle("", isOn: $adaptiveAppearance)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
                 }
             }
 
@@ -918,6 +929,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // MARK: 面板配色跟随背景
+
+    /// 截取面板正下方区域算平均亮度：亮背景→深色配色，暗背景→浅色配色（反差保证可读）。
+    /// 滞回防抖动：>0.6 深 / <0.4 浅 / 中间不动。无录屏权限等失败路径静默降级（跟随系统）。
+    private func adaptPanelAppearance() {
+        // 开关关闭：恢复跟随系统（appearance=nil）后直接返回
+        let adaptive = UserDefaults.standard.object(forKey: "panelAdaptiveAppearance") == nil
+            ? true : UserDefaults.standard.bool(forKey: "panelAdaptiveAppearance")
+        guard adaptive else {
+            if panel.appearance != nil { panel.appearance = nil }
+            return
+        }
+        guard panel.isVisible,  // 面板不可见直接返回，省电
+              let image = CGWindowListCreateImage(panel.frame, .optionOnScreenBelowWindow,
+                                                  CGWindowID(panel.windowNumber),
+                                                  [.boundsIgnoreFraming, .nominalResolution])
+        else { return }
+        // 缩到 4x4 位图取平均亮度（Rec.709 加权）
+        var pixels = [UInt8](repeating: 0, count: 64)
+        guard let ctx = CGContext(data: &pixels, width: 4, height: 4, bitsPerComponent: 8,
+                                  bytesPerRow: 16, space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return }
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: 4, height: 4))
+        var lum = 0.0
+        for i in stride(from: 0, to: 64, by: 4) {
+            lum += 0.2126 * Double(pixels[i]) / 255
+                 + 0.7152 * Double(pixels[i + 1]) / 255
+                 + 0.0722 * Double(pixels[i + 2]) / 255
+        }
+        lum /= 16
+        let target: NSAppearance?
+        if lum > 0.6 {
+            target = NSAppearance(named: .darkAqua)
+        } else if lum < 0.4 {
+            target = NSAppearance(named: .aqua)
+        } else {
+            return  // 滞回区间保持现状，防抖动
+        }
+        // 目标与当前不同才赋值；SwiftUI colorScheme 随 appearance 自动翻转
+        if panel.appearance?.name != target?.name {
+            panel.appearance = target
+        }
+    }
+
     /// 标题限宽，超长截断加省略号
     private func truncate(_ s: String, _ maxChars: Int = 40) -> String {
         s.count > maxChars ? String(s.prefix(maxChars - 1)) + "…" : s
@@ -1027,7 +1083,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                                object: panel, queue: .main) { [weak self] _ in
             guard let f = self?.panel.frame else { return }
             UserDefaults.standard.set(NSStringFromPoint(f.origin), forKey: "panelOrigin")
+            self?.adaptPanelAppearance()  // 拖动后即时重检背景亮度
         }
+
+        // 配色跟随背景：每 3 秒检测面板下方亮度
+        let appearanceTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            self?.adaptPanelAppearance()
+        }
+        RunLoop.main.add(appearanceTimer, forMode: .common)
 
         hosting.layout()
         panel.setContentSize(hosting.fittingSize)
