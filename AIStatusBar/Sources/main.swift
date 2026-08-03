@@ -405,7 +405,8 @@ struct PanelView: View {
     private var quotaView: some View {
         VStack(alignment: .leading, spacing: 10) {
             if let tools = store.data?.tools {
-                let withQuota = tools.filter { $0.quota != nil }
+                // Codex App/CLI 共享同一配额，合并为一张卡片
+                let withQuota = tools.filter { $0.quota != nil && $0.key != "codex-cli" }
                 if withQuota.isEmpty {
                     Text("未检测到限额数据")
                         .font(.system(size: 11))
@@ -415,7 +416,7 @@ struct PanelView: View {
                 ForEach(withQuota, id: \.key) { t in
                     VStack(alignment: .leading, spacing: 4) {
                         HStack(spacing: 6) {
-                            Text(t.name)
+                            Text(t.key == "codex-ide" ? "Codex" : t.name)
                                 .font(.system(size: 12, weight: .semibold))
                                 .foregroundColor(.primary.opacity(0.9))
                             if let plan = t.quota?.plan, !plan.isEmpty {
