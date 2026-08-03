@@ -1,6 +1,7 @@
 import Cocoa
 import SwiftUI
 import UserNotifications
+import ScreenCaptureKit
 
 // MARK: - 数据模型（对应 ai_status.py --json 的输出）
 
@@ -931,8 +932,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: 面板配色跟随背景
 
+    private var requestedCaptureAccess = false  // 每次启动只请求一次录屏权限
+
     /// 截取面板正下方区域算平均亮度：亮背景→深色配色，暗背景→浅色配色（反差保证可读）。
-    /// 滞回防抖动：>0.6 深 / <0.4 浅 / 中间不动。无录屏权限等失败路径静默降级（跟随系统）。
+    /// CGWindowListCreateImage 在 macOS 15+ 已废弃且静默返回 nil，改用 ScreenCaptureKit。
+    /// 滞回防抖动：>0.6 深 / <0.4 浅 / 中间不动。低版本/无权限等失败路径静默降级（跟随系统）。
     private func adaptPanelAppearance() {
         // 开关关闭：恢复跟随系统（appearance=nil）后直接返回
         let adaptive = UserDefaults.standard.object(forKey: "panelAdaptiveAppearance") == nil
@@ -941,17 +945,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if panel.appearance != nil { panel.appearance = nil }
             return
         }
-        guard panel.isVisible,  // 面板不可见直接返回，省电
-              let mainScreen = NSScreen.screens.first
-        else { return }
-        // AppKit 坐标(左下原点) → CGWindowList 坐标(主屏左上原点)，不转会采到垂直镜像位置
-        var captureRect = panel.frame
-        captureRect.origin.y = mainScreen.frame.height - captureRect.origin.y - captureRect.height
-        guard let image = CGWindowListCreateImage(captureRect, .optionOnScreenBelowWindow,
-                                                  CGWindowID(panel.windowNumber),
-                                                  [.boundsIgnoreFraming, .nominalResolution])
-        else { return }
-        // 缩到 4x4 位图取平均亮度（Rec.709 加权）
+        guard panel.isVisible else { return }  // 面板不可见直接返回，省电
+        // SCScreenshotManager 需要 macOS 14；低版本静默降级（不动 appearance）
+        guard #available(macOS 14.0, *) else { return }
+        // 无录屏权限：请求一次（系统弹授权框），本次采样放弃，授权后下个周期生效
+        if !CGPreflightScreenCaptureAccess() {
+            if !requestedCaptureAccess {
+                requestedCaptureAccess = true
+                CGRequestScreenCaptureAccess()
+            }
+            return
+        }
+        // AppKit 坐标(左下原点) → Quartz 全局坐标(主屏左上原点)
+        var rect = panel.frame
+        rect.origin.y = NSScreen.screens[0].frame.height - rect.origin.y - rect.height
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { [weak self] content, error in
+            guard let self, let content, error == nil else { return }
+            guard let display = content.displays.first(where: { $0.frame.intersects(rect) }) else { return }
+            // 排除自己 app 的窗口，避免采到面板自身
+            let own = content.windows.filter {
+                $0.owningApplication?.bundleIdentifier == Bundle.main.bundleIdentifier
+            }
+            let filter = SCContentFilter(display: display, excludingWindows: own)
+            let config = SCStreamConfiguration()
+            config.sourceRect = rect.offsetBy(dx: -display.frame.origin.x,
+                                              dy: -display.frame.origin.y)  // 相对显示器的点坐标
+            config.width = 4
+            config.height = 4
+            config.showsCursor = false
+            SCScreenshotManager.captureImage(contentFilter: filter, configuration: config) { image, error in
+                guard let image, error == nil else { return }  // 报错静默降级
+                DispatchQueue.main.async { self.applyAppearance(for: image) }
+            }
+        }
+    }
+
+    /// 主线程：CGImage 缩到 4x4 算平均亮度（Rec.709 加权），按滞回切 panel.appearance
+    private func applyAppearance(for image: CGImage) {
         var pixels = [UInt8](repeating: 0, count: 64)
         guard let ctx = CGContext(data: &pixels, width: 4, height: 4, bitsPerComponent: 8,
                                   bytesPerRow: 16, space: CGColorSpaceCreateDeviceRGB(),
