@@ -9,6 +9,19 @@ struct BusyItem: Codable, Hashable {
     let title: String
 }
 
+struct QuotaWindow: Codable, Hashable {
+    let kind: String
+    let label: String
+    let usedPercent: Double
+    let resetsAt: Int
+}
+
+struct ToolQuota: Codable {
+    let plan: String?
+    let windows: [QuotaWindow]
+    let updatedAt: Int
+}
+
 struct ToolStatus: Codable {
     let key: String
     let letter: String
@@ -19,6 +32,7 @@ struct ToolStatus: Codable {
     let detail: String
     let latestTitle: String?
     let latestAge: String?
+    let quota: ToolQuota?
 }
 
 struct UsageEntry: Codable {
@@ -253,6 +267,7 @@ struct PanelView: View {
                 tabButton("状态", "status")
                 tabButton("用量", "usage")
                 tabButton("活跃", "heat")
+                tabButton("配额", "quota")
             }
             .padding(.bottom, 8)
 
@@ -260,6 +275,8 @@ struct PanelView: View {
                 heatView
             } else if tab == "usage" {
                 usageView
+            } else if tab == "quota" {
+                quotaView
             } else if let tools = store.data?.tools {
                 let visible = tools.filter { $0.state != "off" }  // 未运行的不显示
                 if visible.isEmpty {
@@ -381,6 +398,86 @@ struct PanelView: View {
                 .foregroundColor(bold ? Color.primary.opacity(0.9) : Color.secondary)
         }
         .padding(.vertical, 4)
+    }
+
+    // MARK: 配额（限额统计）
+
+    private var quotaView: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let tools = store.data?.tools {
+                ForEach(tools, id: \.key) { t in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 6) {
+                            Text(t.name)
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(.primary.opacity(0.9))
+                            if let plan = t.quota?.plan, !plan.isEmpty {
+                                Text(plan)
+                                    .font(.system(size: 9, weight: .medium))
+                                    .foregroundColor(.secondary)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Capsule().fill(Color.primary.opacity(0.08)))
+                            }
+                            Spacer()
+                        }
+                        if let q = t.quota, !q.windows.isEmpty {
+                            ForEach(q.windows, id: \.label) { w in
+                                quotaRow(w)
+                            }
+                        } else {
+                            Text("暂不支持")
+                                .font(.system(size: 10))
+                                .foregroundColor(.secondary.opacity(0.6))
+                                .padding(.bottom, 2)
+                        }
+                    }
+                }
+            } else {
+                Text("加载中…")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+        }
+    }
+
+    private func quotaRow(_ w: QuotaWindow) -> some View {
+        let used = min(max(w.usedPercent, 0), 100) / 100
+        return VStack(alignment: .leading, spacing: 3) {
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.08))
+                    Capsule().fill(quotaColor(w.usedPercent))
+                        .frame(width: max(4, geo.size.width * CGFloat(used)))
+                }
+            }
+            .frame(height: 6)
+            Text("\(w.label) · 已用 \(Int(w.usedPercent.rounded()))% · \(quotaResetText(w.resetsAt))")
+                .font(.system(size: 10).monospacedDigit())
+                .foregroundColor(.secondary)
+        }
+        .padding(.bottom, 2)
+    }
+
+    /// 按用量升档着色：低用量绿、中等黄、逼近上限红
+    private func quotaColor(_ usedPercent: Double) -> Color {
+        switch usedPercent {
+        case ..<50: return Color(red: 0.19, green: 0.82, blue: 0.35)
+        case ..<80: return Color(red: 1.0, green: 0.84, blue: 0.04)
+        default: return Color(red: 0.96, green: 0.34, blue: 0.30)
+        }
+    }
+
+    private func quotaResetText(_ ts: Int) -> String {
+        guard ts > 0 else { return "重置时间未知" }
+        let date = Date(timeIntervalSince1970: TimeInterval(ts))
+        let f = DateFormatter()
+        if date.timeIntervalSinceNow > 86400 {
+            f.dateFormat = "M月d日"
+        } else {
+            f.dateFormat = "HH:mm"
+        }
+        return f.string(from: date) + " 重置"
     }
 
     // MARK: 活跃热力图（GitHub 风格：列=周，行=周一~周日）
@@ -798,7 +895,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.button?.attributedTitle = visible.isEmpty
             ? badgeTitle([ToolStatus(key: "_", letter: "AI", name: "", state: "off",
                                      busyCount: 0, busyItems: [], detail: "",
-                                     latestTitle: nil, latestAge: nil)])
+                                     latestTitle: nil, latestAge: nil, quota: nil)])
             : badgeTitle(visible)
 
         // 浮窗尺寸跟随内容

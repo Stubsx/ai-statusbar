@@ -10,6 +10,9 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 
 def latest_glob(pattern):
@@ -467,6 +470,171 @@ def zcode_status():
     return cli_n, app_on, running, latest, last_activity
 
 
+# ---------- 限额统计（Codex 本地 / Kimi API，300 秒缓存） ----------
+QUOTA_CACHE = os.path.join(USAGE_DIR, "quota-cache.json")
+QUOTA_TTL = 300
+KIMI_CREDENTIALS = os.path.join(HOME, ".kimi-code", "credentials", "kimi-code.json")
+KIMI_TOKEN_URL = "https://auth.kimi.com/api/oauth/token"
+KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
+KIMI_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
+
+
+def _quota_window(minutes, used_percent, resets_at):
+    """统一窗口结构：300 分钟→5小时，10080 分钟左右→本周，其余按小时标注。"""
+    if minutes == 300:
+        kind, label = "5h", "5小时"
+    elif abs(minutes - 10080) <= 60:
+        kind, label = "week", "本周"
+    else:
+        kind, label = "custom", f"{minutes // 60}小时"
+    return {"kind": kind, "label": label,
+            "used_percent": round(float(used_percent or 0), 1),
+            "resets_at": int(resets_at or 0)}
+
+
+def codex_quota():
+    """从 mtime 最新的会话 jsonl 尾部找最后一条 token_count 事件里的 rate_limits。"""
+    try:
+        files = glob.glob(os.path.join(HOME, ".codex", "sessions", "*", "*", "*", "*.jsonl"))
+        if not files:
+            return None
+        latest = max(files, key=os.path.getmtime)
+        found = None
+        for d in iter_jsonl(read_tail(latest)):
+            p = d.get("payload", {})
+            if isinstance(p, dict) and p.get("type") == "token_count":
+                rl = p.get("rate_limits")
+                if isinstance(rl, dict):
+                    found = rl
+        if not found:
+            return None
+        windows = []
+        for key in ("primary", "secondary"):
+            w = found.get(key)
+            if isinstance(w, dict) and w.get("window_minutes"):
+                windows.append(_quota_window(w["window_minutes"],
+                                             w.get("used_percent", 0),
+                                             w.get("resets_at", 0)))
+        if not windows:
+            return None
+        return {"plan": found.get("plan_type"), "windows": windows,
+                "updated_at": int(NOW)}
+    except Exception:
+        return None
+
+
+def _kimi_refresh(cred):
+    """刷新 access_token 并写回凭据文件（refresh_token 会轮换，不写回会踢掉 CLI）。
+    返回新 access_token。"""
+    body = urllib.parse.urlencode({
+        "client_id": KIMI_CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": cred.get("refresh_token", ""),
+    }).encode("utf-8")
+    req = urllib.request.Request(KIMI_TOKEN_URL, data=body)
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    if not data.get("access_token"):
+        raise RuntimeError("刷新响应缺少 access_token")
+    cred["access_token"] = data["access_token"]
+    if data.get("refresh_token"):
+        cred["refresh_token"] = data["refresh_token"]
+    cred["expires_in"] = int(data.get("expires_in", 900))
+    cred["expires_at"] = int(NOW) + cred["expires_in"]
+    json.dump(cred, open(KIMI_CREDENTIALS, "w"))
+    return cred["access_token"]
+
+
+def _kimi_usage(token):
+    req = urllib.request.Request(KIMI_USAGE_URL)
+    req.add_header("Authorization", f"Bearer {token}")
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def kimi_quota():
+    """查询 Kimi 限额 API：usage → 本周窗口，limits[] → 各时长窗口。"""
+    try:
+        cred = json.load(open(KIMI_CREDENTIALS, encoding="utf-8"))
+        token = cred.get("access_token")
+        if not token:
+            return None
+        exp = cred.get("expires_at", 0) or 0
+        if exp > 1e12:  # expires_at 可能是毫秒时间戳
+            exp /= 1000
+        if NOW >= exp - 30:
+            token = _kimi_refresh(cred)
+        try:
+            data = _kimi_usage(token)
+        except urllib.error.HTTPError as e:
+            if e.code != 401:
+                raise
+            token = _kimi_refresh(cred)  # 401 兜底：刷新后重试一次
+            data = _kimi_usage(token)
+
+        def _win(src, minutes):
+            try:
+                used, limit = int(src.get("used", 0)), int(src.get("limit", 0))
+            except Exception:
+                return None
+            if limit <= 0:
+                return None
+            resets_at = 0
+            try:
+                resets_at = int(datetime.fromisoformat(
+                    src.get("resetTime", "").replace("Z", "+00:00")).timestamp())
+            except Exception:
+                pass
+            return _quota_window(int(minutes or 0), 100.0 * used / limit, resets_at)
+
+        windows = []
+        top = _win(data.get("usage") or {}, 10080)
+        if top:
+            windows.append(top)
+        for item in data.get("limits") or []:
+            w = _win(item.get("detail") or {}, item.get("window", {}).get("duration", 0))
+            if w:
+                windows.append(w)
+        if not windows:
+            return None
+        plan = (data.get("user") or {}).get("membership", {}).get("level")
+        return {"plan": plan, "windows": windows, "updated_at": int(NOW)}
+    except Exception:
+        return None
+
+
+def zcode_quota():
+    """ZCode 限额端点均拒绝其 OAuth token，暂不支持。"""
+    return None
+
+
+def collect_quota():
+    """限额数据，300 秒缓存；刷新失败的工具保留旧缓存值。"""
+    cache = {}
+    try:
+        if NOW - os.path.getmtime(QUOTA_CACHE) <= QUOTA_TTL:
+            return json.load(open(QUOTA_CACHE, encoding="utf-8"))
+        cache = json.load(open(QUOTA_CACHE, encoding="utf-8")) or {}
+    except Exception:
+        pass
+    fresh = {}
+    for key, fn in (("codex", codex_quota), ("kimi", kimi_quota), ("zcode", zcode_quota)):
+        try:
+            v = fn()
+        except Exception:
+            v = None
+        if v is None:
+            v = cache.get(key)  # 失败降级：沿用旧缓存
+        fresh[key] = v
+    try:
+        os.makedirs(USAGE_DIR, exist_ok=True)
+        json.dump(fresh, open(QUOTA_CACHE, "w"))
+    except Exception:
+        pass
+    return fresh
+
+
 # ---------- Token 用量统计（增量扫描，缓存于本地 sqlite） ----------
 USAGE_DB = os.path.join(USAGE_DIR, "usage.sqlite")
 USAGE_MAX_AGE = 70 * 86400  # 只索引最近 70 天的日志文件（热力图需要 10 周）
@@ -718,6 +886,7 @@ def collect():
     ls_ = state_of(claude_n > 0, claude_busy)
     hs = state_of(hermes_n > 0 or hermes_gw, hermes_busy)
     zs = state_of(zcode_cli_n > 0 or zcode_app, zcode_running)
+    quota = collect_quota()
 
     def tool(key, letter, name, st, busy_items, latest, detail_off, activity):
         # 长时间无活动（默认 3 小时）即使进程在也按未运行处理，0=不启用
@@ -733,6 +902,7 @@ def collect():
             "detail": f"{len(busy_items)} 个任务" if st == "busy" else detail_off,
             "latest_title": latest[0] if latest else None,
             "latest_age": age_str(latest[1]) if latest else None,
+            "quota": quota.get("codex" if key.startswith("codex") else key),
         }
 
     tools = [
