@@ -405,7 +405,14 @@ struct PanelView: View {
     private var quotaView: some View {
         VStack(alignment: .leading, spacing: 10) {
             if let tools = store.data?.tools {
-                ForEach(tools, id: \.key) { t in
+                let withQuota = tools.filter { $0.quota != nil }
+                if withQuota.isEmpty {
+                    Text("未检测到限额数据")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary.opacity(0.6))
+                        .padding(.vertical, 4)
+                }
+                ForEach(withQuota, id: \.key) { t in
                     VStack(alignment: .leading, spacing: 4) {
                         HStack(spacing: 6) {
                             Text(t.name)
@@ -421,15 +428,8 @@ struct PanelView: View {
                             }
                             Spacer()
                         }
-                        if let q = t.quota, !q.windows.isEmpty {
-                            ForEach(q.windows, id: \.label) { w in
-                                quotaRow(w)
-                            }
-                        } else {
-                            Text("暂不支持")
-                                .font(.system(size: 10))
-                                .foregroundColor(.secondary.opacity(0.6))
-                                .padding(.bottom, 2)
+                        ForEach(t.quota?.windows ?? [], id: \.label) { w in
+                            quotaRow(w)
                         }
                     }
                 }

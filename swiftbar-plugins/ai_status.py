@@ -492,43 +492,87 @@ def _quota_window(minutes, used_percent, resets_at):
             "resets_at": int(resets_at or 0)}
 
 
+CODEX_AUTH = os.path.join(HOME, ".codex", "auth.json")
+CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+
+
+def _codex_quota_api():
+    """实时接口：只看顶层 rate_limit（忽略 Spark 等 additional_rate_limits 附加池）。
+    凭据只进内存，不写日志/缓存。字段缺失或结构不符 → None（走本地兜底）。"""
+    auth = json.load(open(CODEX_AUTH, encoding="utf-8"))
+    tokens = auth.get("tokens") or {}
+    token, account = tokens.get("access_token"), tokens.get("account_id")
+    if not token or not account:
+        return None
+    req = urllib.request.Request(CODEX_USAGE_URL)
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("ChatGPT-Account-Id", account)
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    rl = data.get("rate_limit")
+    if not isinstance(rl, dict):
+        return None
+    windows = []
+    for key in ("primary_window", "secondary_window"):
+        w = rl.get(key)
+        if isinstance(w, dict) and w.get("limit_window_seconds"):
+            windows.append(_quota_window(int(w["limit_window_seconds"]) // 60,
+                                         w.get("used_percent", 0),
+                                         w.get("reset_at", 0)))
+    if not windows:
+        return None
+    return {"plan": data.get("plan_type"), "windows": windows,
+            "updated_at": int(NOW)}
+
+
+def _codex_quota_local():
+    """本地兜底：扫描最近 14 天会话 jsonl（各读尾部 256KB），记录每个 limit_id 池
+    最新的 rate_limits；优先选标准池 limit_id="codex"，没有才退到最新的其他池。"""
+    files = [f for f in glob.glob(os.path.join(HOME, ".codex", "sessions", "*", "*", "*", "*.jsonl"))
+             if NOW - os.path.getmtime(f) < 14 * 86400]
+    pools = {}  # limit_id -> (事件时间戳, rate_limits)
+    for f in files:
+        for d in iter_jsonl(read_tail(f)):
+            p = d.get("payload", {})
+            if not isinstance(p, dict) or p.get("type") != "token_count":
+                continue
+            rl = p.get("rate_limits")
+            if not isinstance(rl, dict):
+                continue
+            try:
+                ts = datetime.fromisoformat(
+                    d.get("timestamp", "").replace("Z", "+00:00")).timestamp()
+            except Exception:
+                ts = 0
+            lid = rl.get("limit_id") or "codex"
+            if lid not in pools or ts > pools[lid][0]:
+                pools[lid] = (ts, rl)
+    if not pools:
+        return None
+    ts, found = pools.get("codex") or max(pools.values(), key=lambda kv: kv[0])
+    windows = []
+    for key in ("primary", "secondary"):
+        w = found.get(key)
+        if isinstance(w, dict) and w.get("window_minutes"):
+            windows.append(_quota_window(w["window_minutes"],
+                                         w.get("used_percent", 0),
+                                         w.get("resets_at", 0)))
+    if not windows:
+        return None
+    return {"plan": found.get("plan_type"), "windows": windows,
+            "updated_at": int(NOW)}
+
+
 def codex_quota():
-    """扫描最近 14 天会话 jsonl（各读尾部 256KB），记录每个 limit_id 池最新的
-    rate_limits；优先选标准池 limit_id="codex"，没有才退到最新的其他池。"""
+    """优先实时 wham/usage 接口；异常/401/结构缺失时回退本地会话快照。"""
     try:
-        files = [f for f in glob.glob(os.path.join(HOME, ".codex", "sessions", "*", "*", "*", "*.jsonl"))
-                 if NOW - os.path.getmtime(f) < 14 * 86400]
-        pools = {}  # limit_id -> (事件时间戳, rate_limits)
-        for f in files:
-            for d in iter_jsonl(read_tail(f)):
-                p = d.get("payload", {})
-                if not isinstance(p, dict) or p.get("type") != "token_count":
-                    continue
-                rl = p.get("rate_limits")
-                if not isinstance(rl, dict):
-                    continue
-                try:
-                    ts = datetime.fromisoformat(
-                        d.get("timestamp", "").replace("Z", "+00:00")).timestamp()
-                except Exception:
-                    ts = 0
-                lid = rl.get("limit_id") or "codex"
-                if lid not in pools or ts > pools[lid][0]:
-                    pools[lid] = (ts, rl)
-        if not pools:
-            return None
-        ts, found = pools.get("codex") or max(pools.values(), key=lambda kv: kv[0])
-        windows = []
-        for key in ("primary", "secondary"):
-            w = found.get(key)
-            if isinstance(w, dict) and w.get("window_minutes"):
-                windows.append(_quota_window(w["window_minutes"],
-                                             w.get("used_percent", 0),
-                                             w.get("resets_at", 0)))
-        if not windows:
-            return None
-        return {"plan": found.get("plan_type"), "windows": windows,
-                "updated_at": int(NOW)}
+        q = _codex_quota_api()
+        if q:
+            return q
+    except Exception:
+        pass
+    try:
+        return _codex_quota_local()
     except Exception:
         return None
 
