@@ -942,7 +942,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         guard panel.isVisible,  // 面板不可见直接返回，省电
-              let image = CGWindowListCreateImage(panel.frame, .optionOnScreenBelowWindow,
+              let mainScreen = NSScreen.screens.first
+        else { return }
+        // AppKit 坐标(左下原点) → CGWindowList 坐标(主屏左上原点)，不转会采到垂直镜像位置
+        var captureRect = panel.frame
+        captureRect.origin.y = mainScreen.frame.height - captureRect.origin.y - captureRect.height
+        guard let image = CGWindowListCreateImage(captureRect, .optionOnScreenBelowWindow,
                                                   CGWindowID(panel.windowNumber),
                                                   [.boundsIgnoreFraming, .nominalResolution])
         else { return }
