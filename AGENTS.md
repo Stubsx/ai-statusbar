@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`swiftbar-plugins/ai_status.py` is the canonical collector. It reads local Codex, Kimi, Claude, Hermes, and ZCode state and emits either SwiftBar text or the JSON contract consumed by other frontends. `ai-cli-status.10s.py` is the thin SwiftBar launcher. The native menu-bar app lives in `AIStatusBar/`: edit `Sources/main.swift` and `Info.plist`, then rebuild the tracked `AIStatusBar.app` bundle. `uebersicht-widgets/ai-status.widget/index.jsx` provides the desktop widget. App icons belong in `icons/`; release packaging is handled by `scripts/`. Generated DMGs under `dist/` are ignored.
+`swiftbar-plugins/ai_status.py` is the canonical collector. It reads local Codex, Kimi, Claude, Hermes, and ZCode state and emits either SwiftBar text or the JSON contract consumed by other frontends. `ai-cli-status.10s.py` is the thin SwiftBar launcher. The native menu-bar app lives in `AIStatusBar/`: edit `Sources/main.swift` and `Info.plist`, then run `build.sh` to produce the local `AIStatusBar.app` bundle (git-ignored build artifact, not tracked). `uebersicht-widgets/ai-status.widget/index.jsx` provides the desktop widget. App icons belong in `icons/`; release packaging is handled by `scripts/`. Generated DMGs under `dist/` are ignored.
 
 ## Build, Test, and Development Commands
 
@@ -26,7 +26,7 @@ There is no automated test suite or coverage threshold yet. For collector change
 
 ## Commit & Pull Request Guidelines
 
-Recent commits use concise Chinese, action-oriented subjects such as `修复 Kimi 幽灵步骤误报` or `新增设置窗口`. Keep each commit focused and explain the behavioral reason. Include rebuilt tracked app artifacts when source changes require them, but do not add `dist/` files. Pull requests should summarize the change, list validation commands, note affected agents/frontends, link relevant issues, and attach before/after screenshots for UI work.
+Recent commits use concise Chinese, action-oriented subjects such as `修复 Kimi 幽灵步骤误报` or `新增设置窗口`. Keep each commit focused and explain the behavioral reason. The `AIStatusBar.app` bundle and `dist/` files are local build artifacts — never commit them. Pull requests should summarize the change, list validation commands, note affected agents/frontends, link relevant issues, and attach before/after screenshots for UI work.
 
 ## Security & Local Configuration
 
