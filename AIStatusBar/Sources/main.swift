@@ -80,6 +80,12 @@ final class SettingsStore: ObservableObject {
     @Published var offlineAfterSec = 10800 { didSet { save() } }
     @Published var notifyEnabled = true { didSet { save() } }
     @Published var notifyTools: [String: Bool] = [:] { didSet { save() } }
+    @Published var showDockIcon = false { didSet { save(); applyDockIconPolicy() } }
+
+    /// Dock 图标开关即时生效：regular 显示 Dock 图标，accessory 纯菜单栏
+    func applyDockIconPolicy() {
+        NSApp.setActivationPolicy(showDockIcon ? .regular : .accessory)
+    }
 
     private let path = NSHomeDirectory() + "/.ai-statusbar/settings.json"
 
@@ -107,6 +113,7 @@ final class SettingsStore: ObservableObject {
             if let e = n["enabled"] as? Bool { notifyEnabled = e }
             if let t = n["tools"] as? [String: Bool] { notifyTools = t }
         }
+        if let v = obj["show_dock_icon"] as? Bool { showDockIcon = v }
     }
 
     private func save() {
@@ -115,6 +122,7 @@ final class SettingsStore: ObservableObject {
             "per_tool": perTool,
             "offline_after_sec": offlineAfterSec,
             "notify": ["enabled": notifyEnabled, "tools": notifyTools],
+            "show_dock_icon": showDockIcon,
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: .prettyPrinted) else { return }
         try? FileManager.default.createDirectory(atPath: NSHomeDirectory() + "/.ai-statusbar",
@@ -702,6 +710,16 @@ struct SettingsView: View {
                 row("面板配色") {
                     modePicker($appearanceMode, options: [("浅色", "light"), ("深色", "dark"),
                                                           ("跟随系统", "system"), ("背景自适应", "adaptive")])
+                }
+            }
+
+            // Dock 图标
+            card(title: "Dock 图标", icon: "menubar.dock.rectangle", subtitle: "默认仅显示在菜单栏，不占用 Dock") {
+                row("在 Dock 中显示图标") {
+                    Toggle("", isOn: $settings.showDockIcon)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
                 }
             }
 
