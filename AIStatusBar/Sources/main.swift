@@ -648,7 +648,7 @@ struct PanelView: View {
 struct SettingsView: View {
     @ObservedObject var settings: SettingsStore
     @State private var notifyDiag = ""
-    @AppStorage("panelAdaptiveAppearance") private var adaptiveAppearance = true
+    @AppStorage("panelAppearanceMode") private var appearanceMode = "adaptive"
 
     var body: some View {
         VStack(spacing: 16) {
@@ -682,12 +682,10 @@ struct SettingsView: View {
             }
 
             // 面板外观
-            card(title: "面板外观", icon: "circle.lefthalf.filled", subtitle: "浮在浅色内容上自动切换深色配色") {
-                row("面板配色跟随背景") {
-                    Toggle("", isOn: $adaptiveAppearance)
-                        .labelsHidden()
-                        .toggleStyle(.switch)
-                        .controlSize(.small)
+            card(title: "面板外观", icon: "circle.lefthalf.filled", subtitle: "背景自适应会按面板下方内容明暗自动反差") {
+                row("面板配色") {
+                    modePicker($appearanceMode, options: [("浅色", "light"), ("深色", "dark"),
+                                                          ("跟随系统", "system"), ("背景自适应", "adaptive")])
                 }
             }
 
@@ -782,6 +780,19 @@ struct SettingsView: View {
         Picker("", selection: selection) {
             ForEach(options, id: \.1) { label, sec in
                 Text(label).tag(sec)
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .controlSize(.small)
+        .frame(width: 108)
+    }
+
+    /// valuePicker 的 String 版本（外观模式等字符串枚举设置用）
+    private func modePicker(_ selection: Binding<String>, options: [(String, String)]) -> some View {
+        Picker("", selection: selection) {
+            ForEach(options, id: \.1) { label, mode in
+                Text(label).tag(mode)
             }
         }
         .labelsHidden()
@@ -957,19 +968,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } catch {}
     }
 
-    /// 截取面板正下方区域算平均亮度：亮背景→深色配色，暗背景→浅色配色（反差保证可读）。
+    /// 面板外观模式：light / dark / system / adaptive（默认 adaptive）。
+    /// 旧 Bool 键 panelAdaptiveAppearance 迁移只在这里做：false→system，其余→adaptive。
+    private func panelAppearanceMode() -> String {
+        if let m = UserDefaults.standard.string(forKey: "panelAppearanceMode") {
+            return m
+        }
+        let legacy = UserDefaults.standard.object(forKey: "panelAdaptiveAppearance") as? Bool
+        return legacy == false ? "system" : "adaptive"
+    }
+
+    /// 统一入口：按模式应用面板外观。light/dark/system 直写（不发 SCK 请求，开销可忽略）；
+    /// adaptive 走背景采样。定时器/拖动/切 app/切 Space/设置变更都调这里。
+    private func applyPanelAppearanceMode() {
+        switch panelAppearanceMode() {
+        case "light":
+            hosting.appearance = NSAppearance(named: .aqua)
+            panel.appearance = NSAppearance(named: .aqua)
+        case "dark":
+            hosting.appearance = NSAppearance(named: .darkAqua)
+            panel.appearance = NSAppearance(named: .darkAqua)
+        case "system":  // 恢复跟随系统
+            hosting.appearance = nil
+            panel.appearance = nil
+        default:
+            adaptPanelAppearance()
+        }
+    }
+
+    /// adaptive 模式：截取面板正下方区域算平均亮度，亮背景→深色配色，暗背景→浅色配色（反差保证可读）。
     /// CGWindowListCreateImage 在 macOS 15+ 已废弃且静默返回 nil，改用 ScreenCaptureKit。
     /// 滞回防抖动：>0.6 深 / <0.4 浅 / 中间不动。低版本/无权限等失败路径静默降级（跟随系统）。
     private func adaptPanelAppearance() {
-        // 开关关闭：恢复跟随系统（appearance=nil）后直接返回
-        let adaptive = UserDefaults.standard.object(forKey: "panelAdaptiveAppearance") == nil
-            ? true : UserDefaults.standard.bool(forKey: "panelAdaptiveAppearance")
-        guard adaptive else {
-            // 开关关闭：恢复跟随系统（hosting 和 panel 的 appearance 都还原）
-            hosting.appearance = nil
-            panel.appearance = nil
-            return
-        }
         guard panel.isVisible else { return }  // 面板不可见直接返回，省电
         // SCScreenshotManager 需要 macOS 14；低版本静默降级（不动 appearance）
         guard #available(macOS 14.0, *) else { return }
@@ -1168,22 +1198,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                                object: panel, queue: .main) { [weak self] _ in
             guard let f = self?.panel.frame else { return }
             UserDefaults.standard.set(NSStringFromPoint(f.origin), forKey: "panelOrigin")
-            self?.adaptPanelAppearance()  // 拖动后即时重检背景亮度
+            self?.applyPanelAppearanceMode()  // 拖动后即时重检（adaptive 模式下重采背景亮度）
         }
 
-        // 配色跟随背景：每 3 秒检测面板下方亮度
+        // 面板外观：每 3 秒走一次模式入口（adaptive 模式下检测面板下方亮度）
         let appearanceTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
-            self?.adaptPanelAppearance()
+            self?.applyPanelAppearanceMode()
         }
         RunLoop.main.add(appearanceTimer, forMode: .common)
         // 事件驱动补采样：前台 app 切换 / 切 Space 时背景内容大概率变了，即时重检
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.adaptPanelAppearance()
+            self?.applyPanelAppearanceMode()
         }
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.adaptPanelAppearance()
+            self?.applyPanelAppearanceMode()
+        }
+        // 设置改动（外观模式切换）立即生效，不等下个 3 秒周期
+        NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.applyPanelAppearanceMode()
         }
 
         hosting.layout()
