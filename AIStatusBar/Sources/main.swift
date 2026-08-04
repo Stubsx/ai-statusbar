@@ -127,7 +127,6 @@ final class SettingsStore: ObservableObject {
 
 final class StatusStore: ObservableObject {
     @Published var data: StatusData?
-    @Published var panelColorOverride: ColorScheme? = nil  // 面板深浅配色覆盖，nil = 跟随系统
     let scriptPath: String
     let settings: SettingsStore
     private var timer: Timer?
@@ -337,7 +336,6 @@ struct PanelView: View {
         .padding(.top, 12)
         .padding(.bottom, 10)
         .frame(width: 300)  // 固定宽度，长标题自动省略号
-        .preferredColorScheme(store.panelColorOverride)  // 配色跟随背景：直接驱动 SwiftUI
         .modifier(ConditionalGlass(bare: bare))
         .contextMenu {
             Button(pinned ? "取消置顶" : "置顶") {
@@ -967,9 +965,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let adaptive = UserDefaults.standard.object(forKey: "panelAdaptiveAppearance") == nil
             ? true : UserDefaults.standard.bool(forKey: "panelAdaptiveAppearance")
         guard adaptive else {
-            // 开关关闭：恢复跟随系统（SwiftUI override 和 AppKit appearance 都还原）
-            store.panelColorOverride = nil
-            if panel.appearance != nil { panel.appearance = nil }
+            // 开关关闭：恢复跟随系统（hosting 和 panel 的 appearance 都还原）
+            hosting.appearance = nil
+            panel.appearance = nil
             return
         }
         guard panel.isVisible else { return }  // 面板不可见直接返回，省电
@@ -1022,7 +1020,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// 主线程：CGImage 缩到 4x4 算平均亮度（Rec.709 加权），按滞回切 panel.appearance
+    /// 主线程：CGImage 缩到 4x4 算平均亮度（Rec.709 加权），按滞回切 hosting/panel 的 appearance
     private func applyAppearance(for image: CGImage) {
         var pixels = [UInt8](repeating: 0, count: 64)
         guard let ctx = CGContext(data: &pixels, width: 4, height: 4, bitsPerComponent: 8,
@@ -1038,23 +1036,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         lum /= 16
         let lumStr = String(format: "%.2f", lum)
-        // macOS 26 上 NSWindow.appearance → SwiftUI colorScheme 传导不可靠，
-        // 主通道直接写 store.panelColorOverride（驱动 SwiftUI），panel.appearance 作为副通道
-        let scheme: ColorScheme
+        // macOS 26 实测：window.appearance 经 NSGlassEffectView 传到 NSHostingView 的链路断了，
+        // .preferredColorScheme 动态更新对已渲染的 hosting view 也不生效（仅静态初始值有效）；
+        // 唯一直写 hosting.appearance 立即生效（SwiftUI colorScheme 随之翻转），故以它为主通道，
+        // panel.appearance 作为副通道（玻璃外框色调）
         let appearanceName: NSAppearance.Name
         if lum > 0.6 {
-            scheme = .dark
             appearanceName = .darkAqua
         } else if lum < 0.4 {
-            scheme = .light
             appearanceName = .aqua
         } else {
             adaptLog("亮度 \(lumStr)，滞回保持现状")
             return  // 滞回区间保持现状，防抖动
         }
         // 目标与当前不同才赋值
-        if store.panelColorOverride != scheme {
-            store.panelColorOverride = scheme
+        if hosting.appearance?.name != appearanceName {
+            hosting.appearance = NSAppearance(named: appearanceName)
             panel.appearance = NSAppearance(named: appearanceName)
             adaptLog("亮度 \(lumStr)，切换 \(appearanceName.rawValue)")
         } else {
