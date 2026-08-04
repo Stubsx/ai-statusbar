@@ -848,6 +848,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var store: StatusStore!
     private let settings = SettingsStore()
     private var settingsWindow: NSWindow?
+    private var activityToken: NSObjectProtocol?  // App Nap 防护 token，app 生命周期内持有
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let scriptPath = Bundle.main.path(forResource: "ai_status", ofType: "py")
@@ -864,6 +865,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         store.start()
         NotificationCenter.default.addObserver(self, selector: #selector(onStatusUpdated),
                                                name: .statusUpdated, object: nil)
+        // 防止 macOS 把后台菜单栏 app 的定时器节流（App Nap），保住 3 秒背景采样
+        activityToken = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated, .suddenTerminationDisabled, .automaticTerminationDisabled],
+            reason: "面板背景采样定时器")
     }
 
     // MARK: 菜单栏标题
@@ -934,6 +939,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var requestedCaptureAccess = false  // 每次启动只请求一次录屏权限
 
+    /// 调试日志：往 ~/.ai-statusbar/adapt-debug.log 追加一行（ISO 时间戳 + 消息），异常静默
+    private func adaptLog(_ msg: String) {
+        let dir = NSHomeDirectory() + "/.ai-statusbar"
+        let path = dir + "/adapt-debug.log"
+        let line = ISO8601DateFormatter().string(from: Date()) + " " + msg + "\n"
+        guard let data = line.data(using: .utf8) else { return }
+        do {
+            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            if !FileManager.default.fileExists(atPath: path) {
+                FileManager.default.createFile(atPath: path, contents: nil)
+            }
+            let fh = try FileHandle(forWritingTo: URL(fileURLWithPath: path))
+            fh.seekToEndOfFile()
+            fh.write(data)
+            try fh.close()
+        } catch {}
+    }
+
     /// 截取面板正下方区域算平均亮度：亮背景→深色配色，暗背景→浅色配色（反差保证可读）。
     /// CGWindowListCreateImage 在 macOS 15+ 已废弃且静默返回 nil，改用 ScreenCaptureKit。
     /// 滞回防抖动：>0.6 深 / <0.4 浅 / 中间不动。低版本/无权限等失败路径静默降级（跟随系统）。
@@ -953,6 +976,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if !requestedCaptureAccess {
                 requestedCaptureAccess = true
                 CGRequestScreenCaptureAccess()
+                adaptLog("无录屏权限，已弹授权请求，本次采样放弃")
+            } else {
+                adaptLog("无录屏权限（已申请过，等待授权），跳过本次采样")
             }
             return
         }
@@ -960,8 +986,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var rect = panel.frame
         rect.origin.y = NSScreen.screens[0].frame.height - rect.origin.y - rect.height
         SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { [weak self] content, error in
-            guard let self, let content, error == nil else { return }
-            guard let display = content.displays.first(where: { $0.frame.intersects(rect) }) else { return }
+            guard let self else { return }
+            if let error {
+                self.adaptLog("SCShareableContent 失败: \(error.localizedDescription)")
+                return
+            }
+            guard let content else { return }
+            guard let display = content.displays.first(where: { $0.frame.intersects(rect) }) else {
+                self.adaptLog("找不到相交 display: rect=\(rect) displays=\(content.displays.count)")
+                return
+            }
             // 排除自己 app 的窗口，避免采到面板自身
             let own = content.windows.filter {
                 $0.owningApplication?.bundleIdentifier == Bundle.main.bundleIdentifier
@@ -974,7 +1008,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             config.height = 4
             config.showsCursor = false
             SCScreenshotManager.captureImage(contentFilter: filter, configuration: config) { image, error in
-                guard let image, error == nil else { return }  // 报错静默降级
+                if let error {
+                    self.adaptLog("captureImage 失败: \(error.localizedDescription)")
+                    return
+                }
+                guard let image else { return }
                 DispatchQueue.main.async { self.applyAppearance(for: image) }
             }
         }
@@ -995,17 +1033,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                  + 0.0722 * Double(pixels[i + 2]) / 255
         }
         lum /= 16
+        let lumStr = String(format: "%.2f", lum)
         let target: NSAppearance?
         if lum > 0.6 {
             target = NSAppearance(named: .darkAqua)
         } else if lum < 0.4 {
             target = NSAppearance(named: .aqua)
         } else {
+            adaptLog("亮度 \(lumStr)，滞回保持现状")
             return  // 滞回区间保持现状，防抖动
         }
         // 目标与当前不同才赋值；SwiftUI colorScheme 随 appearance 自动翻转
         if panel.appearance?.name != target?.name {
             panel.appearance = target
+            adaptLog("亮度 \(lumStr)，切换 \(target?.name.rawValue ?? "?")")
+        } else {
+            adaptLog("亮度 \(lumStr)，已是目标外观，不赋值")
         }
     }
 
@@ -1126,6 +1169,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.adaptPanelAppearance()
         }
         RunLoop.main.add(appearanceTimer, forMode: .common)
+        // 事件驱动补采样：前台 app 切换 / 切 Space 时背景内容大概率变了，即时重检
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.adaptPanelAppearance()
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.adaptPanelAppearance()
+        }
 
         hosting.layout()
         panel.setContentSize(hosting.fittingSize)
