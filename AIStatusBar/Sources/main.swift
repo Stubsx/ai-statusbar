@@ -127,6 +127,7 @@ final class SettingsStore: ObservableObject {
 
 final class StatusStore: ObservableObject {
     @Published var data: StatusData?
+    @Published var panelColorOverride: ColorScheme? = nil  // 面板深浅配色覆盖，nil = 跟随系统
     let scriptPath: String
     let settings: SettingsStore
     private var timer: Timer?
@@ -336,6 +337,7 @@ struct PanelView: View {
         .padding(.top, 12)
         .padding(.bottom, 10)
         .frame(width: 300)  // 固定宽度，长标题自动省略号
+        .preferredColorScheme(store.panelColorOverride)  // 配色跟随背景：直接驱动 SwiftUI
         .modifier(ConditionalGlass(bare: bare))
         .contextMenu {
             Button(pinned ? "取消置顶" : "置顶") {
@@ -965,6 +967,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let adaptive = UserDefaults.standard.object(forKey: "panelAdaptiveAppearance") == nil
             ? true : UserDefaults.standard.bool(forKey: "panelAdaptiveAppearance")
         guard adaptive else {
+            // 开关关闭：恢复跟随系统（SwiftUI override 和 AppKit appearance 都还原）
+            store.panelColorOverride = nil
             if panel.appearance != nil { panel.appearance = nil }
             return
         }
@@ -1034,19 +1038,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         lum /= 16
         let lumStr = String(format: "%.2f", lum)
-        let target: NSAppearance?
+        // macOS 26 上 NSWindow.appearance → SwiftUI colorScheme 传导不可靠，
+        // 主通道直接写 store.panelColorOverride（驱动 SwiftUI），panel.appearance 作为副通道
+        let scheme: ColorScheme
+        let appearanceName: NSAppearance.Name
         if lum > 0.6 {
-            target = NSAppearance(named: .darkAqua)
+            scheme = .dark
+            appearanceName = .darkAqua
         } else if lum < 0.4 {
-            target = NSAppearance(named: .aqua)
+            scheme = .light
+            appearanceName = .aqua
         } else {
             adaptLog("亮度 \(lumStr)，滞回保持现状")
             return  // 滞回区间保持现状，防抖动
         }
-        // 目标与当前不同才赋值；SwiftUI colorScheme 随 appearance 自动翻转
-        if panel.appearance?.name != target?.name {
-            panel.appearance = target
-            adaptLog("亮度 \(lumStr)，切换 \(target?.name.rawValue ?? "?")")
+        // 目标与当前不同才赋值
+        if store.panelColorOverride != scheme {
+            store.panelColorOverride = scheme
+            panel.appearance = NSAppearance(named: appearanceName)
+            adaptLog("亮度 \(lumStr)，切换 \(appearanceName.rawValue)")
         } else {
             adaptLog("亮度 \(lumStr)，已是目标外观，不赋值")
         }
