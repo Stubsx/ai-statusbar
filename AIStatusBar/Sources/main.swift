@@ -856,6 +856,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var panel: NSPanel!
     private var hosting: DraggableHostingView<PanelView>!
+    private var glassView: NSView?  // macOS 26+ 的 NSGlassEffectView（用 NSView 声明避开可用性注解）
     private var store: StatusStore!
     private let settings = SettingsStore()
     private var settingsWindow: NSWindow?
@@ -980,17 +981,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// 统一入口：按模式应用面板外观。light/dark/system 直写（不发 SCK 请求，开销可忽略）；
     /// adaptive 走背景采样。定时器/拖动/切 app/切 Space/设置变更都调这里。
+    /// window→glass/hosting 的 appearance 传导均不可靠，三者都要直写。
     private func applyPanelAppearanceMode() {
         switch panelAppearanceMode() {
         case "light":
             hosting.appearance = NSAppearance(named: .aqua)
             panel.appearance = NSAppearance(named: .aqua)
+            glassView?.appearance = NSAppearance(named: .aqua)
         case "dark":
             hosting.appearance = NSAppearance(named: .darkAqua)
             panel.appearance = NSAppearance(named: .darkAqua)
+            glassView?.appearance = NSAppearance(named: .darkAqua)
         case "system":  // 恢复跟随系统
             hosting.appearance = nil
             panel.appearance = nil
+            glassView?.appearance = nil
         default:
             adaptPanelAppearance()
         }
@@ -1068,8 +1073,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let lumStr = String(format: "%.2f", lum)
         // macOS 26 实测：window.appearance 经 NSGlassEffectView 传到 NSHostingView 的链路断了，
         // .preferredColorScheme 动态更新对已渲染的 hosting view 也不生效（仅静态初始值有效）；
-        // 唯一直写 hosting.appearance 立即生效（SwiftUI colorScheme 随之翻转），故以它为主通道，
-        // panel.appearance 作为副通道（玻璃外框色调）
+        // 唯一直写 hosting.appearance 立即生效（SwiftUI colorScheme 随之翻转），故以它为主通道；
+        // window→glass 的传导同样不可靠，glassView 也要直写（玻璃背景明暗），panel.appearance 作副通道
         let appearanceName: NSAppearance.Name
         if lum > 0.6 {
             appearanceName = .darkAqua
@@ -1083,6 +1088,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if hosting.appearance?.name != appearanceName {
             hosting.appearance = NSAppearance(named: appearanceName)
             panel.appearance = NSAppearance(named: appearanceName)
+            glassView?.appearance = NSAppearance(named: appearanceName)
             adaptLog("亮度 \(lumStr)，切换 \(appearanceName.rawValue)")
         } else {
             adaptLog("亮度 \(lumStr)，已是目标外观，不赋值")
@@ -1178,6 +1184,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             glass.cornerRadius = 18
             glass.contentView = hosting
             panel.contentView = glass
+            glassView = glass  // 持有引用：window→glass 的 appearance 传导不可靠，需直写
         } else {
             panel.contentView = hosting
         }
