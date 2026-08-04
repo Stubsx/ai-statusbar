@@ -950,6 +950,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: 面板配色跟随背景
 
     private var requestedCaptureAccess = false  // 每次启动只请求一次录屏权限
+    private var appearanceCaptureGeneration: UInt = 0  // 丢弃异步返回的过期截图
+    private var adaptiveAppearanceName: NSAppearance.Name?  // 滞回区内保持上次自适应判定
 
     /// 调试日志：往 ~/.ai-statusbar/adapt-debug.log 追加一行（ISO 时间戳 + 消息），异常静默
     private func adaptLog(_ msg: String) {
@@ -979,32 +981,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return legacy == false ? "system" : "adaptive"
     }
 
+    /// 同步设置 SwiftUI、窗口和玻璃容器。macOS 26 的玻璃只改 appearance 不保证底色有足够反差，
+    /// 因此深/浅外观同时给玻璃加方向一致的 tint；system 模式仍保留系统原生无 tint 行为。
+    private func setPanelAppearance(_ name: NSAppearance.Name?) {
+        let appearance = name.flatMap { NSAppearance(named: $0) }
+        if hosting.appearance?.name != name { hosting.appearance = appearance }
+        if panel.appearance?.name != name { panel.appearance = appearance }
+        if glassView?.appearance?.name != name { glassView?.appearance = appearance }
+        if #available(macOS 26.0, *), let glass = glassView as? NSGlassEffectView {
+            switch name {
+            case .darkAqua:
+                glass.tintColor = NSColor.black.withAlphaComponent(0.25)
+                // NSGlassEffectView 的 tint 很克制，白色窗口上仅靠 tint 不足以托住白字；
+                // 在内容层后加半透明底色，仍保留玻璃纹理，同时保证文字对比度。
+                hosting.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.52).cgColor
+            case .aqua:
+                glass.tintColor = NSColor.white.withAlphaComponent(0.20)
+                hosting.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.50).cgColor
+            default:
+                glass.tintColor = nil
+                hosting.layer?.backgroundColor = NSColor.clear.cgColor
+            }
+        }
+    }
+
     /// 统一入口：按模式应用面板外观。light/dark/system 直写（不发 SCK 请求，开销可忽略）；
     /// adaptive 走背景采样。定时器/拖动/切 app/切 Space/设置变更都调这里。
     /// window→glass/hosting 的 appearance 传导均不可靠，三者都要直写。
     private func applyPanelAppearanceMode() {
+        appearanceCaptureGeneration &+= 1
+        let generation = appearanceCaptureGeneration
         switch panelAppearanceMode() {
         case "light":
-            hosting.appearance = NSAppearance(named: .aqua)
-            panel.appearance = NSAppearance(named: .aqua)
-            glassView?.appearance = NSAppearance(named: .aqua)
+            adaptiveAppearanceName = nil
+            setPanelAppearance(.aqua)
         case "dark":
-            hosting.appearance = NSAppearance(named: .darkAqua)
-            panel.appearance = NSAppearance(named: .darkAqua)
-            glassView?.appearance = NSAppearance(named: .darkAqua)
+            adaptiveAppearanceName = nil
+            setPanelAppearance(.darkAqua)
         case "system":  // 恢复跟随系统
-            hosting.appearance = nil
-            panel.appearance = nil
-            glassView?.appearance = nil
+            adaptiveAppearanceName = nil
+            setPanelAppearance(nil)
         default:
-            adaptPanelAppearance()
+            adaptPanelAppearance(generation: generation)
         }
     }
 
     /// adaptive 模式：截取面板正下方区域算平均亮度，亮背景→深色配色，暗背景→浅色配色（反差保证可读）。
     /// CGWindowListCreateImage 在 macOS 15+ 已废弃且静默返回 nil，改用 ScreenCaptureKit。
-    /// 滞回防抖动：>0.6 深 / <0.4 浅 / 中间不动。低版本/无权限等失败路径静默降级（跟随系统）。
-    private func adaptPanelAppearance() {
+    /// 采样图保持面板宽高比，避免 ScreenCaptureKit 的透明留边稀释亮度；
+    /// 滞回防抖动：>=0.58 深 / <=0.42 浅 / 中间保持上次判定。
+    private func adaptPanelAppearance(generation: UInt) {
         guard panel.isVisible else { return }  // 面板不可见直接返回，省电
         // SCScreenshotManager 需要 macOS 14；低版本静默降级（不动 appearance）
         guard #available(macOS 14.0, *) else { return }
@@ -1021,7 +1047,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         // AppKit 坐标(左下原点) → Quartz 全局坐标(主屏左上原点)
         var rect = panel.frame
-        rect.origin.y = NSScreen.screens[0].frame.height - rect.origin.y - rect.height
+        let primaryTop = NSScreen.screens.first?.frame.maxY ?? 0
+        rect.origin.y = primaryTop - rect.maxY
         SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { [weak self] content, error in
             guard let self else { return }
             if let error {
@@ -1029,20 +1056,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return
             }
             guard let content else { return }
-            guard let display = content.displays.first(where: { $0.frame.intersects(rect) }) else {
+            // 跨屏边缘时选择与面板相交面积最大的显示器，并把采样范围裁进该显示器。
+            guard let display = content.displays
+                .filter({ $0.frame.intersects(rect) })
+                .max(by: {
+                    let lhs = $0.frame.intersection(rect)
+                    let rhs = $1.frame.intersection(rect)
+                    return lhs.width * lhs.height < rhs.width * rhs.height
+                })
+            else {
                 self.adaptLog("找不到相交 display: rect=\(rect) displays=\(content.displays.count)")
                 return
             }
+            let captureRect = rect.intersection(display.frame)
+            guard !captureRect.isNull, captureRect.width > 0, captureRect.height > 0 else { return }
             // 排除自己 app 的窗口，避免采到面板自身
             let own = content.windows.filter {
                 $0.owningApplication?.bundleIdentifier == Bundle.main.bundleIdentifier
             }
             let filter = SCContentFilter(display: display, excludingWindows: own)
             let config = SCStreamConfiguration()
-            config.sourceRect = rect.offsetBy(dx: -display.frame.origin.x,
-                                              dy: -display.frame.origin.y)  // 相对显示器的点坐标
-            config.width = 4
-            config.height = 4
+            config.sourceRect = captureRect.offsetBy(dx: -display.frame.origin.x,
+                                                     dy: -display.frame.origin.y)
+            // 24 像素长边已足够判断整体明暗，同时让输出宽高比贴近采样区域。
+            let longSide = 24.0
+            if captureRect.width >= captureRect.height {
+                config.width = Int(longSide)
+                config.height = max(1, Int((longSide * captureRect.height / captureRect.width).rounded()))
+            } else {
+                config.height = Int(longSide)
+                config.width = max(1, Int((longSide * captureRect.width / captureRect.height).rounded()))
+            }
+            // 明确填满目标小图；比例已在上方保持，关闭系统默认留边可避免透明黑边参与统计。
+            config.preservesAspectRatio = false
             config.showsCursor = false
             SCScreenshotManager.captureImage(contentFilter: filter, configuration: config) { image, error in
                 if let error {
@@ -1050,48 +1096,86 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     return
                 }
                 guard let image else { return }
-                DispatchQueue.main.async { self.applyAppearance(for: image) }
+                DispatchQueue.main.async {
+                    // 截图异步完成前可能已切换模式/背景，只允许最新请求生效。
+                    guard self.appearanceCaptureGeneration == generation,
+                          self.panelAppearanceMode() == "adaptive"
+                    else { return }
+                    self.applyAppearance(for: image)
+                }
             }
         }
     }
 
-    /// 主线程：CGImage 缩到 4x4 算平均亮度（Rec.709 加权），按滞回切 hosting/panel 的 appearance
-    private func applyAppearance(for image: CGImage) {
-        var pixels = [UInt8](repeating: 0, count: 64)
-        guard let ctx = CGContext(data: &pixels, width: 4, height: 4, bitsPerComponent: 8,
-                                  bytesPerRow: 16, space: CGColorSpaceCreateDeviceRGB(),
-                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
-        else { return }
-        ctx.draw(image, in: CGRect(x: 0, y: 0, width: 4, height: 4))
-        var lum = 0.0
-        for i in stride(from: 0, to: 64, by: 4) {
-            lum += 0.2126 * Double(pixels[i]) / 255
-                 + 0.7152 * Double(pixels[i + 1]) / 255
-                 + 0.0722 * Double(pixels[i + 2]) / 255
+    /// 把小图转换为 RGBA，忽略透明填充并对预乘 alpha 反算真实颜色。
+    /// 对亮度排序后裁掉两端各 10%，降低少量高亮/阴影内容对整张卡片判定的干扰。
+    private func backgroundLuminance(for image: CGImage) -> (value: Double, valid: Int, total: Int)? {
+        let width = image.width
+        let height = image.height
+        guard width > 0, height > 0 else { return nil }
+        let bytesPerRow = width * 4
+        var pixels = [UInt8](repeating: 0, count: bytesPerRow * height)
+        let bitmapInfo = CGBitmapInfo.byteOrder32Big.rawValue
+            | CGImageAlphaInfo.premultipliedLast.rawValue
+        guard let ctx = CGContext(data: &pixels, width: width, height: height, bitsPerComponent: 8,
+                                  bytesPerRow: bytesPerRow, space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: bitmapInfo)
+        else { return nil }
+        ctx.interpolationQuality = .medium
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        var luminances: [Double] = []
+        luminances.reserveCapacity(width * height)
+        for i in stride(from: 0, to: pixels.count, by: 4) {
+            let alpha = Double(pixels[i + 3]) / 255
+            guard alpha >= 0.05 else { continue }  // 透明留边或无内容区域
+            // CGContext 输出 premultipliedLast；反预乘后才是屏幕内容自身的颜色。
+            let red = min(1, Double(pixels[i]) / 255 / alpha)
+            let green = min(1, Double(pixels[i + 1]) / 255 / alpha)
+            let blue = min(1, Double(pixels[i + 2]) / 255 / alpha)
+            luminances.append(0.2126 * red + 0.7152 * green + 0.0722 * blue)
         }
-        lum /= 16
+
+        let total = width * height
+        // 有效内容太少时不猜测，维持当前外观并等待下次采样。
+        guard luminances.count >= max(4, total / 8) else { return nil }
+        luminances.sort()
+        let trim = luminances.count >= 20 ? luminances.count / 10 : 0
+        let kept = luminances[trim..<(luminances.count - trim)]
+        return (kept.reduce(0, +) / Double(kept.count), luminances.count, total)
+    }
+
+    /// 主线程：按背景亮度和滞回阈值切换 hosting/panel/glass 的 appearance。
+    private func applyAppearance(for image: CGImage) {
+        guard let sample = backgroundLuminance(for: image) else {
+            adaptLog("有效背景像素不足，保持现状")
+            return
+        }
+        let lum = sample.value
         let lumStr = String(format: "%.2f", lum)
         // macOS 26 实测：window.appearance 经 NSGlassEffectView 传到 NSHostingView 的链路断了，
         // .preferredColorScheme 动态更新对已渲染的 hosting view 也不生效（仅静态初始值有效）；
         // 唯一直写 hosting.appearance 立即生效（SwiftUI colorScheme 随之翻转），故以它为主通道；
         // window→glass 的传导同样不可靠，glassView 也要直写（玻璃背景明暗），panel.appearance 作副通道
         let appearanceName: NSAppearance.Name
-        if lum > 0.6 {
+        if lum >= 0.58 {
             appearanceName = .darkAqua
-        } else if lum < 0.4 {
+        } else if lum <= 0.42 {
             appearanceName = .aqua
+        } else if let previous = adaptiveAppearanceName {
+            appearanceName = previous
         } else {
-            adaptLog("亮度 \(lumStr)，滞回保持现状")
-            return  // 滞回区间保持现状，防抖动
+            // 首次进入 adaptive 时不能没有结论；中点只用于首次判定，之后由滞回保持稳定。
+            appearanceName = lum >= 0.5 ? .darkAqua : .aqua
         }
-        // 目标与当前不同才赋值
-        if hosting.appearance?.name != appearanceName {
-            hosting.appearance = NSAppearance(named: appearanceName)
-            panel.appearance = NSAppearance(named: appearanceName)
-            glassView?.appearance = NSAppearance(named: appearanceName)
-            adaptLog("亮度 \(lumStr)，切换 \(appearanceName.rawValue)")
+        adaptiveAppearanceName = appearanceName
+        let changed = hosting.appearance?.name != appearanceName
+        // 即使文字外观已相同，也同步一次玻璃 tint/内容底色，覆盖“系统原本就是该外观”的启动场景。
+        setPanelAppearance(appearanceName)
+        if changed {
+            adaptLog("亮度 \(lumStr)（有效 \(sample.valid)/\(sample.total)），切换 \(appearanceName.rawValue)")
         } else {
-            adaptLog("亮度 \(lumStr)，已是目标外观，不赋值")
+            adaptLog("亮度 \(lumStr)（有效 \(sample.valid)/\(sample.total)），已是目标外观")
         }
     }
 
@@ -1176,6 +1260,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         hosting = DraggableHostingView(rootView: PanelView(store: store, bare: systemGlass))
         hosting.wantsLayer = true
         hosting.layer?.backgroundColor = NSColor.clear.cgColor  // 防止透明窗口边缘泛灰
+        hosting.layer?.cornerRadius = 18
+        hosting.layer?.masksToBounds = true
         panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 320, height: 200),
                         styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.identifier = NSUserInterfaceItemIdentifier("AIStatusPanel")
