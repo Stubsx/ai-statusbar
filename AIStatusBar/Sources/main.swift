@@ -503,8 +503,7 @@ struct PanelView: View {
                                     .frame(width: 15, height: 15)
                                     .overlay(
                                         RoundedRectangle(cornerRadius: 3, style: .continuous)
-                                            .stroke(day.date == today && !day.future
-                                                    ? Color.primary.opacity(0.8) : Color.clear,
+                                            .stroke(heatStroke(day: day, today: today),
                                                     lineWidth: 1)
                                     )
                                     .onHover { inside in
@@ -530,8 +529,13 @@ struct PanelView: View {
                             .font(.system(size: 9))
                             .foregroundColor(.secondary.opacity(0.7))
                         RoundedRectangle(cornerRadius: 2, style: .continuous)
-                            .fill(Color.primary.opacity(0.1))
+                            .fill(Color.clear)
                             .frame(width: 9, height: 9)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 2, style: .continuous)
+                                    .stroke(Color.primary.opacity(colorScheme == .dark ? 0.18 : 0.14),
+                                            lineWidth: 1)
+                            )
                         HStack(spacing: 2) {
                             ForEach(heatPalette.indices, id: \.self) { level in
                                 RoundedRectangle(cornerRadius: 2, style: .continuous)
@@ -555,11 +559,20 @@ struct PanelView: View {
         .padding(.top, 2)
     }
 
-    /// 0 = 中性灰；非零日按近十周五分位数分为五级，避免极端值压缩色差。
+    /// 未来日 = 全透明；无活动日 = 不填充（由 heatStroke 画淡描边"空槽"，
+    /// 与任何有色级别结构性区分）；非零日按近十周五分位数分五级，避免极端值压缩色差。
     private func heatColor(day: HeatDay, thresholds: [Int]) -> Color {
-        if day.future { return Color.clear }
-        if day.total <= 0 { return Color.primary.opacity(0.1) }
+        if day.future || day.total <= 0 { return Color.clear }
         return heatPalette[heatLevel(day.total, thresholds: thresholds) - 1]
+    }
+
+    /// 今天 = 主色描边；无活动日 = 淡描边空槽；其余无描边。
+    private func heatStroke(day: HeatDay, today: String) -> Color {
+        if day.date == today && !day.future { return Color.primary.opacity(0.8) }
+        if !day.future && day.total <= 0 {
+            return Color.primary.opacity(colorScheme == .dark ? 0.18 : 0.14)
+        }
+        return Color.clear
     }
 
     private func heatLevel(_ value: Int, thresholds: [Int]) -> Int {
@@ -581,23 +594,26 @@ struct PanelView: View {
         }
     }
 
-    /// 保持统一蓝色色相，在明暗模式下分别调校亮度与饱和度。
+    /// 两种模式统一原则："无活动"是描边空槽，L1 起就是清晰可辨的蓝。
+    /// 浅色：饱和度与深度同步递增（白底上越深越强）。
+    /// 深色：以饱和度递增为主，亮度只在窄区间内爬升，峰值是最高饱和的电蓝
+    /// 而非最白；色相随级别从宝蓝微滑向青蓝以增强"热"感。
     private var heatPalette: [Color] {
         if colorScheme == .dark {
             return [
-                Color(red: 0.08, green: 0.14, blue: 0.24),
-                Color(red: 0.10, green: 0.23, blue: 0.40),
-                Color(red: 0.12, green: 0.37, blue: 0.62),
-                Color(red: 0.15, green: 0.54, blue: 0.85),
-                Color(red: 0.39, green: 0.72, blue: 1.00),
+                Color(hue: 215.0 / 360, saturation: 0.55, brightness: 0.45),
+                Color(hue: 210.0 / 360, saturation: 0.68, brightness: 0.58),
+                Color(hue: 205.0 / 360, saturation: 0.80, brightness: 0.72),
+                Color(hue: 198.0 / 360, saturation: 0.90, brightness: 0.85),
+                Color(hue: 192.0 / 360, saturation: 0.95, brightness: 0.98),
             ]
         }
         return [
-            Color(red: 0.91, green: 0.95, blue: 1.00),
-            Color(red: 0.73, green: 0.85, blue: 1.00),
-            Color(red: 0.46, green: 0.70, blue: 0.98),
-            Color(red: 0.18, green: 0.52, blue: 0.86),
-            Color(red: 0.03, green: 0.35, blue: 0.69),
+            Color(hue: 213.0 / 360, saturation: 0.22, brightness: 1.00),
+            Color(hue: 211.0 / 360, saturation: 0.42, brightness: 0.99),
+            Color(hue: 209.0 / 360, saturation: 0.62, brightness: 0.95),
+            Color(hue: 206.0 / 360, saturation: 0.82, brightness: 0.88),
+            Color(hue: 202.0 / 360, saturation: 0.95, brightness: 0.78),
         ]
     }
 
