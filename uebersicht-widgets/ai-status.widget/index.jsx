@@ -86,11 +86,11 @@ export const render = ({ output, error }) => {
   let data = null
   try { data = JSON.parse(output) } catch (e) {}
   if (error || !data) {
-    return <div className="card"><div className="header">AI AGENTS</div><div className="state">加载中…</div></div>
+    return <div className="card"><div className="header">灵眸</div><div className="state">加载中…</div></div>
   }
   return (
     <div className="card">
-      <div className="header"><span>AI AGENTS</span><span>{data.updated_at}</span></div>
+      <div className="header"><span>灵眸</span><span>{data.updated_at}</span></div>
       {data.tools.map(t => (
         <div key={t.key}>
           <div className="row">

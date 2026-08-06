@@ -268,7 +268,7 @@ struct PanelView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
-                Text("AI AGENTS")
+                Text("灵眸")
                     .font(.system(size: 11, weight: .semibold))
                     .tracking(1)
                     .foregroundColor(.secondary)
