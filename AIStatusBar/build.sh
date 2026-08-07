@@ -17,9 +17,13 @@ cp ../swiftbar-plugins/ai_status.py "$APP/Contents/Resources/"
 cp Info.plist "$APP/Contents/"
 [ -f ../icons/AppIcon.icns ] && cp ../icons/AppIcon.icns "$APP/Contents/Resources/"
 
-# 写入真实版本号（与 DMG 命名一致）：CFBundleVersion 恒为 1 会让
-# LaunchServices/usernoted 永远命中旧缓存，通知里的名称和图标不更新
+# 写入真实版本号：未提交的本地构建使用下一个版本号，确保反复调试图标时
+# LaunchServices/usernoted 不会因为版本号未变而继续命中旧通知缓存。
 VER_COUNT=$(git -C .. rev-list --count HEAD 2>/dev/null || echo 0)
+if ! git -C .. diff --quiet --ignore-submodules -- \
+    || ! git -C .. diff --cached --quiet --ignore-submodules --; then
+  VER_COUNT=$((VER_COUNT + 1))
+fi
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString 1.0.${VER_COUNT}" \
     -c "Set :CFBundleVersion ${VER_COUNT}" "$APP/Contents/Info.plist"
 
@@ -34,7 +38,3 @@ fi
 
 echo "✅ 构建完成: $(pwd)/$APP"
 lipo -info "$APP/Contents/MacOS/AIStatusBar"
-
-# 重新注册 LaunchServices，刷新缓存的应用名称/图标（否则通知仍显示旧值）
-LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
-[ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$APP" || true
