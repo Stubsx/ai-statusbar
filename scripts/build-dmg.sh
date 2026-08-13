@@ -1,8 +1,15 @@
 #!/bin/bash
 # 构建 AIStatusBar.app 并打包为 DMG（发版时由 scripts/release.sh 调用，也可手动执行）
-set -e
+set -euo pipefail
 ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 cd "$ROOT"
+
+# 先校验发布参数，避免配置错误时已经生成 DMG 或清理历史产物。
+SIGN_IDENTITY="${SIGN_IDENTITY:-}"
+if [[ -n "${NOTARY_PROFILE:-}" && "$SIGN_IDENTITY" != "Developer ID Application:"* ]]; then
+  echo "错误：使用 NOTARY_PROFILE 公证时必须同时指定 Developer ID Application 签名身份" >&2
+  exit 1
+fi
 
 "$ROOT/AIStatusBar/build.sh"
 
@@ -21,18 +28,30 @@ ln -s /Applications "$STAGE/应用程序"
 
 hdiutil create -volname "${PRODUCT_NAME}安装" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 
+# Developer ID 发布可通过环境变量启用 DMG 签名和 Apple 公证：
+# SIGN_IDENTITY="Developer ID Application: ..." NOTARY_PROFILE="profile" ./scripts/build-dmg.sh
+if [[ "$SIGN_IDENTITY" == "Developer ID Application:"* ]]; then
+  codesign --force --timestamp --sign "$SIGN_IDENTITY" "$DMG"
+fi
+if [[ -n "${NOTARY_PROFILE:-}" ]]; then
+  xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
+  xcrun stapler staple "$DMG"
+fi
+
 # 只保留最近 3 个 DMG（按版本号倒序），删除其余历史产物。
 # 版本号格式为 x.y.z；sort -t. -k1,1n -k2,2n -k3,3n 按数字段排序，
 # 跳过文件名前缀差异（中文 灵眸- 与遗留英文 AIStatusBar-）。
 KEEP=3
-mapfile -t DMG_LIST < <(ls -1 dist/*.dmg 2>/dev/null \
-  | sed -E 's#.*/[^-]+-([0-9]+\.[0-9]+\.[0-9]+)\.dmg$#\1 &#' \
-  | sort -t. -k1,1n -k2,2n -k3,3nr \
-  | cut -d' ' -f2-)
-if (( ${#DMG_LIST[@]} > KEEP )); then
-  printf '%s\n' "${DMG_LIST[@]:KEEP}" | while IFS= read -r f; do
-    [ -n "$f" ] && rm -f "$f"
-  done
-fi
+index=0
+find dist -maxdepth 1 -type f \( -name "${PRODUCT_NAME}-*.dmg" -o -name 'AIStatusBar-*.dmg' \) \
+  | sed -nE 's#(.*-([0-9]+\.[0-9]+\.[0-9]+)\.dmg)$#\2 \1#p' \
+  | sort -t. -k1,1nr -k2,2nr -k3,3nr \
+  | cut -d' ' -f2- \
+  | while IFS= read -r f; do
+      index=$((index + 1))
+      if (( index > KEEP )) && [[ -n "$f" ]]; then
+        rm -f -- "$f"
+      fi
+    done
 
-echo "✅ DMG 打包完成: $ROOT/$DMG"
+echo "✅ DMG 打包完成: ${ROOT}/${DMG}"

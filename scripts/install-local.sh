@@ -1,10 +1,10 @@
 #!/bin/bash
 # 构建 AIStatusBar，替换本地安装的 /Applications/灵眸.app，并重启运行实例。
-# post-commit hook 后台调用；也可手动执行：./scripts/install-local.sh
+# post-commit hook 前台调用；也可手动执行：./scripts/install-local.sh
 set -euo pipefail
 ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 APP_NAME="灵眸"
-BUNDLE_ID="com.jabber1.aistatusbar"
+BUNDLE_ID="io.github.stubsx.lingmou"
 SRC_APP="$ROOT/AIStatusBar/AIStatusBar.app"
 INSTALLED_APP="/Applications/${APP_NAME}.app"
 

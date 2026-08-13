@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""AI CLI 状态采集核心：Codex App、Codex CLI、Kimi Code、Claude Code、ZCode。
+"""AI CLI 状态采集核心：Codex App、Codex CLI、Kimi Code、Claude Code、Hermes、ZCode。
 默认输出 SwiftBar 格式，--json 输出 JSON 供 Übersicht 小组件使用。"""
 
 import base64
@@ -10,9 +10,9 @@ import os
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -48,18 +48,51 @@ SETTINGS_PATH = os.path.join(USAGE_DIR, "settings.json")
 DEFAULT_BUSY_SEC = 300  # 默认 5 分钟
 
 
+def _ensure_private_dir():
+    """本地缓存含会话文件路径和用量信息，仅允许当前用户访问。"""
+    os.makedirs(USAGE_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(USAGE_DIR, 0o700)
+    except Exception:
+        pass
+
+
+def _write_private_json(path, value):
+    """写入 JSON 后收紧权限；不用于修改第三方工具自己的凭据。"""
+    _ensure_private_dir()
+    fd, temp_path = tempfile.mkstemp(prefix=".lingmou-", suffix=".tmp", dir=USAGE_DIR)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(value, fh)
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+        try:
+            os.unlink(temp_path)
+        except Exception:
+            pass
+        raise
+
+
 def _load_busy_settings():
     try:
-        s = json.load(open(SETTINGS_PATH, encoding="utf-8"))
+        with open(SETTINGS_PATH, encoding="utf-8") as fh:
+            s = json.load(fh)
         return (int(s.get("default_busy_sec", DEFAULT_BUSY_SEC)),
                 dict(s.get("per_tool", {})),
                 int(s.get("offline_after_sec", 10800)),
-                bool(s.get("kimi_monthly_quota", False)))  # 默认关闭网页会员月度额度
+                bool(s.get("kimi_monthly_quota", False)),
+                bool(s.get("online_quota", False)))  # 联网配额默认关闭
     except Exception:
-        return DEFAULT_BUSY_SEC, {}, 10800, False
+        return DEFAULT_BUSY_SEC, {}, 10800, False, False
 
 
-_DEFAULT_BUSY, _PER_TOOL_BUSY, _OFFLINE_AFTER, _KIMI_MONTHLY_ENABLED = _load_busy_settings()
+(_DEFAULT_BUSY, _PER_TOOL_BUSY, _OFFLINE_AFTER, _KIMI_MONTHLY_ENABLED,
+ _ONLINE_QUOTA_ENABLED) = _load_busy_settings()
 
 
 def busy_sec(tool):
@@ -99,7 +132,8 @@ def transient_conns(proc_names=(), pids=(), max_age=CONN_PERSIST_SEC, min_age=15
         local_port = parts[-1].split("->")[0].rsplit(":", 1)[-1]
         cur.setdefault(parts[0], set()).add(local_port)
     try:
-        state = json.load(open(CONN_STATE, encoding="utf-8"))
+        with open(CONN_STATE, encoding="utf-8") as fh:
+            state = json.load(fh)
     except Exception:
         state = {}
     busy = {}
@@ -114,8 +148,7 @@ def transient_conns(proc_names=(), pids=(), max_age=CONN_PERSIST_SEC, min_age=15
         state[proc] = new_prev
         busy[proc] = transient
     try:
-        os.makedirs(USAGE_DIR, exist_ok=True)
-        json.dump(state, open(CONN_STATE, "w"))
+        _write_private_json(CONN_STATE, state)
     except Exception:
         pass
     return busy
@@ -194,7 +227,9 @@ def codex_status():
         pass
     if not names:  # 退回 session_index.jsonl（主要是 CLI 会话）
         try:
-            for r in iter_jsonl(open(CODEX_INDEX, encoding="utf-8").read()):
+            with open(CODEX_INDEX, encoding="utf-8") as fh:
+                records = iter_jsonl(fh.read())
+            for r in records:
                 if r.get("id"):
                     try:
                         ts = datetime.fromisoformat(
@@ -269,7 +304,8 @@ def kimi_status():
     for state_path in glob.glob(os.path.join(KIMI_SESSIONS, "*", "*", "state.json")):
         sdir = os.path.dirname(state_path)
         try:
-            meta = json.load(open(state_path, encoding="utf-8"))
+            with open(state_path, encoding="utf-8") as fh:
+                meta = json.load(fh)
             title = meta.get("title") or os.path.basename(meta.get("workDir", ""))
         except Exception:
             title = "(未命名会话)"
@@ -359,7 +395,7 @@ def claude_status():
                     last_msg = (d["type"], kinds)
         except Exception:
             pass
-        if not title:  # 目录名是 cwd 编码：-Users-jabber1-Desktop-xxx → xxx
+        if not title:  # 目录名是 cwd 编码：-Users-example-Desktop-project → project
             title = os.path.basename(os.path.dirname(f)).lstrip("-").rsplit("-", 1)[-1] or "(未命名会话)"
         if latest is None or mtime > latest[1]:
             latest = (title, mtime)
@@ -478,14 +514,14 @@ def zcode_status():
 QUOTA_CACHE = os.path.join(USAGE_DIR, "quota-cache.json")
 QUOTA_TTL = 300
 KIMI_CREDENTIALS = os.path.join(HOME, ".kimi-code", "credentials", "kimi-code.json")
-KIMI_TOKEN_URL = "https://auth.kimi.com/api/oauth/token"
 KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
-KIMI_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
 KIMI_DESKTOP_TOKENS = os.path.join(
     HOME, "Library", "Application Support", "kimi-desktop", "bridge-store", "token-store.json")
 KIMI_MONTHLY_URL = (
     "https://www.kimi.com/apiv2/"
     "kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats")
+KIMI_MONTHLY_CACHE = os.path.join(USAGE_DIR, "kimi-monthly-cache.json")
+KIMI_MONTHLY_TTL = 3600  # 网页会员月度额度变化慢，每小时最多请求一次
 
 
 def _quota_window(minutes, used_percent, resets_at):
@@ -508,7 +544,8 @@ CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 def _codex_quota_api():
     """实时接口：只看顶层 rate_limit（忽略 Spark 等 additional_rate_limits 附加池）。
     凭据只进内存，不写日志/缓存。字段缺失或结构不符 → None（走本地兜底）。"""
-    auth = json.load(open(CODEX_AUTH, encoding="utf-8"))
+    with open(CODEX_AUTH, encoding="utf-8") as fh:
+        auth = json.load(fh)
     tokens = auth.get("tokens") or {}
     token, account = tokens.get("access_token"), tokens.get("account_id")
     if not token or not account:
@@ -586,29 +623,6 @@ def codex_quota():
         return None
 
 
-def _kimi_refresh(cred):
-    """刷新 access_token 并写回凭据文件（refresh_token 会轮换，不写回会踢掉 CLI）。
-    返回新 access_token。"""
-    body = urllib.parse.urlencode({
-        "client_id": KIMI_CLIENT_ID,
-        "grant_type": "refresh_token",
-        "refresh_token": cred.get("refresh_token", ""),
-    }).encode("utf-8")
-    req = urllib.request.Request(KIMI_TOKEN_URL, data=body)
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
-    with urllib.request.urlopen(req, timeout=8) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    if not data.get("access_token"):
-        raise RuntimeError("刷新响应缺少 access_token")
-    cred["access_token"] = data["access_token"]
-    if data.get("refresh_token"):
-        cred["refresh_token"] = data["refresh_token"]
-    cred["expires_in"] = int(data.get("expires_in", 900))
-    cred["expires_at"] = int(NOW) + cred["expires_in"]
-    json.dump(cred, open(KIMI_CREDENTIALS, "w"))
-    return cred["access_token"]
-
-
 def _kimi_usage(token):
     req = urllib.request.Request(KIMI_USAGE_URL)
     req.add_header("Authorization", f"Bearer {token}")
@@ -619,22 +633,23 @@ def _kimi_usage(token):
 def _kimi_coding_quota():
     """查询 Kimi 限额 API：usage → 本周窗口，limits[] → 各时长窗口。"""
     try:
-        cred = json.load(open(KIMI_CREDENTIALS, encoding="utf-8"))
+        with open(KIMI_CREDENTIALS, encoding="utf-8") as fh:
+            cred = json.load(fh)
         token = cred.get("access_token")
         if not token:
             return None
         exp = cred.get("expires_at", 0) or 0
         if exp > 1e12:  # expires_at 可能是毫秒时间戳
             exp /= 1000
+        # 不代替 Kimi Code 刷新或改写凭据，避免与 CLI 并发写入或轮换 refresh token。
         if NOW >= exp - 30:
-            token = _kimi_refresh(cred)
+            return None
         try:
             data = _kimi_usage(token)
         except urllib.error.HTTPError as e:
-            if e.code != 401:
-                raise
-            token = _kimi_refresh(cred)  # 401 兜底：刷新后重试一次
-            data = _kimi_usage(token)
+            if e.code == 401:
+                return None
+            raise
 
         def _win(src, minutes):
             try:
@@ -684,8 +699,15 @@ def _jwt_exp(token):
         return 0
 
 
-def _kimi_monthly_quota():
-    """读取 Kimi App 同步的网页 token，返回月度总额度及网页侧 5h/7d 窗口。
+def _kimi_monthly_token_mtime():
+    try:
+        return os.path.getmtime(KIMI_DESKTOP_TOKENS)
+    except Exception:
+        return 0
+
+
+def _kimi_monthly_quota_live():
+    """实时读取 Kimi App 网页 token，返回月度总额度及网页侧 5h/7d 窗口。
 
     token 文件只读、不复制、不刷新；401/过期时交给 Kimi App 重新登录续期。
     返回 (quota, notice)，quota 为 None 时由调用方回退 Coding API。
@@ -693,7 +715,8 @@ def _kimi_monthly_quota():
     if not os.path.exists(KIMI_DESKTOP_TOKENS):
         return None, "需要安装并登录 Kimi App，才能读取月度配额"
     try:
-        store = json.load(open(KIMI_DESKTOP_TOKENS, encoding="utf-8"))
+        with open(KIMI_DESKTOP_TOKENS, encoding="utf-8") as fh:
+            store = json.load(fh)
         token = (store.get("tokens") or {}).get("access_token")
         if not token:
             return None, "Kimi 登录已过期，请打开 Kimi App 重新登录"
@@ -747,6 +770,29 @@ def _kimi_monthly_quota():
         return None, None
 
 
+def _kimi_monthly_quota():
+    """月度额度独立缓存一小时；token 文件变化（重新登录）时立即失效。"""
+    token_mtime = _kimi_monthly_token_mtime()
+    try:
+        with open(KIMI_MONTHLY_CACHE, encoding="utf-8") as fh:
+            cache = json.load(fh) or {}
+        if (NOW - float(cache.get("checked_at", 0)) < KIMI_MONTHLY_TTL
+                and float(cache.get("token_mtime", 0)) == token_mtime):
+            return cache.get("quota"), cache.get("notice")
+    except Exception:
+        pass
+
+    quota, notice = _kimi_monthly_quota_live()
+    try:
+        _write_private_json(KIMI_MONTHLY_CACHE, {
+            "checked_at": int(NOW), "token_mtime": token_mtime,
+            "quota": quota, "notice": notice,
+        })
+    except Exception:
+        pass
+    return quota, notice
+
+
 def kimi_quota():
     """月度开关开启时优先网页会员额度；不可用则回退原有 Coding API。"""
     coding = _kimi_coding_quota()
@@ -775,7 +821,8 @@ ZCODE_QUOTA_SOURCES = [("Bigmodel - Coding Plan", "https://open.bigmodel.cn"),
 def zcode_quota():
     """用 model-providers.json 里 Coding Plan 的 apiKey 查智谱限额接口。"""
     try:
-        providers = json.load(open(ZCODE_PROVIDERS, encoding="utf-8"))
+        with open(ZCODE_PROVIDERS, encoding="utf-8") as fh:
+            providers = json.load(fh)
         if not isinstance(providers, list):
             return None
         key, base = None, None
@@ -821,31 +868,45 @@ def collect_quota():
     """限额数据，300 秒缓存；刷新失败的工具保留旧缓存值。"""
     cache = {}
     try:
-        cache = json.load(open(QUOTA_CACHE, encoding="utf-8")) or {}
-        # 开关变化时绕过旧缓存，确保月度额度立即出现/消失。
-        # 登录提醒也不缓存：用户打开 Kimi App 重新登录后，下一轮即可自动恢复。
-        kimi_notice = bool((cache.get("kimi") or {}).get("notice"))
+        with open(QUOTA_CACHE, encoding="utf-8") as fh:
+            cache = json.load(fh) or {}
+        same_mode = cache.get("_online_quota_enabled") == _ONLINE_QUOTA_ENABLED
+        # 开关变化时绕过旧缓存，确保联网/月度配额立即出现或消失。
+        # Kimi App 重新登录会改写 token 文件，也应立即绕过总缓存。
+        token_mtime = (_kimi_monthly_token_mtime()
+                       if _ONLINE_QUOTA_ENABLED and _KIMI_MONTHLY_ENABLED else 0)
+        token_unchanged = (not _ONLINE_QUOTA_ENABLED or not _KIMI_MONTHLY_ENABLED
+                           or cache.get("_kimi_token_mtime") == token_mtime)
         if (NOW - os.path.getmtime(QUOTA_CACHE) <= QUOTA_TTL
+                and same_mode
                 and cache.get("_kimi_monthly_enabled") == _KIMI_MONTHLY_ENABLED
-                and not (_KIMI_MONTHLY_ENABLED and kimi_notice)):
+                and token_unchanged):
+            cache.pop("_online_quota_enabled", None)
             cache.pop("_kimi_monthly_enabled", None)
+            cache.pop("_kimi_token_mtime", None)
             return cache
     except Exception:
-        pass
+        same_mode = False
     fresh = {}
-    for key, fn in (("codex", codex_quota), ("kimi", kimi_quota), ("zcode", zcode_quota)):
+    sources = (("codex", codex_quota), ("kimi", kimi_quota), ("zcode", zcode_quota)) \
+        if _ONLINE_QUOTA_ENABLED else (("codex", _codex_quota_local),)
+    for key, fn in sources:
         try:
             v = fn()
         except Exception:
             v = None
-        if v is None:
+        if v is None and same_mode:
             v = cache.get(key)  # 失败降级：沿用旧缓存
         fresh[key] = v
+    fresh.setdefault("kimi", None)
+    fresh.setdefault("zcode", None)
     try:
-        os.makedirs(USAGE_DIR, exist_ok=True)
         cached = dict(fresh)
+        cached["_online_quota_enabled"] = _ONLINE_QUOTA_ENABLED
         cached["_kimi_monthly_enabled"] = _KIMI_MONTHLY_ENABLED
-        json.dump(cached, open(QUOTA_CACHE, "w"))
+        cached["_kimi_token_mtime"] = (_kimi_monthly_token_mtime()
+                                        if _ONLINE_QUOTA_ENABLED and _KIMI_MONTHLY_ENABLED else 0)
+        _write_private_json(QUOTA_CACHE, cached)
     except Exception:
         pass
     return fresh
@@ -857,8 +918,12 @@ USAGE_MAX_AGE = 70 * 86400  # 只索引最近 70 天的日志文件（热力图�
 
 
 def _usage_db():
-    os.makedirs(USAGE_DIR, exist_ok=True)
+    _ensure_private_dir()
     db = sqlite3.connect(USAGE_DB)
+    try:
+        os.chmod(USAGE_DB, 0o600)
+    except Exception:
+        pass
     db.execute("""CREATE TABLE IF NOT EXISTS daily(
         date TEXT, tool TEXT, input INT, output INT, cache INT,
         PRIMARY KEY(date, tool))""")
@@ -1154,14 +1219,18 @@ def render_swiftbar(data):
             return f"{t['letter']}🟢{t['busy_count']}"
         return f"{t['letter']}{mark(t['state'])}"
 
+    def safe_title(value):
+        """阻止任务标题通过换行或 SwiftBar 的 `|` 参数语法注入菜单项。"""
+        return " ".join(str(value or "").replace("|", "¦").splitlines()).strip()
+
     out.append(" ".join(badge(t) for t in data["tools"]))
     out.append("---")
     for t in data["tools"]:
         out.append(f"{mark(t['state'])} {t['name']}：{label[t['state']]}（{t['detail']}）")
         for item in t["busy_items"][:3]:
-            out.append(f"▶ {item['title']} | size=11 color=green")
+            out.append(f"▶ {safe_title(item['title'])} | size=11 color=green")
         if t["latest_title"] and not t["busy_items"]:
-            out.append(f"最近任务：{t['latest_title']} · {t['latest_age']} | size=11 color=gray")
+            out.append(f"最近任务：{safe_title(t['latest_title'])} · {t['latest_age']} | size=11 color=gray")
         out.append("---")
     out.append("C=Codex App  X=Codex CLI  K=Kimi  L=Claude  H=Hermes  Z=ZCode | size=10 color=gray")
     out.append("🟢工作中  🟡空闲  ⚪️未运行 | size=10 color=gray")
@@ -1170,6 +1239,9 @@ def render_swiftbar(data):
 
 
 if __name__ == "__main__":
+    if sys.version_info < (3, 8):
+        print("灵眸需要 Python 3.8 或更高版本", file=sys.stderr)
+        raise SystemExit(2)
     data = collect()
     if "--json" in sys.argv:
         print(json.dumps(data, ensure_ascii=False))

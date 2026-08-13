@@ -1,5 +1,12 @@
 .DS_Store
+.zcode/
+.env
+.env.*
+!.env.example
 __pycache__/
 *.pyc
+*.log
+.build/
+DerivedData/
 dist/
 AIStatusBar/AIStatusBar.app/

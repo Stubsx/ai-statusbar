@@ -86,9 +86,22 @@ final class SettingsStore: ObservableObject {
     @Published var defaultSec = 300 { didSet { save() } }
     @Published var perTool: [String: Int] = [:] { didSet { save() } }
     @Published var offlineAfterSec = 10800 { didSet { save() } }
-    @Published var notifyEnabled = true { didSet { save() } }
+    @Published var notifyEnabled = false {
+        didSet {
+            save()
+            if notifyEnabled && !oldValue {
+                UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+            }
+        }
+    }
     @Published var notifyTools: [String: Bool] = [:] { didSet { save() } }
     @Published var showDockIcon = false { didSet { save(); applyDockIconPolicy() } }
+    @Published var onlineQuota = false {
+        didSet {
+            if !onlineQuota { kimiMonthlyQuota = false }
+            save()
+        }
+    }
     @Published var kimiMonthlyQuota = false { didSet { save() } }
 
     /// Dock 图标开关即时生效：regular 显示 Dock 图标，accessory 纯菜单栏
@@ -123,7 +136,8 @@ final class SettingsStore: ObservableObject {
             if let t = n["tools"] as? [String: Bool] { notifyTools = t }
         }
         if let v = obj["show_dock_icon"] as? Bool { showDockIcon = v }
-        if let v = obj["kimi_monthly_quota"] as? Bool { kimiMonthlyQuota = v }
+        if let v = obj["online_quota"] as? Bool { onlineQuota = v }
+        if let v = obj["kimi_monthly_quota"] as? Bool { kimiMonthlyQuota = onlineQuota && v }
     }
 
     private func save() {
@@ -133,12 +147,19 @@ final class SettingsStore: ObservableObject {
             "offline_after_sec": offlineAfterSec,
             "notify": ["enabled": notifyEnabled, "tools": notifyTools],
             "show_dock_icon": showDockIcon,
+            "online_quota": onlineQuota,
             "kimi_monthly_quota": kimiMonthlyQuota,
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: .prettyPrinted) else { return }
-        try? FileManager.default.createDirectory(atPath: NSHomeDirectory() + "/.ai-statusbar",
-                                                 withIntermediateDirectories: true)
-        try? data.write(to: URL(fileURLWithPath: path))
+        let directory = NSHomeDirectory() + "/.ai-statusbar"
+        try? FileManager.default.createDirectory(
+            atPath: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory)
+        let url = URL(fileURLWithPath: path)
+        try? data.write(to: url, options: .atomic)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
     }
 }
 
@@ -146,14 +167,40 @@ final class SettingsStore: ObservableObject {
 
 final class StatusStore: ObservableObject {
     @Published var data: StatusData?
-    let scriptPath: String
+    @Published var collectorError: String?
+    let scriptPath: String?
+    let pythonPath: String?
     let settings: SettingsStore
     private var timer: Timer?
+    private var isRefreshing = false
 
-    init(scriptPath: String, settings: SettingsStore) {
+    init(scriptPath: String?, settings: SettingsStore) {
         self.scriptPath = scriptPath
+        self.pythonPath = Self.findPython()
         self.settings = settings
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    private static func findPython() -> String? {
+        let candidates = [
+            "/opt/homebrew/bin/python3",
+            "/usr/local/bin/python3",
+            "/Library/Frameworks/Python.framework/Versions/Current/bin/python3",
+            "/opt/local/bin/python3",
+            "/opt/anaconda3/bin/python3",
+            NSHomeDirectory() + "/anaconda3/bin/python3",
+            NSHomeDirectory() + "/miniconda3/bin/python3",
+            NSHomeDirectory() + "/miniforge3/bin/python3",
+            NSHomeDirectory() + "/.pyenv/shims/python3",
+            "/usr/bin/python3",
+        ]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    private func finishRefresh(error: String?) {
+        DispatchQueue.main.async {
+            self.collectorError = error
+            self.isRefreshing = false
+        }
     }
 
     func start() {
@@ -164,22 +211,48 @@ final class StatusStore: ObservableObject {
     }
 
     func refresh() {
-        let path = scriptPath
+        guard !isRefreshing else { return }
+        guard let path = scriptPath else {
+            collectorError = "应用资源不完整：缺少 ai_status.py"
+            return
+        }
+        guard let python = pythonPath else {
+            collectorError = "未找到 Python 3，请安装 Python 3.8 或更高版本"
+            return
+        }
+        isRefreshing = true
         DispatchQueue.global(qos: .userInitiated).async {
             let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            p.arguments = ["python3", path, "--json"]
+            p.executableURL = URL(fileURLWithPath: python)
+            p.arguments = [path, "--json"]
             let pipe = Pipe()
             p.standardOutput = pipe
             p.standardError = FileHandle.nullDevice
-            guard (try? p.run()) != nil else { return }
+            do {
+                try p.run()
+            } catch {
+                self.finishRefresh(error: "无法启动状态采集器，请检查 Python 3")
+                return
+            }
             let raw = pipe.fileHandleForReading.readDataToEndOfFile()
             p.waitUntilExit()
+            guard p.terminationStatus == 0 else {
+                let message = p.terminationStatus == 2
+                    ? "Python 版本过低，需要 Python 3.8 或更高版本"
+                    : "状态采集器异常退出（代码 \(p.terminationStatus)）"
+                self.finishRefresh(error: message)
+                return
+            }
             let decoder = JSONDecoder()
             decoder.keyDecodingStrategy = .convertFromSnakeCase
-            guard let decoded = try? decoder.decode(StatusData.self, from: raw) else { return }
+            guard let decoded = try? decoder.decode(StatusData.self, from: raw) else {
+                self.finishRefresh(error: "状态数据格式不兼容，请尝试更新灵眸")
+                return
+            }
             DispatchQueue.main.async {
                 self.data = decoded
+                self.collectorError = nil
+                self.isRefreshing = false
                 self.checkTransitions(decoded)
                 NotificationCenter.default.post(name: .statusUpdated, object: nil)
             }
@@ -265,6 +338,15 @@ struct ConditionalGlass: ViewModifier {
 
 final class DraggableHostingView<Content: View>: NSHostingView<Content> {
     override var mouseDownCanMoveWindow: Bool { true }
+
+    // 右键菜单构建回调：由 AppDelegate 注入，读运行时置顶状态构建菜单。
+    var contextMenuBuilder: (() -> NSMenu)?
+
+    // AppKit 在右键派发早期调用本方法，覆盖整个 hosting view 区域，
+    // 不受 SwiftUI .contextMenu 命中测试限制——空白处也能弹菜单。
+    override func menu(for event: NSEvent) -> NSMenu? {
+        contextMenuBuilder?()
+    }
 }
 
 // MARK: - 桌面浮窗内容
@@ -297,6 +379,12 @@ struct PanelView: View {
                 usageView
             } else if tab == "quota" {
                 quotaView
+            } else if let error = store.collectorError {
+                Text(error)
+                    .font(.system(size: 11))
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.vertical, 4)
             } else if let tools = store.data?.tools {
                 let visible = tools.filter { $0.state != "off" }  // 未运行的不显示
                 if visible.isEmpty {
@@ -356,14 +444,6 @@ struct PanelView: View {
         .padding(.bottom, 10)
         .frame(width: 300)  // 固定宽度，长标题自动省略号
         .modifier(ConditionalGlass(bare: bare))
-        .contextMenu {
-            Button(pinned ? "取消置顶" : "置顶") {
-                pinned.toggle()
-                applyLevel()
-            }
-            Divider()
-            Button("退出灵眸") { NSApp.terminate(nil) }
-        }
         .onAppear { applyLevel() }
     }
 
@@ -745,8 +825,9 @@ struct PanelView: View {
 struct SettingsView: View {
     @ObservedObject var settings: SettingsStore
     @State private var notifyDiag = ""
+    @State private var showOnlineQuotaAlert = false
     @State private var showKimiMonthlyAlert = false
-    @AppStorage("panelAppearanceMode") private var appearanceMode = "adaptive"
+    @AppStorage("panelAppearanceMode") private var appearanceMode = "system"
 
     var body: some View {
         ScrollView {
@@ -785,6 +866,22 @@ struct SettingsView: View {
                     row("面板配色") {
                         modePicker($appearanceMode, options: [("浅色", "light"), ("深色", "dark"),
                                                               ("跟随系统", "system"), ("背景自适应", "adaptive")])
+                    }
+                }
+
+                // 联网配额默认关闭，只向各工具自己的厂商接口发送对应令牌。
+                card(title: "联网配额", icon: "network", subtitle: "读取本地登录状态并请求对应厂商的配额接口") {
+                    row("查询账号配额") {
+                        Toggle("", isOn: onlineQuotaBinding)
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .controlSize(.small)
+                            .alert("启用联网配额？", isPresented: $showOnlineQuotaAlert) {
+                                Button("取消", role: .cancel) {}
+                                Button("启用") { settings.onlineQuota = true }
+                            } message: {
+                                Text("灵眸会读取各工具的本地登录令牌，并仅发送到对应厂商的 HTTPS 配额接口。令牌不会写入灵眸日志或缓存。")
+                            }
                     }
                 }
 
@@ -850,7 +947,10 @@ struct SettingsView: View {
         .frame(width: 470)
         .alert("启用 Kimi 月度配额？", isPresented: $showKimiMonthlyAlert) {
             Button("取消", role: .cancel) {}
-            Button("启用") { settings.kimiMonthlyQuota = true }
+            Button("启用") {
+                settings.onlineQuota = true
+                settings.kimiMonthlyQuota = true
+            }
         } message: {
             Text("此功能需要安装并登录 Kimi App。灵眸只读取其本地登录状态；若登录过期，配额面板会提醒你打开 Kimi App 重新登录。")
         }
@@ -969,6 +1069,17 @@ struct SettingsView: View {
     }
 
     /// 开启前先说明 Kimi App 依赖；关闭不需要二次确认。
+    private var onlineQuotaBinding: Binding<Bool> {
+        Binding(
+            get: { settings.onlineQuota },
+            set: { enabled in
+                if enabled { showOnlineQuotaAlert = true }
+                else { settings.onlineQuota = false }
+            }
+        )
+    }
+
+    /// 开启前先说明 Kimi App 依赖；关闭不需要二次确认。
     private var kimiMonthlyBinding: Binding<Bool> {
         Binding(
             get: { settings.kimiMonthlyQuota },
@@ -1004,7 +1115,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let scriptPath = Bundle.main.path(forResource: "ai_status", ofType: "py")
-            ?? (NSHomeDirectory() + "/Desktop/未命名文件夹/swiftbar-plugins/ai_status.py")
         store = StatusStore(scriptPath: scriptPath, settings: settings)
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -1095,6 +1205,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// 调试日志：往 ~/.ai-statusbar/adapt-debug.log 追加一行（ISO 时间戳 + 消息），异常静默
     private func adaptLog(_ msg: String) {
+        guard ProcessInfo.processInfo.environment["LINGMOU_DEBUG"] == "1" else { return }
         let dir = NSHomeDirectory() + "/.ai-statusbar"
         let path = dir + "/adapt-debug.log"
         let line = ISO8601DateFormatter().string(from: Date()) + " " + msg + "\n"
@@ -1128,6 +1239,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if hosting.appearance?.name != name { hosting.appearance = appearance }
         if panel.appearance?.name != name { panel.appearance = appearance }
         if glassView?.appearance?.name != name { glassView?.appearance = appearance }
+        #if compiler(>=6.2)
         if #available(macOS 26.0, *), let glass = glassView as? NSGlassEffectView {
             switch name {
             case .darkAqua:
@@ -1143,6 +1255,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 hosting.layer?.backgroundColor = NSColor.clear.cgColor
             }
         }
+        #endif
     }
 
     /// 统一入口：按模式应用面板外观。light/dark/system 直写（不发 SCK 请求，开销可忽略）；
@@ -1395,16 +1508,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func buildPanel() {
         // macOS 26+：用 AppKit 官方液态玻璃 NSGlassEffectView 做容器
-        let systemGlass: Bool
-        if #available(macOS 26.0, *) { systemGlass = true } else { systemGlass = false }
+        var systemGlass = false
+        #if compiler(>=6.2)
+        if #available(macOS 26.0, *) { systemGlass = true }
+        #endif
         hosting = DraggableHostingView(rootView: PanelView(store: store, bare: systemGlass))
         hosting.wantsLayer = true
         hosting.layer?.backgroundColor = NSColor.clear.cgColor  // 防止透明窗口边缘泛灰
         hosting.layer?.cornerRadius = 18
         hosting.layer?.masksToBounds = true
+        // 面板右键菜单：点任意位置（含空白处）都能弹出，复用菜单栏已有的 togglePin 逻辑
+        hosting.contextMenuBuilder = { [weak self] in
+            self?.buildPanelContextMenu() ?? NSMenu()
+        }
         panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 320, height: 200),
                         styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.identifier = NSUserInterfaceItemIdentifier("AIStatusPanel")
+        #if compiler(>=6.2)
         if #available(macOS 26.0, *) {
             let glass = NSGlassEffectView(frame: NSRect(x: 0, y: 0, width: 320, height: 200))
             glass.cornerRadius = 18
@@ -1414,6 +1534,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             panel.contentView = hosting
         }
+        #else
+        panel.contentView = hosting
+        #endif
         let pinned = UserDefaults.standard.object(forKey: "panelPinned") == nil
             ? true : UserDefaults.standard.bool(forKey: "panelPinned")
         panel.isFloatingPanel = pinned
@@ -1508,6 +1631,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if pinned {
             panel.orderFront(nil)  // 置顶时顺手提到最前，避免找不到
         }
+    }
+
+    /// 构建桌面浮窗右键菜单（置顶切换 + 退出）。复用 togglePin() 动作，
+    /// 与菜单栏下拉的"置顶桌面卡片"项保持同一套置顶逻辑。
+    private func buildPanelContextMenu() -> NSMenu {
+        let menu = NSMenu()
+        let pinned = UserDefaults.standard.object(forKey: "panelPinned") == nil
+            ? true : UserDefaults.standard.bool(forKey: "panelPinned")
+        let pinItem = NSMenuItem(
+            title: pinned ? "取消置顶" : "置顶",
+            action: #selector(togglePin),
+            keyEquivalent: "")
+        pinItem.target = self
+        menu.addItem(pinItem)
+        menu.addItem(.separator())
+        let quitItem = NSMenuItem(
+            title: "退出灵眸",
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "")
+        quitItem.target = NSApp
+        menu.addItem(quitItem)
+        return menu
     }
 
     @objc private func doRefresh() {

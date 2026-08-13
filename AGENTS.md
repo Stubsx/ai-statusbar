@@ -2,19 +2,20 @@
 
 ## Project Structure & Module Organization
 
-`swiftbar-plugins/ai_status.py` is the canonical collector. It reads local Codex, Kimi, Claude, Hermes, and ZCode state and emits either SwiftBar text or the JSON contract consumed by other frontends. `ai-cli-status.10s.py` is the thin SwiftBar launcher. The native menu-bar app lives in `AIStatusBar/`: edit `Sources/main.swift` and `Info.plist`, then run `build.sh` to produce the local `AIStatusBar.app` bundle (git-ignored build artifact, not tracked). `uebersicht-widgets/ai-status.widget/index.jsx` provides the desktop widget. App icons belong in `icons/`; release packaging is handled by `scripts/`. Generated DMGs under `dist/` are ignored.
+`swiftbar-plugins/ai_status.py` is the canonical collector. It reads local Codex, Kimi, Claude, Hermes, and ZCode state and emits either SwiftBar text or the JSON contract consumed by other frontends. `ai-cli-status.10s.py` is the thin SwiftBar launcher. The native menu-bar app lives in `AIStatusBar/`: edit `Sources/main.swift` and `Info.plist`, then run `build.sh` to produce the local `AIStatusBar.app` bundle (git-ignored build artifact, not tracked). `uebersicht-widgets/ai-status.widget/index.jsx` provides the desktop widget and reads the collector from an installed `/Applications/灵眸.app`. App icons belong in `icons/`; release packaging is handled by `scripts/`. Generated DMGs under `dist/` are ignored.
 
 ## Build, Test, and Development Commands
 
 ```bash
 python3 swiftbar-plugins/ai_status.py --json | python3 -m json.tool
 python3 -m py_compile swiftbar-plugins/ai_status.py
+./scripts/check-open-source.sh
 ./AIStatusBar/build.sh
 open AIStatusBar/AIStatusBar.app
 ./scripts/build-dmg.sh
 ```
 
-The first two commands validate collector output and syntax. `build.sh` compiles a universal `arm64`/`x86_64` app, copies the collector into the bundle, and signs it with the stable self-signed `Lingmou Local` identity (falls back to ad-hoc when the certificate is absent, e.g. on another machine). The stable identity keeps TCC grants (screen recording, notifications) valid across rebuilds. `build-dmg.sh` rebuilds and creates a versioned installer in `dist/`.
+The first three commands validate collector output, syntax, tests, privacy checks, and Swift compilation. `build.sh` compiles a universal `arm64`/`x86_64` app, copies the collector into the bundle, and signs it with the configured identity. Local builds prefer the stable self-signed `Lingmou Local` identity and fall back to ad-hoc signing; public releases must use a Developer ID identity and Apple notarization. `build-dmg.sh` rebuilds and creates a versioned installer in `dist/`.
 
 ## Coding Style & Naming Conventions
 
@@ -30,4 +31,4 @@ Recent commits use concise Chinese, action-oriented subjects such as `修复 Kim
 
 ## Security & Local Configuration
 
-Never commit user session logs, databases, credentials, or `~/.ai-statusbar/settings.json`. The Übersicht command currently contains an absolute local path; update it for local use without introducing personal paths into unrelated changes.
+Never commit user session logs, databases, credentials, `~/.ai-statusbar/settings.json`, or personal absolute paths. Network quota checks and privacy-sensitive permissions must remain opt-in by default.

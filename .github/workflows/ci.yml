@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check source, tests, privacy and build scripts
+        run: ./scripts/check-open-source.sh
+      - name: Build universal app
+        env:
+          APP_VERSION: 0.0.0
+        run: ./AIStatusBar/build.sh
+      - name: Verify bundle
+        run: |
+          codesign --verify --deep --strict AIStatusBar/AIStatusBar.app
+          lipo -archs AIStatusBar/AIStatusBar.app/Contents/MacOS/AIStatusBar | grep -q arm64
+          lipo -archs AIStatusBar/AIStatusBar.app/Contents/MacOS/AIStatusBar | grep -q x86_64

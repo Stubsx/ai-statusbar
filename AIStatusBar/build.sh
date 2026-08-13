@@ -1,19 +1,28 @@
 #!/bin/bash
 # 构建独立的 AIStatusBar.app（不依赖 SwiftBar / Übersicht）
-# 通用二进制（arm64 + x86_64）+ 临时签名，便于分发
-set -e
+# 通用二进制（arm64 + x86_64）；本地默认自签名，公开发布支持 Developer ID 签名
+set -euo pipefail
 cd "$(dirname "$0")"
 APP="AIStatusBar.app"
+
+for tool in swiftc lipo codesign security git; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "错误：缺少 $tool。请先安装 Xcode Command Line Tools：xcode-select --install" >&2
+    exit 1
+  fi
+done
 rm -rf "$APP" .build
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" .build
 
 for arch in arm64 x86_64; do
-  swiftc -O -target ${arch}-apple-macosx12.0 -o ".build/AIStatusBar-${arch}" Sources/main.swift
+  swiftc -O -target "${arch}-apple-macosx12.0" -o ".build/AIStatusBar-${arch}" Sources/main.swift
 done
 lipo -create .build/AIStatusBar-arm64 .build/AIStatusBar-x86_64 -output "$APP/Contents/MacOS/AIStatusBar"
 rm -rf .build
 
 cp ../swiftbar-plugins/ai_status.py "$APP/Contents/Resources/"
+cp ../LICENSE "$APP/Contents/Resources/LICENSE.txt"
+cp ../PRIVACY.md "$APP/Contents/Resources/PRIVACY.md"
 cp Info.plist "$APP/Contents/"
 [ -f ../icons/AppIcon.icns ] && cp ../icons/AppIcon.icns "$APP/Contents/Resources/"
 
@@ -27,14 +36,32 @@ fi
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString 1.0.${VER_COUNT}" \
     -c "Set :CFBundleVersion ${VER_COUNT}" "$APP/Contents/Info.plist"
 
+VERSION="${APP_VERSION:-1.0.${VER_COUNT}}"
+if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "错误：APP_VERSION 必须是 x.y.z 格式，当前为 $VERSION" >&2
+  exit 1
+fi
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION}" \
+    "$APP/Contents/Info.plist"
+
 # 固定自签名（Lingmou Local）：签名身份跨构建稳定，TCC 授权（录屏/通知）不会随重建失效；
 # 证书不存在时（如换机分发）回退 ad-hoc 临时签名
-SIGN_IDENTITY="Lingmou Local"
-if security find-identity -p codesigning | grep -q "$SIGN_IDENTITY"; then
-  codesign --force --deep --sign "$SIGN_IDENTITY" "$APP" >/dev/null 2>&1 || true
+SIGN_IDENTITY="${SIGN_IDENTITY:-Lingmou Local}"
+if security find-identity -p codesigning | grep -Fq "$SIGN_IDENTITY"; then
+  if [[ "$SIGN_IDENTITY" == "Developer ID Application:"* ]]; then
+    codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
+  else
+    codesign --force --deep --sign "$SIGN_IDENTITY" "$APP"
+  fi
 else
-  codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || true
+  if [[ "$SIGN_IDENTITY" == "Developer ID Application:"* ]]; then
+    echo "错误：未找到指定的 Developer ID 签名身份：$SIGN_IDENTITY" >&2
+    exit 1
+  fi
+  echo "提示：未找到本地签名身份 '$SIGN_IDENTITY'，使用 ad-hoc 签名（不适合直接公开分发）。" >&2
+  codesign --force --deep --sign - "$APP"
 fi
+codesign --verify --deep --strict "$APP"
 
-echo "✅ 构建完成: $(pwd)/$APP"
+echo "✅ 构建完成: $(pwd)/${APP}（版本 ${VERSION}）"
 lipo -info "$APP/Contents/MacOS/AIStatusBar"

@@ -1,6 +1,7 @@
 import { React } from 'uebersicht'
 
-export const command = "/usr/bin/env python3 /Users/jabber1/Desktop/未命名文件夹/swiftbar-plugins/ai_status.py --json"
+// 复用已安装原生 App 中的采集器，避免依赖开发者电脑上的仓库绝对路径。
+export const command = '/usr/bin/env python3 "/Applications/灵眸.app/Contents/Resources/ai_status.py" --json'
 export const refreshFrequency = 10000
 
 const COLORS = { busy: '#30d158', idle: '#ffd60a', off: '#636366' }
@@ -85,8 +86,8 @@ export const className = `
 export const render = ({ output, error }) => {
   let data = null
   try { data = JSON.parse(output) } catch (e) {}
-  if (error || !data) {
-    return <div className="card"><div className="header">灵眸</div><div className="state">加载中…</div></div>
+  if (error || !data || !Array.isArray(data.tools)) {
+    return <div className="card"><div className="header">灵眸</div><div className="state">无法读取状态，请先安装并启动灵眸</div></div>
   }
   return (
     <div className="card">
@@ -99,12 +100,12 @@ export const render = ({ output, error }) => {
             <span className="state">{LABELS[t.state]}{t.state !== 'busy' && ` · ${t.detail}`}</span>
             {t.state === 'busy' && <span className="count">{t.busy_count}</span>}
           </div>
-          {t.busy_titles.length > 0 && (
+          {t.busy_items.length > 0 && (
             <ul className="tasks">
-              {t.busy_titles.map((title, i) => <li key={i}>▶ {title}</li>)}
+              {t.busy_items.map(item => <li key={item.id}>▶ {item.title}</li>)}
             </ul>
           )}
-          {t.busy_titles.length === 0 && t.latest_title && (
+          {t.busy_items.length === 0 && t.latest_title && (
             <div className="latest">最近：{t.latest_title} · {t.latest_age}</div>
           )}
         </div>
