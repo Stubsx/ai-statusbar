@@ -3,6 +3,7 @@
 """AI CLI 状态采集核心：Codex App、Codex CLI、Kimi Code、Claude Code、ZCode。
 默认输出 SwiftBar 格式，--json 输出 JSON 供 Übersicht 小组件使用。"""
 
+import base64
 import glob
 import json
 import os
@@ -52,12 +53,13 @@ def _load_busy_settings():
         s = json.load(open(SETTINGS_PATH, encoding="utf-8"))
         return (int(s.get("default_busy_sec", DEFAULT_BUSY_SEC)),
                 dict(s.get("per_tool", {})),
-                int(s.get("offline_after_sec", 10800)))  # 默认 3 小时无活动算未运行，0=从不
+                int(s.get("offline_after_sec", 10800)),
+                bool(s.get("kimi_monthly_quota", False)))  # 默认关闭网页会员月度额度
     except Exception:
-        return DEFAULT_BUSY_SEC, {}, 10800
+        return DEFAULT_BUSY_SEC, {}, 10800, False
 
 
-_DEFAULT_BUSY, _PER_TOOL_BUSY, _OFFLINE_AFTER = _load_busy_settings()
+_DEFAULT_BUSY, _PER_TOOL_BUSY, _OFFLINE_AFTER, _KIMI_MONTHLY_ENABLED = _load_busy_settings()
 
 
 def busy_sec(tool):
@@ -479,6 +481,11 @@ KIMI_CREDENTIALS = os.path.join(HOME, ".kimi-code", "credentials", "kimi-code.js
 KIMI_TOKEN_URL = "https://auth.kimi.com/api/oauth/token"
 KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
 KIMI_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
+KIMI_DESKTOP_TOKENS = os.path.join(
+    HOME, "Library", "Application Support", "kimi-desktop", "bridge-store", "token-store.json")
+KIMI_MONTHLY_URL = (
+    "https://www.kimi.com/apiv2/"
+    "kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats")
 
 
 def _quota_window(minutes, used_percent, resets_at):
@@ -609,7 +616,7 @@ def _kimi_usage(token):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def kimi_quota():
+def _kimi_coding_quota():
     """查询 Kimi 限额 API：usage → 本周窗口，limits[] → 各时长窗口。"""
     try:
         cred = json.load(open(KIMI_CREDENTIALS, encoding="utf-8"))
@@ -658,6 +665,105 @@ def kimi_quota():
         return {"plan": plan, "windows": windows, "updated_at": int(NOW)}
     except Exception:
         return None
+
+
+def _iso_timestamp(value):
+    try:
+        return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return 0
+
+
+def _jwt_exp(token):
+    """只读取 JWT 的 exp 做本地过期预判；签名仍由服务端验证。"""
+    try:
+        part = token.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        return int(json.loads(base64.urlsafe_b64decode(part).decode("utf-8")).get("exp", 0))
+    except Exception:
+        return 0
+
+
+def _kimi_monthly_quota():
+    """读取 Kimi App 同步的网页 token，返回月度总额度及网页侧 5h/7d 窗口。
+
+    token 文件只读、不复制、不刷新；401/过期时交给 Kimi App 重新登录续期。
+    返回 (quota, notice)，quota 为 None 时由调用方回退 Coding API。
+    """
+    if not os.path.exists(KIMI_DESKTOP_TOKENS):
+        return None, "需要安装并登录 Kimi App，才能读取月度配额"
+    try:
+        store = json.load(open(KIMI_DESKTOP_TOKENS, encoding="utf-8"))
+        token = (store.get("tokens") or {}).get("access_token")
+        if not token:
+            return None, "Kimi 登录已过期，请打开 Kimi App 重新登录"
+        exp = _jwt_exp(token)
+        if exp and NOW >= exp - 30:
+            return None, "Kimi 登录已过期，请打开 Kimi App 重新登录"
+
+        req = urllib.request.Request(KIMI_MONTHLY_URL, data=b"{}", method="POST")
+        req.add_header("Authorization", f"Bearer {token}")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        balance = data.get("subscriptionBalance") or {}
+        total_ratio = float(balance.get("amountUsedRatio"))
+        code_ratio = max(0.0, float(balance.get("kimiCodeUsedRatio", 0)))
+        total_percent = max(0.0, total_ratio * 100)
+        code_percent = min(total_percent, code_ratio * 100)
+        kimi_percent = max(0.0, total_percent - code_percent)
+        monthly = {
+            "kind": "month",
+            "label": "本月",
+            "used_percent": round(total_percent, 1),
+            "resets_at": _iso_timestamp(balance.get("expireTime")),
+            "components": [
+                {"key": "kimi", "label": "Kimi", "used_percent": round(kimi_percent, 1)},
+                {"key": "code", "label": "Code", "used_percent": round(code_percent, 1)},
+            ],
+        }
+        if not monthly["resets_at"]:
+            raise ValueError("月度额度缺少重置时间")
+
+        windows = [monthly]
+        for key, kind, label in (("ratelimitCode5h", "5h", "5小时"),
+                                 ("ratelimitCode7d", "week", "7天")):
+            item = data.get(key) or {}
+            if not item.get("enabled", True) or item.get("ratio") is None:
+                continue
+            windows.append({
+                "kind": kind,
+                "label": label,
+                "used_percent": round(max(0.0, float(item["ratio"]) * 100), 1),
+                "resets_at": _iso_timestamp(item.get("resetTime")),
+            })
+        return {"windows": windows, "updated_at": int(NOW)}, None
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return None, "Kimi 登录已过期，请打开 Kimi App 重新登录"
+        return None, None
+    except Exception:
+        return None, None
+
+
+def kimi_quota():
+    """月度开关开启时优先网页会员额度；不可用则回退原有 Coding API。"""
+    coding = _kimi_coding_quota()
+    if not _KIMI_MONTHLY_ENABLED:
+        return coding
+
+    monthly, notice = _kimi_monthly_quota()
+    if monthly:
+        monthly["plan"] = coding.get("plan") if coding else None
+        return monthly
+
+    # 即使 Coding API 也不可用，仍返回空配额承载登录提醒。
+    result = dict(coding) if coding else {
+        "plan": None, "windows": [], "updated_at": int(NOW)}
+    if notice:
+        result["notice"] = notice
+    return result
 
 
 ZCODE_PROVIDERS = os.path.join(HOME, ".zcode", "v2", "model-providers.json")
@@ -715,9 +821,15 @@ def collect_quota():
     """限额数据，300 秒缓存；刷新失败的工具保留旧缓存值。"""
     cache = {}
     try:
-        if NOW - os.path.getmtime(QUOTA_CACHE) <= QUOTA_TTL:
-            return json.load(open(QUOTA_CACHE, encoding="utf-8"))
         cache = json.load(open(QUOTA_CACHE, encoding="utf-8")) or {}
+        # 开关变化时绕过旧缓存，确保月度额度立即出现/消失。
+        # 登录提醒也不缓存：用户打开 Kimi App 重新登录后，下一轮即可自动恢复。
+        kimi_notice = bool((cache.get("kimi") or {}).get("notice"))
+        if (NOW - os.path.getmtime(QUOTA_CACHE) <= QUOTA_TTL
+                and cache.get("_kimi_monthly_enabled") == _KIMI_MONTHLY_ENABLED
+                and not (_KIMI_MONTHLY_ENABLED and kimi_notice)):
+            cache.pop("_kimi_monthly_enabled", None)
+            return cache
     except Exception:
         pass
     fresh = {}
@@ -731,7 +843,9 @@ def collect_quota():
         fresh[key] = v
     try:
         os.makedirs(USAGE_DIR, exist_ok=True)
-        json.dump(fresh, open(QUOTA_CACHE, "w"))
+        cached = dict(fresh)
+        cached["_kimi_monthly_enabled"] = _KIMI_MONTHLY_ENABLED
+        json.dump(cached, open(QUOTA_CACHE, "w"))
     except Exception:
         pass
     return fresh

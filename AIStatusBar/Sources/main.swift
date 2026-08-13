@@ -10,17 +10,25 @@ struct BusyItem: Codable, Hashable {
     let title: String
 }
 
+struct QuotaComponent: Codable, Hashable {
+    let key: String
+    let label: String
+    let usedPercent: Double
+}
+
 struct QuotaWindow: Codable, Hashable {
     let kind: String
     let label: String
     let usedPercent: Double
     let resetsAt: Int
+    let components: [QuotaComponent]?
 }
 
 struct ToolQuota: Codable {
     let plan: String?
     let windows: [QuotaWindow]
     let updatedAt: Int
+    let notice: String?
 }
 
 struct ToolStatus: Codable {
@@ -81,6 +89,7 @@ final class SettingsStore: ObservableObject {
     @Published var notifyEnabled = true { didSet { save() } }
     @Published var notifyTools: [String: Bool] = [:] { didSet { save() } }
     @Published var showDockIcon = false { didSet { save(); applyDockIconPolicy() } }
+    @Published var kimiMonthlyQuota = false { didSet { save() } }
 
     /// Dock 图标开关即时生效：regular 显示 Dock 图标，accessory 纯菜单栏
     func applyDockIconPolicy() {
@@ -114,6 +123,7 @@ final class SettingsStore: ObservableObject {
             if let t = n["tools"] as? [String: Bool] { notifyTools = t }
         }
         if let v = obj["show_dock_icon"] as? Bool { showDockIcon = v }
+        if let v = obj["kimi_monthly_quota"] as? Bool { kimiMonthlyQuota = v }
     }
 
     private func save() {
@@ -123,6 +133,7 @@ final class SettingsStore: ObservableObject {
             "offline_after_sec": offlineAfterSec,
             "notify": ["enabled": notifyEnabled, "tools": notifyTools],
             "show_dock_icon": showDockIcon,
+            "kimi_monthly_quota": kimiMonthlyQuota,
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: .prettyPrinted) else { return }
         try? FileManager.default.createDirectory(atPath: NSHomeDirectory() + "/.ai-statusbar",
@@ -425,7 +436,9 @@ struct PanelView: View {
                 ForEach(withQuota, id: \.key) { t in
                     VStack(alignment: .leading, spacing: 4) {
                         HStack(spacing: 6) {
-                            Text(t.key == "codex-ide" ? "Codex" : t.name)
+                            let hasMonthly = t.quota?.windows.contains(where: { $0.kind == "month" }) ?? false
+                            Text(t.key == "codex-ide" ? "Codex" :
+                                 (t.key == "kimi" && hasMonthly ? "Kimi" : t.name))
                                 .font(.system(size: 12, weight: .semibold))
                                 .foregroundColor(.primary.opacity(0.9))
                             if let plan = t.quota?.plan, !plan.isEmpty {
@@ -438,8 +451,24 @@ struct PanelView: View {
                             }
                             Spacer()
                         }
+                        if let notice = t.quota?.notice, !notice.isEmpty {
+                            HStack(alignment: .top, spacing: 5) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .font(.system(size: 9))
+                                    .foregroundColor(.orange)
+                                Text(notice)
+                                    .font(.system(size: 10))
+                                    .foregroundColor(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .padding(.vertical, 2)
+                        }
                         ForEach(t.quota?.windows ?? [], id: \.label) { w in
-                            quotaRow(w)
+                            if w.kind == "month", !(w.components ?? []).isEmpty {
+                                monthlyQuotaRow(w)
+                            } else {
+                                quotaRow(w)
+                            }
                         }
                     }
                 }
@@ -467,6 +496,50 @@ struct PanelView: View {
                 .foregroundColor(.secondary)
         }
         .padding(.bottom, 2)
+    }
+
+    /// Kimi 月度额度：两段宽度均按整月额度计算，直观看出网页 Kimi 与 Code 的构成。
+    private func monthlyQuotaRow(_ w: QuotaWindow) -> some View {
+        let components = w.components ?? []
+        return VStack(alignment: .leading, spacing: 3) {
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.08))
+                    HStack(spacing: 0) {
+                        ForEach(components, id: \.key) { component in
+                            Rectangle()
+                                .fill(monthlyComponentColor(component.key))
+                                .frame(width: geo.size.width * CGFloat(
+                                    min(max(component.usedPercent, 0), 100) / 100))
+                        }
+                    }
+                    .clipShape(Capsule())
+                }
+            }
+            .frame(height: 6)
+            Text("\(w.label) · 已用 \(String(format: "%.1f", w.usedPercent))% · \(quotaResetText(w.resetsAt))")
+                .font(.system(size: 10).monospacedDigit())
+                .foregroundColor(.secondary)
+            HStack(spacing: 10) {
+                ForEach(components, id: \.key) { component in
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(monthlyComponentColor(component.key))
+                            .frame(width: 6, height: 6)
+                        Text("\(component.label) \(String(format: "%.1f", component.usedPercent))%")
+                            .font(.system(size: 9).monospacedDigit())
+                            .foregroundColor(.secondary.opacity(0.85))
+                    }
+                }
+            }
+        }
+        .padding(.bottom, 2)
+    }
+
+    private func monthlyComponentColor(_ key: String) -> Color {
+        key == "code"
+            ? Color(red: 0.19, green: 0.82, blue: 0.58)
+            : Color(red: 0.48, green: 0.38, blue: 0.96)
     }
 
     /// 按用量升档着色：低用量绿、中等黄、逼近上限红
@@ -672,96 +745,115 @@ struct PanelView: View {
 struct SettingsView: View {
     @ObservedObject var settings: SettingsStore
     @State private var notifyDiag = ""
+    @State private var showKimiMonthlyAlert = false
     @AppStorage("panelAppearanceMode") private var appearanceMode = "adaptive"
 
     var body: some View {
-        VStack(spacing: 16) {
-            Text("设置")
-                .font(.system(size: 20, weight: .bold))
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 22)
-                .padding(.top, 34)  // 给红绿灯按钮留位
+        ScrollView {
+            VStack(spacing: 16) {
+                Text("设置")
+                    .font(.system(size: 20, weight: .bold))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 22)
+                    .padding(.top, 34)  // 给红绿灯按钮留位
 
-            // 空闲判定时间
-            card(title: "空闲判定时间", icon: "clock", subtitle: "无活动多久后算空闲") {
-                row("统一设置") {
-                    valuePicker($settings.defaultSec,
-                                options: SettingsStore.busyOptions.map { (SettingsStore.labelSec($0), $0) })
-                }
-                divider
-                ForEach(Array(SettingsStore.tools.enumerated()), id: \.offset) { idx, tool in
-                    row(tool.1) {
-                        valuePicker(perToolBinding(tool.0),
-                                    options: [("跟随统一", 0)] + SettingsStore.busyOptions.map { (SettingsStore.labelSec($0), $0) })
+                // 空闲判定时间
+                card(title: "空闲判定时间", icon: "clock", subtitle: "无活动多久后算空闲") {
+                    row("统一设置") {
+                        valuePicker($settings.defaultSec,
+                                    options: SettingsStore.busyOptions.map { (SettingsStore.labelSec($0), $0) })
                     }
-                    if idx < SettingsStore.tools.count - 1 { divider }
+                    divider
+                    ForEach(Array(SettingsStore.tools.enumerated()), id: \.offset) { idx, tool in
+                        row(tool.1) {
+                            valuePicker(perToolBinding(tool.0),
+                                        options: [("跟随统一", 0)] + SettingsStore.busyOptions.map { (SettingsStore.labelSec($0), $0) })
+                        }
+                        if idx < SettingsStore.tools.count - 1 { divider }
+                    }
                 }
-            }
 
-            // 离线判定
-            card(title: "离线判定", icon: "moon.zzz", subtitle: "进程在但无活动，超过后按未运行处理") {
-                row("无活动超过") {
-                    valuePicker($settings.offlineAfterSec, options: SettingsStore.offlineOptions)
+                // 离线判定
+                card(title: "离线判定", icon: "moon.zzz", subtitle: "进程在但无活动，超过后按未运行处理") {
+                    row("无活动超过") {
+                        valuePicker($settings.offlineAfterSec, options: SettingsStore.offlineOptions)
+                    }
                 }
-            }
 
-            // 面板外观
-            card(title: "面板外观", icon: "circle.lefthalf.filled", subtitle: "背景自适应会按面板下方内容明暗自动反差") {
-                row("面板配色") {
-                    modePicker($appearanceMode, options: [("浅色", "light"), ("深色", "dark"),
-                                                          ("跟随系统", "system"), ("背景自适应", "adaptive")])
+                // 面板外观
+                card(title: "面板外观", icon: "circle.lefthalf.filled", subtitle: "背景自适应会按面板下方内容明暗自动反差") {
+                    row("面板配色") {
+                        modePicker($appearanceMode, options: [("浅色", "light"), ("深色", "dark"),
+                                                              ("跟随系统", "system"), ("背景自适应", "adaptive")])
+                    }
                 }
-            }
 
-            // Dock 图标
-            card(title: "Dock 图标", icon: "menubar.dock.rectangle", subtitle: "默认仅显示在菜单栏，不占用 Dock") {
-                row("在 Dock 中显示图标") {
-                    Toggle("", isOn: $settings.showDockIcon)
-                        .labelsHidden()
-                        .toggleStyle(.switch)
-                        .controlSize(.small)
-                }
-            }
-
-            // 通知提醒
-            card(title: "通知提醒", icon: "bell.badge", subtitle: "任务完成（工作中 → 空闲）时推送") {
-                row("开启提醒") {
-                    Toggle("", isOn: $settings.notifyEnabled)
-                        .labelsHidden()
-                        .toggleStyle(.switch)
-                        .controlSize(.small)
-                }
-                divider
-                ForEach(Array(SettingsStore.tools.enumerated()), id: \.offset) { idx, tool in
-                    row(tool.1) {
-                        Toggle("", isOn: notifyBinding(tool.0))
+                // Kimi 网页会员月度额度
+                card(title: "Kimi 月度配额", icon: "chart.bar.xaxis", subtitle: "读取 Kimi App 的网页会员额度") {
+                    row("展示本月额度") {
+                        Toggle("", isOn: kimiMonthlyBinding)
                             .labelsHidden()
                             .toggleStyle(.switch)
                             .controlSize(.small)
                     }
-                    .opacity(settings.notifyEnabled ? 1 : 0.4)
-                    if idx < SettingsStore.tools.count - 1 { divider }
                 }
-                divider
-                HStack(spacing: 10) {
-                    Button("发送测试通知", action: testNotify)
-                        .controlSize(.small)
-                    if !notifyDiag.isEmpty {
-                        Text(notifyDiag)
-                            .font(.system(size: 10))
-                            .foregroundColor(.secondary)
-                            .lineLimit(2)
-                    }
-                    Spacer()
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-            }
 
-            Spacer(minLength: 0)
+                // Dock 图标
+                card(title: "Dock 图标", icon: "menubar.dock.rectangle", subtitle: "默认仅显示在菜单栏，不占用 Dock") {
+                    row("在 Dock 中显示图标") {
+                        Toggle("", isOn: $settings.showDockIcon)
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .controlSize(.small)
+                    }
+                }
+
+                // 通知提醒
+                card(title: "通知提醒", icon: "bell.badge", subtitle: "任务完成（工作中 → 空闲）时推送") {
+                    row("开启提醒") {
+                        Toggle("", isOn: $settings.notifyEnabled)
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .controlSize(.small)
+                    }
+                    divider
+                    ForEach(Array(SettingsStore.tools.enumerated()), id: \.offset) { idx, tool in
+                        row(tool.1) {
+                            Toggle("", isOn: notifyBinding(tool.0))
+                                .labelsHidden()
+                                .toggleStyle(.switch)
+                                .controlSize(.small)
+                        }
+                        .opacity(settings.notifyEnabled ? 1 : 0.4)
+                        if idx < SettingsStore.tools.count - 1 { divider }
+                    }
+                    divider
+                    HStack(spacing: 10) {
+                        Button("发送测试通知", action: testNotify)
+                            .controlSize(.small)
+                        if !notifyDiag.isEmpty {
+                            Text(notifyDiag)
+                                .font(.system(size: 10))
+                                .foregroundColor(.secondary)
+                                .lineLimit(2)
+                        }
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                }
+
+                Spacer(minLength: 0)
+            }
+            .padding(.bottom, 18)
         }
-        .padding(.bottom, 18)
         .frame(width: 470)
+        .alert("启用 Kimi 月度配额？", isPresented: $showKimiMonthlyAlert) {
+            Button("取消", role: .cancel) {}
+            Button("启用") { settings.kimiMonthlyQuota = true }
+        } message: {
+            Text("此功能需要安装并登录 Kimi App。灵眸只读取其本地登录状态；若登录过期，配额面板会提醒你打开 Kimi App 重新登录。")
+        }
     }
 
     // MARK: 组件
@@ -872,6 +964,20 @@ struct SettingsView: View {
             set: { v in
                 if v == 0 { self.settings.perTool.removeValue(forKey: key) }
                 else { self.settings.perTool[key] = v }
+            }
+        )
+    }
+
+    /// 开启前先说明 Kimi App 依赖；关闭不需要二次确认。
+    private var kimiMonthlyBinding: Binding<Bool> {
+        Binding(
+            get: { settings.kimiMonthlyQuota },
+            set: { enabled in
+                if enabled {
+                    showKimiMonthlyAlert = true
+                } else {
+                    settings.kimiMonthlyQuota = false
+                }
             }
         )
     }
