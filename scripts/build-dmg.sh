@@ -38,20 +38,26 @@ if [[ -n "${NOTARY_PROFILE:-}" ]]; then
   xcrun stapler staple "$DMG"
 fi
 
-# 只保留最近 3 个 DMG（按版本号倒序），删除其余历史产物。
+# 当前刚构建的 DMG 始终保留；其余历史产物只保留版本号最高的 2 个。
 # 版本号格式为 x.y.z；sort -t. -k1,1n -k2,2n -k3,3n 按数字段排序，
 # 跳过文件名前缀差异（中文 灵眸- 与遗留英文 AIStatusBar-）。
-KEEP=3
+KEEP_OLD=2
 index=0
 find dist -maxdepth 1 -type f \( -name "${PRODUCT_NAME}-*.dmg" -o -name 'AIStatusBar-*.dmg' \) \
   | sed -nE 's#(.*-([0-9]+\.[0-9]+\.[0-9]+)\.dmg)$#\2 \1#p' \
   | sort -t. -k1,1nr -k2,2nr -k3,3nr \
   | cut -d' ' -f2- \
   | while IFS= read -r f; do
+      [[ "$f" == "$DMG" ]] && continue
       index=$((index + 1))
-      if (( index > KEEP )) && [[ -n "$f" ]]; then
+      if (( index > KEEP_OLD )) && [[ -n "$f" ]]; then
         rm -f -- "$f"
       fi
     done
+
+if [[ ! -s "$DMG" ]]; then
+  echo "错误：DMG 产物在构建后缺失：$DMG" >&2
+  exit 1
+fi
 
 echo "✅ DMG 打包完成: ${ROOT}/${DMG}"

@@ -3,7 +3,7 @@ import SwiftUI
 import UserNotifications
 import ScreenCaptureKit
 
-// MARK: - 数据模型（对应 ai_status.py --json 的输出）
+// MARK: - 数据模型（对应 lingmou-collector --json 的输出）
 
 struct BusyItem: Codable, Hashable {
     let id: String
@@ -168,32 +168,14 @@ final class SettingsStore: ObservableObject {
 final class StatusStore: ObservableObject {
     @Published var data: StatusData?
     @Published var collectorError: String?
-    let scriptPath: String?
-    let pythonPath: String?
+    let collectorPath: String?
     let settings: SettingsStore
     private var timer: Timer?
     private var isRefreshing = false
 
-    init(scriptPath: String?, settings: SettingsStore) {
-        self.scriptPath = scriptPath
-        self.pythonPath = Self.findPython()
+    init(collectorPath: String?, settings: SettingsStore) {
+        self.collectorPath = collectorPath
         self.settings = settings
-    }
-
-    private static func findPython() -> String? {
-        let candidates = [
-            "/opt/homebrew/bin/python3",
-            "/usr/local/bin/python3",
-            "/Library/Frameworks/Python.framework/Versions/Current/bin/python3",
-            "/opt/local/bin/python3",
-            "/opt/anaconda3/bin/python3",
-            NSHomeDirectory() + "/anaconda3/bin/python3",
-            NSHomeDirectory() + "/miniconda3/bin/python3",
-            NSHomeDirectory() + "/miniforge3/bin/python3",
-            NSHomeDirectory() + "/.pyenv/shims/python3",
-            "/usr/bin/python3",
-        ]
-        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
     private func finishRefresh(error: String?) {
@@ -212,35 +194,28 @@ final class StatusStore: ObservableObject {
 
     func refresh() {
         guard !isRefreshing else { return }
-        guard let path = scriptPath else {
-            collectorError = "应用资源不完整：缺少 ai_status.py"
-            return
-        }
-        guard let python = pythonPath else {
-            collectorError = "未找到 Python 3，请安装 Python 3.8 或更高版本"
+        guard let path = collectorPath else {
+            collectorError = "应用资源不完整：缺少 Swift 状态采集器"
             return
         }
         isRefreshing = true
         DispatchQueue.global(qos: .userInitiated).async {
             let p = Process()
-            p.executableURL = URL(fileURLWithPath: python)
-            p.arguments = [path, "--json"]
+            p.executableURL = URL(fileURLWithPath: path)
+            p.arguments = ["--json"]
             let pipe = Pipe()
             p.standardOutput = pipe
             p.standardError = FileHandle.nullDevice
             do {
                 try p.run()
             } catch {
-                self.finishRefresh(error: "无法启动状态采集器，请检查 Python 3")
+                self.finishRefresh(error: "无法启动 Swift 状态采集器")
                 return
             }
             let raw = pipe.fileHandleForReading.readDataToEndOfFile()
             p.waitUntilExit()
             guard p.terminationStatus == 0 else {
-                let message = p.terminationStatus == 2
-                    ? "Python 版本过低，需要 Python 3.8 或更高版本"
-                    : "状态采集器异常退出（代码 \(p.terminationStatus)）"
-                self.finishRefresh(error: message)
+                self.finishRefresh(error: "状态采集器异常退出（代码 \(p.terminationStatus)）")
                 return
             }
             let decoder = JSONDecoder()
@@ -1114,8 +1089,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var activityToken: NSObjectProtocol?  // App Nap 防护 token，app 生命周期内持有
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let scriptPath = Bundle.main.path(forResource: "ai_status", ofType: "py")
-        store = StatusStore(scriptPath: scriptPath, settings: settings)
+        let collectorPath = Bundle.main.path(forResource: "lingmou-collector", ofType: nil)
+        store = StatusStore(collectorPath: collectorPath, settings: settings)
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "AI …"

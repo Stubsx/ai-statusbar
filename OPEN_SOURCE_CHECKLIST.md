@@ -17,7 +17,7 @@
 - [ ] 使用符合 `vX.Y.Z` 的新版本号。
 - [ ] 用 Developer ID Application 身份签名 App 和 DMG。
 - [ ] 使用 Apple notarytool 公证并 stapler 装订。
-- [ ] 在另一台 Mac 上验证首次打开、Python 缺失提示、通知和录屏权限。
+- [ ] 在另一台未安装 Python 的 Mac 上验证首次打开、状态刷新、通知和录屏权限。
 - [ ] 检查 DMG 中不包含日志、数据库、设置、证书或其他本地文件。
 - [ ] 创建 GitHub Release，附校验和与变更说明。
 

@@ -17,9 +17,22 @@ osascript -e 'quit app id "'"${BUNDLE_ID}"'"' 2>/dev/null \
   || pkill -f "${INSTALLED_APP}" 2>/dev/null || true
 # 等待进程退出，最多约 3 秒
 for _ in $(seq 1 10); do
-  pgrep -f "${INSTALLED_APP}" >/dev/null || break
+  pgrep -f "${INSTALLED_APP}/Contents/MacOS/AIStatusBar" >/dev/null || break
   sleep 0.3
 done
+# 部分菜单栏 App 不响应 Apple Event 的 quit；宽限后明确终止旧主进程，
+# 否则 open 只会唤醒仍驻留内存的旧版本。
+if pgrep -f "${INSTALLED_APP}/Contents/MacOS/AIStatusBar" >/dev/null; then
+  pkill -TERM -f "${INSTALLED_APP}/Contents/MacOS/AIStatusBar"
+  for _ in $(seq 1 10); do
+    pgrep -f "${INSTALLED_APP}/Contents/MacOS/AIStatusBar" >/dev/null || break
+    sleep 0.2
+  done
+fi
+if pgrep -f "${INSTALLED_APP}/Contents/MacOS/AIStatusBar" >/dev/null; then
+  echo "错误：旧版灵眸进程无法退出，未替换安装包" >&2
+  exit 1
+fi
 
 # 3) 替换安装版（先删后拷，保留 build.sh 写入的签名 / 权限）
 rm -rf "${INSTALLED_APP}"

@@ -15,17 +15,15 @@
 ## 系统要求
 
 - macOS 12 或更高版本；背景自适应截图需要 macOS 14 或更高版本。
-- Python 3.8 或更高版本。原生 App 当前通过 Python 采集状态，启动时会检查运行环境。
-- 从源码构建还需要支持目标系统的 Xcode Command Line Tools；使用 macOS 26 液态玻璃源码构建时需要包含相关 SDK 的新版 Xcode。
+- 安装版不需要 Python 或其他额外运行时。
+- 从源码构建需要支持目标系统的 Xcode Command Line Tools；使用 macOS 26 液态玻璃源码构建时需要包含相关 SDK 的新版 Xcode。
 
 先确认环境：
 
 ```bash
-python3 --version
 xcode-select -p
+swift --version
 ```
-
-没有 Python 时，可从 [Python 官方网站](https://www.python.org/downloads/macos/) 安装，或在已安装 Homebrew 的电脑上运行 `brew install python`。安装后请重新启动灵眸。
 
 ## 从源码安装
 
@@ -38,6 +36,8 @@ open /Applications/灵眸.app
 ```
 
 可选的 Übersicht 小组件位于 `uebersicht-widgets/ai-status.widget/`，它读取 `/Applications/灵眸.app` 中同一份采集器，因此需要先把原生 App 安装到“应用程序”目录。
+
+可选的 SwiftBar 启动器位于 `swiftbar-plugins/ai-cli-status.10s.sh`。它优先使用同目录的 `lingmou-collector`，否则读取已安装“灵眸”中的同一份 Swift 采集器。
 
 开发者可运行 `./scripts/install-local.sh` 构建并替换本机 `/Applications/灵眸.app`。该脚本会关闭同 Bundle ID 的现有实例，不建议用作普通用户安装器。
 
@@ -54,14 +54,14 @@ open /Applications/灵眸.app
 ## 开发与验证
 
 ```bash
-python3 swiftbar-plugins/ai_status.py --json | python3 -m json.tool
-python3 -m py_compile swiftbar-plugins/ai_status.py
+swift test
+swift run lingmou-collector --json
 ./scripts/check-open-source.sh
 ./AIStatusBar/build.sh
 ./scripts/build-dmg.sh
 ```
 
-采集器主要使用 Python 标准库，原生界面使用 macOS 系统框架，没有第三方运行时包依赖。提交代码前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。安全问题请按 [SECURITY.md](SECURITY.md) 报告。
+状态采集器和原生界面均使用 Swift 与 macOS 系统框架，没有第三方运行时包依赖。`LingmouCollectorCore` 提供共享采集逻辑，`lingmou-collector` 提供 JSON 和 SwiftBar 命令行输出。提交代码前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。安全问题请按 [SECURITY.md](SECURITY.md) 报告。
 
 ## 卸载
 
@@ -71,7 +71,6 @@ python3 -m py_compile swiftbar-plugins/ai_status.py
 
 - 各工具的本地数据库和非公开配额接口可能随版本变化，某项数据暂时缺失不代表账号异常。
 - 任务标题来自本机工具，可能包含敏感项目名称；可以关闭通知或在系统中隐藏通知预览。
-- 原生 App 尚未内置 Python 运行时。
 
 ## 许可证
 

@@ -1,0 +1,318 @@
+import Foundation
+
+struct LocalCollectors {
+    let environment: CollectorEnvironment
+    let settings: CollectorSettings
+    let files: FileSupport
+    let processes: ProcessSupport
+
+    func kimi() -> RawToolState {
+        let count = processes.count(named: "kimi")
+        var result = RawToolState(processOn: count > 0, detail: "\(count) 个进程")
+        let root = environment.path(".kimi-code", "sessions")
+        let stateFiles = files.files(atDepth: 3, under: root) { $0.hasSuffix("/state.json") }
+        let window = TimeInterval(max(settings.busySeconds(for: "kimi"), 1_800))
+        for statePath in stateFiles {
+            let directory = (statePath as NSString).deletingLastPathComponent
+            let metadata = files.read(statePath).flatMap(JSONValue.object) ?? [:]
+            let workDirectory = JSONValue.string(metadata["workDir"]) ?? ""
+            let title =
+                JSONValue.string(metadata["title"]).flatMap { $0.isEmpty ? nil : $0 }
+                ?? URL(fileURLWithPath: workDirectory).lastPathComponent.nonempty
+                ?? "(未命名会话)"
+            let wireFiles = files.files(
+                atDepth: 2,
+                under: (directory as NSString).appendingPathComponent("agents")
+            ) { $0.hasSuffix("/wire.jsonl") }
+            guard let modified = wireFiles.compactMap(files.modificationTime).max() else {
+                continue
+            }
+            updateLatest(&result, title: title, timestamp: modified)
+            guard environment.now - modified <= window else { continue }
+            if wireFiles.contains(where: kimiWireBusy) {
+                result.busy.append(
+                    BusyItem(id: URL(fileURLWithPath: directory).lastPathComponent, title: title))
+            }
+        }
+        return result
+    }
+
+    private func kimiWireBusy(_ path: String) -> Bool {
+        let events: [JSONObject] = files.jsonLines(files.readTail(path)).compactMap { object in
+            guard JSONValue.string(object["type"]) == "context.append_loop_event",
+                let event = object["event"] as? JSONObject,
+                let type = JSONValue.string(event["type"]),
+                ["step.begin", "step.end", "tool.call", "tool.result"].contains(type)
+            else { return nil }
+            return event
+        }
+        guard let turn = events.reversed().compactMap({ JSONValue.string($0["turnId"]) }).first
+        else {
+            return false
+        }
+        var steps = Set<String>()
+        var tools = Set<String>()
+        for event in events {
+            let type = JSONValue.string(event["type"]) ?? ""
+            if type == "tool.result" {
+                if let id = JSONValue.string(event["toolCallId"]) { tools.remove(id) }
+                continue
+            }
+            guard JSONValue.string(event["turnId"]) == turn else { continue }
+            if type == "step.begin", let id = JSONValue.string(event["uuid"]) { steps.insert(id) }
+            if type == "step.end", let id = JSONValue.string(event["uuid"]) { steps.remove(id) }
+            if type == "tool.call", let id = JSONValue.string(event["toolCallId"]) {
+                tools.insert(id)
+            }
+        }
+        return !steps.isEmpty || !tools.isEmpty
+    }
+
+    func claude() -> RawToolState {
+        let count = processes.count(named: "claude", excluding: ["Claude.app/"])
+        var result = RawToolState(processOn: count > 0, detail: "\(count) 个进程")
+        let root = environment.path(".claude", "projects")
+        let window = TimeInterval(max(settings.busySeconds(for: "claude"), 1_800))
+        for path in files.files(atDepth: 2, under: root, where: { $0.hasSuffix(".jsonl") }) {
+            guard let modified = files.modificationTime(path), environment.now - modified < 86_400
+            else {
+                continue
+            }
+            var title: String?
+            var lastType: String?
+            var lastKinds: [String] = []
+            for raw in (files.readText(path) ?? "").split(whereSeparator: \.isNewline) {
+                let line = String(raw)
+                if line.contains("\"ai-title\""), let object = JSONValue.object(from: line),
+                    let value = JSONValue.string(object["aiTitle"]), !value.isEmpty
+                {
+                    title = value
+                    continue
+                }
+                guard line.contains("\"user\"") || line.contains("\"assistant\""),
+                    let object = JSONValue.object(from: line),
+                    let type = JSONValue.string(object["type"]),
+                    ["user", "assistant"].contains(type)
+                else { continue }
+                lastType = type
+                if let message = object["message"] as? JSONObject,
+                    let content = message["content"] as? [JSONObject]
+                {
+                    lastKinds = content.compactMap { JSONValue.string($0["type"]) }
+                } else {
+                    lastKinds = ["text"]
+                }
+            }
+            if title == nil {
+                let encoded = URL(fileURLWithPath: path).deletingLastPathComponent()
+                    .lastPathComponent
+                title =
+                    encoded.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+                    .split(separator: "-").last.map(String.init) ?? "(未命名会话)"
+            }
+            guard let title else { continue }
+            updateLatest(&result, title: title, timestamp: modified)
+            if environment.now - modified <= window,
+                lastType == "user" || lastKinds.contains("tool_use")
+            {
+                result.busy.append(
+                    BusyItem(
+                        id: URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent,
+                        title: title)
+                )
+            }
+        }
+        return result
+    }
+
+    func hermes() -> RawToolState {
+        let appCount = processes.count(named: "Hermes")
+        let heartbeat = environment.path(".hermes", "state", "gateway.heartbeat")
+        let gatewayAlive =
+            files.modificationTime(heartbeat).map { environment.now - $0 < 120 } ?? false
+        var result = RawToolState(
+            processOn: appCount > 0 || gatewayAlive,
+            detail: appCount > 0 || gatewayAlive ? "在线" : "无进程"
+        )
+        let path = environment.path(".hermes", "state.db")
+        guard let database = try? SQLiteDatabase(path: path, readOnly: true),
+            let sessionColumns = try? database.columns(in: "sessions"),
+            let usageColumns = try? database.columns(in: "session_model_usage"),
+            Set(["id", "title", "started_at"]).isSubset(of: sessionColumns),
+            usageColumns.contains("last_seen")
+        else { return result }
+        let busyRows =
+            (try? database.query(
+                """
+                SELECT DISTINCT s.id AS id, s.title AS title FROM sessions s
+                JOIN session_model_usage u ON u.session_id = s.id
+                WHERE u.last_seen > ? AND s.archived = 0 AND s.title IS NOT NULL AND s.title != ''
+                ORDER BY u.last_seen DESC
+                """,
+                binds: [.real(environment.now - TimeInterval(settings.busySeconds(for: "hermes")))]))
+            ?? []
+        result.busy = busyRows.compactMap { row in
+            guard let id = row["id"]?.string, let title = row["title"]?.string else { return nil }
+            return BusyItem(id: id, title: title)
+        }
+        if let row = try? database.query(
+            """
+            SELECT title, started_at FROM sessions
+            WHERE archived = 0 AND title IS NOT NULL AND title != ''
+            ORDER BY started_at DESC LIMIT 1
+            """
+        ).first, let title = row["title"]?.string, let timestamp = row["started_at"]?.double {
+            result.latest = LatestItem(title: title, timestamp: timestamp)
+        }
+        result.activity =
+            (try? database.query("SELECT MAX(last_seen) AS activity FROM session_model_usage")
+                .first?[
+                    "activity"]?.double) ?? 0
+        if result.busy.isEmpty, let latest = result.latest {
+            let pids = processes.output(
+                executable: "/usr/bin/pgrep", arguments: ["-f", "hermes_cli"]
+            )
+            .split(whereSeparator: \.isWhitespace).compactMap { Int($0) }
+            if transientConnections(pids: pids)["python", default: 0] > 0 {
+                result.busy = [BusyItem(id: "conn-hermes", title: latest.title)]
+            }
+        }
+        return result
+    }
+
+    func zcode() -> RawToolState {
+        let cliCount = processes.count(named: "zcode-cli")
+        let appOn = processes.count(named: "ZCode") > 0
+        var result = RawToolState(
+            processOn: cliCount > 0 || appOn, detail: appOn ? "App 在线" : "无进程")
+        let zcode = environment.path(".zcode")
+        let version = files.children(of: zcode).filter {
+            URL(fileURLWithPath: $0).lastPathComponent.hasPrefix("v")
+        }
+        .max { files.modificationTime($0) ?? 0 < files.modificationTime($1) ?? 0 }
+        let databasePath =
+            version.map { ($0 as NSString).appendingPathComponent("tasks-index.sqlite") }
+            ?? environment.path(".zcode", "v2", "tasks-index.sqlite")
+        var titles: [String: String] = [:]
+        if let database = try? SQLiteDatabase(path: databasePath, readOnly: true),
+            let columns = try? database.columns(in: "tasks"),
+            Set(["task_id", "title", "updated_at"]).isSubset(of: columns)
+        {
+            if let rows = try? database.query("SELECT task_id, title FROM tasks WHERE deleted=0") {
+                for row in rows {
+                    if let id = row["task_id"]?.string {
+                        titles[id] = row["title"]?.string ?? "(未知任务)"
+                    }
+                }
+            }
+            if let row = try? database.query(
+                "SELECT title, updated_at/1000.0 AS timestamp FROM tasks WHERE deleted=0 ORDER BY updated_at DESC LIMIT 1"
+            ).first,
+                let title = row["title"]?.string, let timestamp = row["timestamp"]?.double
+            {
+                result.latest = LatestItem(title: title, timestamp: timestamp)
+            }
+        }
+        let cli = environment.path(".zcode", "cli")
+        var activity: [String: TimeInterval] = [:]
+        for path in files.files(
+            atDepth: 1, under: (cli as NSString).appendingPathComponent("rollout"),
+            where: { $0.hasSuffix(".jsonl") })
+        {
+            let name = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+            guard name.hasPrefix("model-io-sess_"), let time = files.modificationTime(path) else {
+                continue
+            }
+            let id = String(name.dropFirst("model-io-".count))
+            if !id.hasPrefix("sess_subagent_") { activity[id] = max(activity[id] ?? 0, time) }
+        }
+        for path in files.children(of: (cli as NSString).appendingPathComponent("artifacts")) {
+            let id = URL(fileURLWithPath: path).lastPathComponent
+            if id.hasPrefix("sess_"), !id.hasPrefix("sess_subagent_"),
+                let time = files.modificationTime(path)
+            {
+                activity[id] = max(activity[id] ?? 0, time)
+            }
+        }
+        for path in files.files(
+            under: (cli as NSString).appendingPathComponent("agents"),
+            where: { !$1 && $0.hasSuffix("/transcript.jsonl") })
+        {
+            let id = URL(fileURLWithPath: path).deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .lastPathComponent
+            if id.hasPrefix("sess_"), !id.hasPrefix("sess_subagent_"),
+                let time = files.modificationTime(path)
+            {
+                activity[id] = max(activity[id] ?? 0, time)
+            }
+        }
+        result.busy = activity.sorted { $0.value > $1.value }.compactMap { id, time in
+            environment.now - time < TimeInterval(settings.busySeconds(for: "zcode"))
+                ? BusyItem(id: id, title: titles[id] ?? "(未知任务)") : nil
+        }
+        if result.latest == nil, let (id, time) = activity.max(by: { $0.value < $1.value }) {
+            result.latest = LatestItem(title: titles[id] ?? "(未知任务)", timestamp: time)
+        }
+        result.activity = activity.values.max() ?? 0
+        if result.busy.isEmpty, appOn, let latest = result.latest,
+            transientConnections(processNames: ["ZCode"])["ZCode", default: 0] > 0
+        {
+            result.busy = [BusyItem(id: "conn-zcode", title: latest.title)]
+        }
+        return result
+    }
+
+    private func updateLatest(_ result: inout RawToolState, title: String, timestamp: TimeInterval)
+    {
+        if result.latest.map({ timestamp > $0.timestamp }) ?? true {
+            result.latest = LatestItem(title: title, timestamp: timestamp)
+        }
+        result.activity = max(result.activity, timestamp)
+    }
+
+    private func transientConnections(
+        processNames: [String] = [], pids: [Int] = [], minimumAge: TimeInterval = 15,
+        maximumAge: TimeInterval = 300
+    ) -> [String: Int] {
+        var arguments = ["-nP", "-iTCP", "-sTCP:ESTABLISHED", "-a"]
+        processNames.forEach { arguments += ["-c", $0] }
+        pids.forEach { arguments += ["-p", String($0)] }
+        let output = processes.output(executable: "/usr/sbin/lsof", arguments: arguments)
+        var current: [String: Set<String>] = [:]
+        for raw in output.split(whereSeparator: \.isNewline).dropFirst() {
+            let line = String(raw)
+            let parts = line.split(whereSeparator: \.isWhitespace).map(String.init)
+            guard parts.count >= 9, let endpoint = parts.last, endpoint.contains("->"),
+                !line.contains("->127.0.0.1"), !line.contains("->[::1]"),
+                !line.contains("->localhost")
+            else { continue }
+            let local = endpoint.components(separatedBy: "->")[0]
+            current[parts[0], default: []].insert(local.components(separatedBy: ":").last ?? local)
+        }
+        let cachePath = environment.path(".ai-statusbar", "conn_state.json")
+        let old = files.read(cachePath).flatMap(JSONValue.object) ?? [:]
+        var saved: JSONObject = [:]
+        var result: [String: Int] = [:]
+        for (name, ports) in current {
+            let previous = old[name] as? JSONObject ?? [:]
+            var next: JSONObject = [:]
+            var count = 0
+            for port in ports {
+                let first = JSONValue.double(previous[port]) ?? environment.now
+                next[port] = first
+                if environment.now - first >= minimumAge && environment.now - first < maximumAge {
+                    count += 1
+                }
+            }
+            saved[name] = next
+            result[name] = count
+        }
+        try? files.writePrivateJSON(saved, to: cachePath)
+        return result
+    }
+}
+
+extension String {
+    fileprivate var nonempty: String? { isEmpty ? nil : self }
+}

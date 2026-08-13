@@ -1,7 +1,7 @@
 import { React } from 'uebersicht'
 
 // 复用已安装原生 App 中的采集器，避免依赖开发者电脑上的仓库绝对路径。
-export const command = '/usr/bin/env python3 "/Applications/灵眸.app/Contents/Resources/ai_status.py" --json'
+export const command = '"/Applications/灵眸.app/Contents/Resources/lingmou-collector" --json'
 export const refreshFrequency = 10000
 
 const COLORS = { busy: '#30d158', idle: '#ffd60a', off: '#636366' }

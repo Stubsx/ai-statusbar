@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 APP="AIStatusBar.app"
 
-for tool in swiftc lipo codesign security git; do
+for tool in swift swiftc lipo codesign security git; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "错误：缺少 $tool。请先安装 Xcode Command Line Tools：xcode-select --install" >&2
     exit 1
@@ -14,13 +14,17 @@ done
 rm -rf "$APP" .build
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" .build
 
+# 构建共享 Swift 采集器（arm64 + x86_64），原生 App、SwiftBar 和 Übersicht 共用。
+swift build --package-path .. -c release --arch arm64 --arch x86_64
+cp ../.build/apple/Products/Release/lingmou-collector "$APP/Contents/Resources/"
+chmod 755 "$APP/Contents/Resources/lingmou-collector"
+
 for arch in arm64 x86_64; do
   swiftc -O -target "${arch}-apple-macosx12.0" -o ".build/AIStatusBar-${arch}" Sources/main.swift
 done
 lipo -create .build/AIStatusBar-arm64 .build/AIStatusBar-x86_64 -output "$APP/Contents/MacOS/AIStatusBar"
 rm -rf .build
 
-cp ../swiftbar-plugins/ai_status.py "$APP/Contents/Resources/"
 cp ../LICENSE "$APP/Contents/Resources/LICENSE.txt"
 cp ../PRIVACY.md "$APP/Contents/Resources/PRIVACY.md"
 cp Info.plist "$APP/Contents/"
@@ -49,8 +53,11 @@ fi
 SIGN_IDENTITY="${SIGN_IDENTITY:-Lingmou Local}"
 if security find-identity -p codesigning | grep -Fq "$SIGN_IDENTITY"; then
   if [[ "$SIGN_IDENTITY" == "Developer ID Application:"* ]]; then
+    codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" \
+      "$APP/Contents/Resources/lingmou-collector"
     codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
   else
+    codesign --force --sign "$SIGN_IDENTITY" "$APP/Contents/Resources/lingmou-collector"
     codesign --force --deep --sign "$SIGN_IDENTITY" "$APP"
   fi
 else
@@ -59,6 +66,7 @@ else
     exit 1
   fi
   echo "提示：未找到本地签名身份 '$SIGN_IDENTITY'，使用 ad-hoc 签名（不适合直接公开分发）。" >&2
+  codesign --force --sign - "$APP/Contents/Resources/lingmou-collector"
   codesign --force --deep --sign - "$APP"
 fi
 codesign --verify --deep --strict "$APP"
