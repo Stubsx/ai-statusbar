@@ -18,7 +18,11 @@ struct CodexCollector {
     }
 
     func collect() -> CodexResult {
-        let cliCount = processes.count(named: "codex", excluding: ["ChatGPT.app/", "Codex.app/"])
+        // 只统计用户真正打开的交互式 CLI；App/编辑器托管的无头服务进程
+        //（ChatGPT/Codex App、VS Code/Cursor 扩展拉起的 codex app-server / mcp-server）不算。
+        let cliCount = processes.count(
+            named: "codex",
+            excluding: ["ChatGPT.app/", "Codex.app/", "app-server", "mcp-server"])
         let appCount = processes.count(named: "ChatGPT") + processes.count(named: "Codex")
         var result = CodexResult()
         result.cli.processOn = cliCount > 0

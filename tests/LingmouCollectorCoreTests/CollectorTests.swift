@@ -178,6 +178,28 @@ final class CollectorTests: XCTestCase {
         XCTAssertTrue(collector.collect().cli.busy.isEmpty)
     }
 
+    func testCodexCliCountIgnoresIdeManagedServerProcesses() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let psOutput = """
+            /usr/local/bin/codex
+            /fake-home/.vscode/extensions/openai.chatgpt-1.0-darwin-arm64/bin/macos-aarch64/codex -c features.code_mode_host=true app-server
+            /fake-home/.cursor/extensions/openai.chatgpt-1.0-darwin-arm64/bin/macos-aarch64/codex -c features.code_mode_host=true app-server
+            /Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server
+            /usr/local/bin/codex mcp-server
+            """
+        let process = ProcessSupport { executable, arguments, _ in
+            executable == "/bin/ps" && arguments.contains("args=") ? psOutput : ""
+        }
+        let collector = CodexCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: 2_000_000_000),
+            settings: CollectorSettings(),
+            files: FileSupport(),
+            processes: process
+        )
+        XCTAssertEqual(collector.collect().cli.detail, "1 个进程")
+    }
+
     func testExpiredKimiCredentialsRemainUnchanged() throws {
         let home = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: home) }
