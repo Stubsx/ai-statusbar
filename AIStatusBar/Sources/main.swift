@@ -790,7 +790,6 @@ struct PanelView: View {
 
 struct SettingsView: View {
     @ObservedObject var settings: SettingsStore
-    @State private var notifyDiag = ""
     @State private var showOnlineQuotaAlert = false
     @AppStorage("panelAppearanceMode") private var appearanceMode = "system"
 
@@ -879,20 +878,6 @@ struct SettingsView: View {
                         .opacity(settings.notifyEnabled ? 1 : 0.4)
                         if idx < SettingsStore.tools.count - 1 { divider }
                     }
-                    divider
-                    HStack(spacing: 10) {
-                        Button("发送测试通知", action: testNotify)
-                            .controlSize(.small)
-                        if !notifyDiag.isEmpty {
-                            Text(notifyDiag)
-                                .font(.system(size: 10))
-                                .foregroundColor(.secondary)
-                                .lineLimit(2)
-                        }
-                        Spacer()
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
                 }
 
                 Spacer(minLength: 0)
@@ -974,35 +959,6 @@ struct SettingsView: View {
     }
 
     // MARK: 动作
-
-    private func testNotify() {
-        let center = UNUserNotificationCenter.current()
-        center.getNotificationSettings { s in
-            let statusText = ["未请求过", "已被拒绝", "已允许", "临时允许", "未知"][min(s.authorizationStatus.rawValue, 4)]
-            if s.authorizationStatus == .denied {
-                DispatchQueue.main.async {
-                    self.notifyDiag = "授权被拒绝（系统设置→通知→灵眸 开启）"
-                }
-                return
-            }
-            center.requestAuthorization(options: [.alert, .sound]) { _, err in
-                if let err = err {
-                    DispatchQueue.main.async { self.notifyDiag = "授权请求失败：\(err.localizedDescription)" }
-                    return
-                }
-                let content = UNMutableNotificationContent()
-                content.title = "灵眸 测试通知"
-                content.body = "看到这条说明通知链路正常"
-                content.sound = .default
-                center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)) { err in
-                    DispatchQueue.main.async {
-                        self.notifyDiag = err.map { "发送失败：\($0.localizedDescription)" }
-                            ?? "已发送（\(statusText)）"
-                    }
-                }
-            }
-        }
-    }
 
     private func perToolBinding(_ key: String) -> Binding<Int> {
         Binding(
