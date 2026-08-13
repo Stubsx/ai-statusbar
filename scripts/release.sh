@@ -21,4 +21,4 @@ fi
 
 APP_VERSION="${TAG#v}" "$ROOT/scripts/build-dmg.sh"
 git -C "$ROOT" tag -a "$TAG" -m "Release $TAG"
-echo "✅ 本地发版完成: $TAG（尚未推送 tag 或创建 GitHub Release）"
+echo "✅ 本地发版完成: ${TAG}（尚未推送 tag 或创建 GitHub Release）"
