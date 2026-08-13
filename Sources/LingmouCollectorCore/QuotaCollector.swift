@@ -9,9 +9,11 @@ struct QuotaCollector {
     private struct CachedQuota {
         var codex: ToolQuota?
         var kimi: ToolQuota?
+        var kimiWork: ToolQuota?
         var zcode: ToolQuota?
         var onlineQuotaEnabled: Bool
-        var kimiMonthlyEnabled: Bool
+        var kimiQuotaSeparated: Bool
+        var kimiCodingTokenMtime: TimeInterval
         var kimiTokenMtime: TimeInterval
     }
 
@@ -25,37 +27,49 @@ struct QuotaCollector {
     func collect() -> [String: ToolQuota?] {
         let cachePath = environment.path(".ai-statusbar", "quota-cache.json")
         let cached = readCache(cachePath)
-        let tokenTime =
-            settings.onlineQuota && settings.kimiMonthlyQuota ? kimiTokenModificationTime : 0
+        let codingTokenTime = settings.onlineQuota ? kimiCodingTokenModificationTime : 0
+        let monthlyTokenTime = settings.onlineQuota ? kimiTokenModificationTime : 0
         let sameMode =
             cached?.onlineQuotaEnabled == settings.onlineQuota
-            && cached?.kimiMonthlyEnabled == settings.kimiMonthlyQuota
+            && (!settings.onlineQuota || cached?.kimiQuotaSeparated == true)
         if let cached, sameMode,
-            cached.kimiTokenMtime == tokenTime,
+            cached.kimiCodingTokenMtime == codingTokenTime,
+            cached.kimiTokenMtime == monthlyTokenTime,
             environment.now - (files.modificationTime(cachePath) ?? 0) <= 300
         {
-            return ["codex": cached.codex, "kimi": cached.kimi, "zcode": cached.zcode]
+            return [
+                "codex": cached.codex, "kimi": cached.kimi, "kimi-work": cached.kimiWork,
+                "zcode": cached.zcode,
+            ]
         }
 
         let old = cached
         var codex: ToolQuota? = settings.onlineQuota ? codexOnline() ?? codexLocal() : codexLocal()
-        var kimi: ToolQuota? = settings.onlineQuota ? kimiQuota() : nil
+        var kimi: ToolQuota? = settings.onlineQuota ? kimiCodingQuota(previous: old?.kimi) : nil
+        var kimiWork: ToolQuota? = settings.onlineQuota ? kimiWorkQuota() : nil
         var zcode: ToolQuota? = settings.onlineQuota ? zcodeQuota() : nil
         if sameMode {
             if codex == nil { codex = old?.codex }
-            if kimi == nil { kimi = old?.kimi }
+            if kimi == nil, kimiCodingCredentialExists, let previous = old?.kimi,
+                !previous.windows.isEmpty
+            {
+                kimi = previous
+            }
+            if kimiWork == nil, kimiWorkInstalled { kimiWork = old?.kimiWork }
             if zcode == nil { zcode = old?.zcode }
         }
         let value = CachedQuota(
             codex: codex,
             kimi: kimi,
+            kimiWork: kimiWork,
             zcode: zcode,
             onlineQuotaEnabled: settings.onlineQuota,
-            kimiMonthlyEnabled: settings.kimiMonthlyQuota,
-            kimiTokenMtime: tokenTime
+            kimiQuotaSeparated: true,
+            kimiCodingTokenMtime: codingTokenTime,
+            kimiTokenMtime: monthlyTokenTime
         )
         writeCache(value, path: cachePath)
-        return ["codex": codex, "kimi": kimi, "zcode": zcode]
+        return ["codex": codex, "kimi": kimi, "kimi-work": kimiWork, "zcode": zcode]
     }
 
     private func readCache(_ path: String) -> CachedQuota? {
@@ -72,11 +86,15 @@ struct QuotaCollector {
         return CachedQuota(
             codex: decodeQuota("codex"),
             kimi: decodeQuota("kimi"),
+            kimiWork: decodeQuota("kimi-work") ?? decodeQuota("kimi_work"),
             zcode: decodeQuota("zcode"),
             onlineQuotaEnabled: JSONValue.bool(
                 object["_online_quota_enabled"] ?? object["online_quota_enabled"]) ?? false,
-            kimiMonthlyEnabled: JSONValue.bool(
-                object["_kimi_monthly_enabled"] ?? object["kimi_monthly_enabled"]) ?? false,
+            kimiQuotaSeparated: JSONValue.bool(
+                object["_kimi_quota_separated"] ?? object["kimi_quota_separated"]) ?? false,
+            kimiCodingTokenMtime: JSONValue.double(
+                object["_kimi_coding_token_mtime"] ?? object["kimi_coding_token_mtime"])
+                ?? 0,
             kimiTokenMtime: JSONValue.double(
                 object["_kimi_token_mtime"] ?? object["kimi_token_mtime"])
                 ?? 0
@@ -96,9 +114,11 @@ struct QuotaCollector {
             [
                 "codex": object(cache.codex),
                 "kimi": object(cache.kimi),
+                "kimi-work": object(cache.kimiWork),
                 "zcode": object(cache.zcode),
                 "_online_quota_enabled": cache.onlineQuotaEnabled,
-                "_kimi_monthly_enabled": cache.kimiMonthlyEnabled,
+                "_kimi_quota_separated": cache.kimiQuotaSeparated,
+                "_kimi_coding_token_mtime": cache.kimiCodingTokenMtime,
                 "_kimi_token_mtime": cache.kimiTokenMtime,
             ], to: path)
     }
@@ -174,60 +194,100 @@ struct QuotaCollector {
         )
     }
 
-    private func kimiQuota() -> ToolQuota? {
+    private func kimiCodingQuota(previous: ToolQuota?) -> ToolQuota? {
+        guard kimiCodingCredentialExists else { return nil }
         let coding = kimiCodingQuota()
-        guard settings.kimiMonthlyQuota else { return coding }
-        let monthly = kimiMonthlyQuota()
-        if var quota = monthly.0 {
-            quota.plan = coding?.plan
+        if var quota = coding.quota {
+            quota.notice = coding.notice
             return quota
         }
-        var result = coding ?? ToolQuota(plan: nil, windows: [], updatedAt: Int(environment.now))
-        result.notice = monthly.1
-        return result
+        if coding.notice == nil, let previous {
+            let windows = previous.windows.filter { $0.kind != "month" }
+            if !windows.isEmpty {
+                return ToolQuota(
+                    plan: previous.plan, windows: windows, updatedAt: previous.updatedAt,
+                    notice: nil)
+            }
+        }
+        guard let notice = coding.notice else { return nil }
+        return ToolQuota(plan: nil, windows: [], updatedAt: Int(environment.now), notice: notice)
     }
 
-    private func kimiCodingQuota() -> ToolQuota? {
+    private func kimiCodingQuota() -> (quota: ToolQuota?, notice: String?) {
         let path = environment.path(".kimi-code", "credentials", "kimi-code.json")
+        guard FileManager.default.fileExists(atPath: path) else {
+            return (nil, nil)
+        }
         guard let credential = files.read(path).flatMap(JSONValue.object),
             let token = JSONValue.string(credential["access_token"]), !token.isEmpty
-        else { return nil }
+        else { return (nil, "Kimi Code 尚未登录，请运行 kimi login") }
         var expiration = JSONValue.double(credential["expires_at"]) ?? 0
         if expiration > 1_000_000_000_000 { expiration /= 1_000 }
-        guard environment.now < expiration - 30,
+        guard expiration == 0 || environment.now < expiration - 30 else {
+            // Kimi Code 的短期 access token 过期不代表账号退出；CLI 会在真正使用时
+            // 通过 refresh token 自行续期。灵眸保持只读并沿用最近一次有效配额。
+            return (nil, nil)
+        }
+        guard
             let object = request(
                 url: "https://api.kimi.com/coding/v1/usages",
                 headers: ["Authorization": "Bearer \(token)"]
             )
-        else { return nil }
-        func make(_ source: JSONObject, minutes: Int) -> QuotaWindow? {
+        else { return (nil, nil) }
+        func make(_ source: JSONObject, minutes: Int, label: String? = nil) -> QuotaWindow? {
             let used = JSONValue.int(source["used"]) ?? 0
             let limit = JSONValue.int(source["limit"]) ?? 0
             guard limit > 0 else { return nil }
-            return window(
+            let value = window(
                 minutes: minutes,
                 percent: 100 * Double(used) / Double(limit),
                 resetsAt: Int(DateSupport.timestamp(source["resetTime"]) ?? 0)
             )
+            guard let label else { return value }
+            return QuotaWindow(
+                kind: value.kind,
+                label: label,
+                usedPercent: value.usedPercent,
+                resetsAt: value.resetsAt
+            )
         }
         var windows: [QuotaWindow] = []
-        if let usage = object["usage"] as? JSONObject, let value = make(usage, minutes: 10_080) {
+        if let usage = object["usage"] as? JSONObject,
+            let value = make(usage, minutes: 10_080, label: "7天")
+        {
             windows.append(value)
         }
         for item in object["limits"] as? [JSONObject] ?? [] {
+            let minutes = JSONValue.int((item["window"] as? JSONObject)?["duration"]) ?? 0
             if let detail = item["detail"] as? JSONObject,
                 let value = make(
                     detail,
-                    minutes: JSONValue.int((item["window"] as? JSONObject)?["duration"]) ?? 0)
+                    minutes: minutes,
+                    label: abs(minutes - 10_080) <= 60 ? "7天" : nil)
             {
-                windows.append(value)
+                if !windows.contains(where: { $0.kind == value.kind && $0.label == value.label }) {
+                    windows.append(value)
+                }
             }
         }
-        guard !windows.isEmpty else { return nil }
+        guard !windows.isEmpty else { return (nil, nil) }
         let plan = (((object["user"] as? JSONObject)?["membership"] as? JSONObject)?["level"])
             .flatMap(
                 JSONValue.string)
-        return ToolQuota(plan: plan, windows: windows, updatedAt: Int(environment.now))
+        return (
+            ToolQuota(plan: plan, windows: windows, updatedAt: Int(environment.now)),
+            nil
+        )
+    }
+
+    private var kimiCodingCredentialExists: Bool {
+        FileManager.default.fileExists(
+            atPath: environment.path(".kimi-code", "credentials", "kimi-code.json"))
+    }
+
+    private var kimiCodingTokenModificationTime: TimeInterval {
+        files.modificationTime(
+            environment.path(".kimi-code", "credentials", "kimi-code.json")) ?? 0
     }
 
     private var kimiTokenPath: String {
@@ -237,6 +297,22 @@ struct QuotaCollector {
 
     private var kimiTokenModificationTime: TimeInterval {
         files.modificationTime(kimiTokenPath) ?? 0
+    }
+
+    private var kimiWorkRoot: String {
+        environment.path("Library", "Application Support", "kimi-desktop")
+    }
+
+    private var kimiWorkInstalled: Bool {
+        FileManager.default.fileExists(atPath: kimiWorkRoot)
+    }
+
+    private func kimiWorkQuota() -> ToolQuota? {
+        guard kimiWorkInstalled else { return nil }
+        let monthly = kimiMonthlyQuota()
+        if let quota = monthly.0 { return quota }
+        guard let notice = monthly.1 else { return nil }
+        return ToolQuota(plan: nil, windows: [], updatedAt: Int(environment.now), notice: notice)
     }
 
     private func kimiMonthlyQuota() -> (ToolQuota?, String?) {
@@ -265,7 +341,7 @@ struct QuotaCollector {
 
     private func kimiMonthlyLive() -> (ToolQuota?, String?) {
         guard FileManager.default.fileExists(atPath: kimiTokenPath) else {
-            return (nil, "需要安装并登录 Kimi App，才能读取月度配额")
+            return (nil, "Kimi Work 尚未登录，无法读取本月额度")
         }
         guard let store = files.read(kimiTokenPath).flatMap(JSONValue.object),
             let tokens = store["tokens"] as? JSONObject,
@@ -291,7 +367,7 @@ struct QuotaCollector {
         let code = min(total, max(0, JSONValue.double(balance["kimiCodeUsedRatio"]) ?? 0) * 100)
         let reset = Int(DateSupport.timestamp(balance["expireTime"]) ?? 0)
         guard reset > 0 else { return (nil, nil) }
-        var windows = [
+        let windows = [
             QuotaWindow(
                 kind: "month",
                 label: "本月",
@@ -304,21 +380,6 @@ struct QuotaCollector {
                 ]
             )
         ]
-        for (key, kind, label) in [
-            ("ratelimitCode5h", "5h", "5小时"), ("ratelimitCode7d", "week", "7天"),
-        ] {
-            guard let item = object[key] as? JSONObject,
-                JSONValue.bool(item["enabled"]) != false,
-                let ratio = JSONValue.double(item["ratio"])
-            else { continue }
-            windows.append(
-                QuotaWindow(
-                    kind: kind,
-                    label: label,
-                    usedPercent: max(0, ratio * 100).roundedTenth,
-                    resetsAt: Int(DateSupport.timestamp(item["resetTime"]) ?? 0)
-                ))
-        }
         return (ToolQuota(plan: nil, windows: windows, updatedAt: Int(environment.now)), nil)
     }
 

@@ -33,6 +33,11 @@ cp Info.plist "$APP/Contents/"
 # 写入真实版本号：未提交的本地构建使用下一个版本号，确保反复调试图标时
 # LaunchServices/usernoted 不会因为版本号未变而继续命中旧通知缓存。
 VER_COUNT=$(git -C .. rev-list --count HEAD 2>/dev/null || echo 0)
+SOURCE_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Info.plist)
+SOURCE_PATCH=${SOURCE_VERSION##*.}
+if [[ "$SOURCE_PATCH" =~ ^[0-9]+$ ]] && (( SOURCE_PATCH > VER_COUNT )); then
+  VER_COUNT=$SOURCE_PATCH
+fi
 if ! git -C .. diff --quiet --ignore-submodules -- \
     || ! git -C .. diff --cached --quiet --ignore-submodules --; then
   VER_COUNT=$((VER_COUNT + 1))

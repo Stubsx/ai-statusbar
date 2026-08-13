@@ -7,21 +7,22 @@
 为了判断状态和计算用量，灵眸可能读取已安装工具的以下本地数据：
 
 - 进程列表和已建立连接的本地端口；
-- Codex、Kimi Code、Claude Code、Hermes、ZCode 的会话数据库、日志或索引；
+- Codex、Kimi Code、Kimi Work、Claude Code、Hermes、ZCode 的会话数据库、日志或索引；
 - 会话 ID、任务标题、更新时间、事件状态和 Token 计数；
-- 用户主动启用配额功能时所需的本地登录状态或访问令牌。
+- 联网配额功能所需的本地登录状态或访问令牌；此功能默认开启，可随时在设置中关闭。
 
 会话正文仅在本机解析状态和计数，不会发送给灵眸项目维护者。任务标题会显示在本机界面；启用通知后，也可能显示在通知中心或锁屏。
 
 ## 网络请求
 
-配额查询可能把对应厂商的访问令牌发送回该厂商的 HTTPS 接口：
+联网配额默认开启，查询时可能把对应厂商的访问令牌发送回该厂商的 HTTPS 接口；用户可在设置中关闭：
 
 - `chatgpt.com`：Codex/ChatGPT 配额；
 - `api.kimi.com`、`www.kimi.com`：Kimi Code 或 Kimi 会员配额；
 - `open.bigmodel.cn` 或 `api.z.ai`：ZCode Coding Plan 配额。
 
 灵眸不会把一个厂商的令牌发送给另一个厂商，也不会把令牌写入自身日志或配额缓存。这些接口可能由厂商调整或停用。
+Kimi Code 的 7天/5小时配额来自 `api.kimi.com`；检测到 Kimi Work 时，其本月会员额度来自 `www.kimi.com`。两者独立查询；未检测到 Kimi Work 时不会请求或展示月度额度。
 
 ## 本地写入的数据
 

@@ -93,6 +93,9 @@ struct UsageCollector {
                         where: { $0.hasSuffix("/wire.jsonl") }), "kimi", UsageParsers.kimi
                 ),
                 (
+                    kimiWorkUsageFiles(), "kimi-work", UsageParsers.kimi
+                ),
+                (
                     files.files(
                         atDepth: 2, under: environment.path(".claude", "projects"),
                         where: { $0.hasSuffix(".jsonl") }), "claude", UsageParsers.claude
@@ -139,6 +142,21 @@ struct UsageCollector {
             )
         } catch {
             return nil
+        }
+    }
+
+    private func kimiWorkUsageFiles() -> [String] {
+        let root = environment.path(
+            "Library", "Application Support", "kimi-desktop", "daimon-share", "daimon",
+            "runtime", "kimi-code", "home", "sessions")
+        return files.files(under: root) { path, isDirectory in
+            guard !isDirectory, path.hasSuffix("/agents/main/wire.jsonl") else { return false }
+            let session = URL(fileURLWithPath: path)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .lastPathComponent
+            return session.hasPrefix("conv-")
         }
     }
 

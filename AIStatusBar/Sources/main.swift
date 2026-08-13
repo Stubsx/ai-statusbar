@@ -77,8 +77,8 @@ extension Notification.Name {
 // MARK: - 设置（持久化到 ~/.ai-statusbar/settings.json，与采集端共享）
 
 final class SettingsStore: ObservableObject {
-    static let tools = [("codex", "Codex"), ("kimi", "Kimi Code"), ("claude", "Claude Code"),
-                        ("hermes", "Hermes"), ("zcode", "ZCode")]
+    static let tools = [("codex", "Codex"), ("kimi", "Kimi Code"), ("kimi-work", "Kimi Work"),
+                        ("claude", "Claude Code"), ("hermes", "Hermes"), ("zcode", "ZCode")]
     static let busyOptions = [60, 180, 300, 600, 900, 1800]
     static let offlineOptions: [(String, Int)] = [("1 小时", 3600), ("2 小时", 7200), ("3 小时", 10800),
                                                   ("6 小时", 21600), ("12 小时", 43200), ("从不", 0)]
@@ -96,13 +96,7 @@ final class SettingsStore: ObservableObject {
     }
     @Published var notifyTools: [String: Bool] = [:] { didSet { save() } }
     @Published var showDockIcon = false { didSet { save(); applyDockIconPolicy() } }
-    @Published var onlineQuota = false {
-        didSet {
-            if !onlineQuota { kimiMonthlyQuota = false }
-            save()
-        }
-    }
-    @Published var kimiMonthlyQuota = false { didSet { save() } }
+    @Published var onlineQuota = true { didSet { save() } }
 
     /// Dock 图标开关即时生效：regular 显示 Dock 图标，accessory 纯菜单栏
     func applyDockIconPolicy() {
@@ -137,7 +131,6 @@ final class SettingsStore: ObservableObject {
         }
         if let v = obj["show_dock_icon"] as? Bool { showDockIcon = v }
         if let v = obj["online_quota"] as? Bool { onlineQuota = v }
-        if let v = obj["kimi_monthly_quota"] as? Bool { kimiMonthlyQuota = onlineQuota && v }
     }
 
     private func save() {
@@ -148,7 +141,6 @@ final class SettingsStore: ObservableObject {
             "notify": ["enabled": notifyEnabled, "tools": notifyTools],
             "show_dock_icon": showDockIcon,
             "online_quota": onlineQuota,
-            "kimi_monthly_quota": kimiMonthlyQuota,
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: .prettyPrinted) else { return }
         let directory = NSHomeDirectory() + "/.ai-statusbar"
@@ -449,7 +441,7 @@ struct PanelView: View {
                 .padding(.bottom, 4)
                 usageRow("总计", u.total, bold: true)
                 Divider().background(Color.primary.opacity(0.1))
-                ForEach(["codex", "kimi", "claude", "zcode", "hermes"], id: \.self) { key in
+                ForEach(["codex", "kimi", "kimi-work", "claude", "zcode", "hermes"], id: \.self) { key in
                     if let e = u.tools[key] {
                         usageRow(usageName(key), e, bold: false)
                     }
@@ -491,9 +483,8 @@ struct PanelView: View {
                 ForEach(withQuota, id: \.key) { t in
                     VStack(alignment: .leading, spacing: 4) {
                         HStack(spacing: 6) {
-                            let hasMonthly = t.quota?.windows.contains(where: { $0.kind == "month" }) ?? false
                             Text(t.key == "codex-ide" ? "Codex" :
-                                 (t.key == "kimi" && hasMonthly ? "Kimi" : t.name))
+                                 t.name)
                                 .font(.system(size: 12, weight: .semibold))
                                 .foregroundColor(.primary.opacity(0.9))
                             if let plan = t.quota?.plan, !plan.isEmpty {
@@ -760,7 +751,7 @@ struct PanelView: View {
     }
 
     private func usageName(_ key: String) -> String {
-        ["codex": "Codex", "kimi": "Kimi Code", "claude": "Claude Code", "zcode": "ZCode", "hermes": "Hermes"][key] ?? key
+        ["codex": "Codex", "kimi": "Kimi Code", "kimi-work": "Kimi Work", "claude": "Claude Code", "zcode": "ZCode", "hermes": "Hermes"][key] ?? key
     }
 
     private func fmt(_ n: Int) -> String {
@@ -801,7 +792,6 @@ struct SettingsView: View {
     @ObservedObject var settings: SettingsStore
     @State private var notifyDiag = ""
     @State private var showOnlineQuotaAlert = false
-    @State private var showKimiMonthlyAlert = false
     @AppStorage("panelAppearanceMode") private var appearanceMode = "system"
 
     var body: some View {
@@ -844,7 +834,7 @@ struct SettingsView: View {
                     }
                 }
 
-                // 联网配额默认关闭，只向各工具自己的厂商接口发送对应令牌。
+                // 联网配额默认开启，只向各工具自己的厂商接口发送对应令牌。
                 card(title: "联网配额", icon: "network", subtitle: "读取本地登录状态并请求对应厂商的配额接口") {
                     row("查询账号配额") {
                         Toggle("", isOn: onlineQuotaBinding)
@@ -857,16 +847,6 @@ struct SettingsView: View {
                             } message: {
                                 Text("灵眸会读取各工具的本地登录令牌，并仅发送到对应厂商的 HTTPS 配额接口。令牌不会写入灵眸日志或缓存。")
                             }
-                    }
-                }
-
-                // Kimi 网页会员月度额度
-                card(title: "Kimi 月度配额", icon: "chart.bar.xaxis", subtitle: "读取 Kimi App 的网页会员额度") {
-                    row("展示本月额度") {
-                        Toggle("", isOn: kimiMonthlyBinding)
-                            .labelsHidden()
-                            .toggleStyle(.switch)
-                            .controlSize(.small)
                     }
                 }
 
@@ -920,15 +900,6 @@ struct SettingsView: View {
             .padding(.bottom, 18)
         }
         .frame(width: 470)
-        .alert("启用 Kimi 月度配额？", isPresented: $showKimiMonthlyAlert) {
-            Button("取消", role: .cancel) {}
-            Button("启用") {
-                settings.onlineQuota = true
-                settings.kimiMonthlyQuota = true
-            }
-        } message: {
-            Text("此功能需要安装并登录 Kimi App。灵眸只读取其本地登录状态；若登录过期，配额面板会提醒你打开 Kimi App 重新登录。")
-        }
     }
 
     // MARK: 组件
@@ -1050,20 +1021,6 @@ struct SettingsView: View {
             set: { enabled in
                 if enabled { showOnlineQuotaAlert = true }
                 else { settings.onlineQuota = false }
-            }
-        )
-    }
-
-    /// 开启前先说明 Kimi App 依赖；关闭不需要二次确认。
-    private var kimiMonthlyBinding: Binding<Bool> {
-        Binding(
-            get: { settings.kimiMonthlyQuota },
-            set: { enabled in
-                if enabled {
-                    showKimiMonthlyAlert = true
-                } else {
-                    settings.kimiMonthlyQuota = false
-                }
             }
         )
     }

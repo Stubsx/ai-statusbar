@@ -31,6 +31,7 @@ public final class LingmouCollector {
         let local = LocalCollectors(
             environment: environment, settings: settings, files: files, processes: processes)
         let kimi = local.kimi()
+        let kimiWork = local.kimiWork()
         let claude = local.claude()
         let hermes = local.hermes()
         let zcode = local.zcode()
@@ -48,6 +49,9 @@ public final class LingmouCollector {
         tools += [
             makeTool(
                 key: "kimi", letter: "K", name: "Kimi Code", raw: kimi, quota: quota["kimi"] ?? nil),
+            makeTool(
+                key: "kimi-work", letter: "W", name: "Kimi Work", raw: kimiWork,
+                quota: quota["kimi-work"] ?? nil),
             makeTool(key: "claude", letter: "L", name: "Claude Code", raw: claude, quota: nil),
             makeTool(key: "hermes", letter: "H", name: "Hermes", raw: hermes, quota: nil),
             makeTool(
@@ -99,7 +103,8 @@ public final class LingmouCollector {
             output.append("---")
         }
         output.append(
-            "C=Codex App  X=Codex CLI  K=Kimi  L=Claude  H=Hermes  Z=ZCode | size=10 color=gray")
+            "C=Codex App  X=Codex CLI  K=Kimi Code  W=Kimi Work  L=Claude  H=Hermes  Z=ZCode | size=10 color=gray"
+        )
         output.append("🟢工作中  🟡空闲  ⚪️未运行 | size=10 color=gray")
         output.append("刷新 | refresh=true")
         return output.joined(separator: "\n")

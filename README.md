@@ -1,6 +1,6 @@
 # 灵眸
 
-灵眸是一个 macOS 菜单栏工具，用来汇总本机 AI 编程工具的运行状态、最近任务、Token 用量和配额。目前支持 Codex App/CLI、Kimi Code、Claude Code、Hermes 和 ZCode。
+灵眸是一个 macOS 菜单栏工具，用来汇总本机 AI 编程工具的运行状态、最近任务、Token 用量和配额。目前支持 Codex App/CLI、Kimi Code、Kimi Work、Claude Code、Hermes 和 ZCode。
 
 > 灵眸不是上述产品的官方组件，也不隶属于 OpenAI、Moonshot AI、Anthropic 或其他工具厂商。各产品名称和商标归其权利人所有。
 
@@ -8,7 +8,8 @@
 
 - 在菜单栏和可选桌面卡片中显示工作中、空闲、未运行状态。
 - 显示近期任务标题、当日 Token 用量和近十周活跃热力图。
-- 查询已登录工具的配额；接口不可用时自动降级。
+- 默认联网查询已登录工具的配额（可在设置中关闭）；接口不可用时自动降级。
+- Kimi Code 显示 7天/5小时配额；检测到 Kimi Work 时自动显示其本月会员额度。
 - 可选任务完成通知、Dock 图标和背景自适应外观。
 - 缺少某个工具或本地数据格式不兼容时，不影响其他工具运行。
 

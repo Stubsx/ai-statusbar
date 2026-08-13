@@ -37,6 +37,40 @@ struct LocalCollectors {
         return result
     }
 
+    func kimiWork() -> RawToolState {
+        let appOn = processes.count(named: "Kimi") > 0
+        var result = RawToolState(processOn: appOn, detail: appOn ? "App 在线" : "无进程")
+        let support = environment.path("Library", "Application Support", "kimi-desktop")
+        let statusesPath = (support as NSString).appendingPathComponent(
+            "kimi-agent/conversation-statuses.json")
+        let statuses = files.read(statusesPath).flatMap(JSONValue.object) ?? [:]
+        let databasePath = (support as NSString).appendingPathComponent(
+            "daimon-share/daimon/agents/main/sessions/hosted-logical/conversations.sqlite")
+        guard let database = try? SQLiteDatabase(path: databasePath, readOnly: true),
+            let columns = try? database.columns(in: "conversations"),
+            Set(["conversation_key", "title", "updated_at_ms"]).isSubset(of: columns),
+            let rows = try? database.query(
+                """
+                SELECT conversation_key, title, updated_at_ms / 1000.0 AS timestamp
+                FROM conversations
+                WHERE title != ''
+                ORDER BY updated_at_ms DESC
+                """)
+        else { return result }
+        for row in rows {
+            guard let id = row["conversation_key"]?.string,
+                let title = row["title"]?.string,
+                let timestamp = row["timestamp"]?.double
+            else { continue }
+            updateLatest(&result, title: title, timestamp: timestamp)
+            let statusKey = "agent:main:main:conversation:\(id)"
+            if appOn, JSONValue.string(statuses[statusKey]) == "running" {
+                result.busy.append(BusyItem(id: id, title: title))
+            }
+        }
+        return result
+    }
+
     private func kimiWireBusy(_ path: String) -> Bool {
         let events: [JSONObject] = files.jsonLines(files.readTail(path)).compactMap { object in
             guard JSONValue.string(object["type"]) == "context.append_loop_event",

@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`Sources/LingmouCollectorCore/` is the canonical collector. It reads local Codex, Kimi, Claude, Hermes, and ZCode state and preserves the JSON contract consumed by all frontends. `Sources/LingmouCollectorCLI/` builds `lingmou-collector`, which emits JSON with `--json` and SwiftBar text by default. `swiftbar-plugins/ai-cli-status.10s.sh` is the thin SwiftBar launcher. The native menu-bar app lives in `AIStatusBar/`: edit `Sources/main.swift` and `Info.plist`, then run `build.sh` to produce the local `AIStatusBar.app` bundle (git-ignored build artifact, not tracked). `uebersicht-widgets/ai-status.widget/index.jsx` provides the desktop widget and reads the collector from an installed `/Applications/灵眸.app`. App icons belong in `icons/`; release packaging is handled by `scripts/`. Generated DMGs under `dist/` are ignored.
+`Sources/LingmouCollectorCore/` is the canonical collector. It reads local Codex, Kimi Code, Kimi Work, Claude, Hermes, and ZCode state and preserves the JSON contract consumed by all frontends. `Sources/LingmouCollectorCLI/` builds `lingmou-collector`, which emits JSON with `--json` and SwiftBar text by default. `swiftbar-plugins/ai-cli-status.10s.sh` is the thin SwiftBar launcher. The native menu-bar app lives in `AIStatusBar/`: edit `Sources/main.swift` and `Info.plist`, then run `build.sh` to produce the local `AIStatusBar.app` bundle (git-ignored build artifact, not tracked). `uebersicht-widgets/ai-status.widget/index.jsx` provides the desktop widget and reads the collector from an installed `/Applications/灵眸.app`. App icons belong in `icons/`; release packaging is handled by `scripts/`. Generated DMGs under `dist/` are ignored.
 
 ## Build, Test, and Development Commands
 
@@ -31,4 +31,4 @@ Recent commits use concise Chinese, action-oriented subjects such as `修复 Kim
 
 ## Security & Local Configuration
 
-Never commit user session logs, databases, credentials, `~/.ai-statusbar/settings.json`, or personal absolute paths. Network quota checks and privacy-sensitive permissions must remain opt-in by default.
+Never commit user session logs, databases, credentials, `~/.ai-statusbar/settings.json`, or personal absolute paths. Network quota behavior and privacy-sensitive permissions must remain clearly documented; permissions such as notifications and screen recording stay opt-in.
