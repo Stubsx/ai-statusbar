@@ -791,6 +791,7 @@ struct PanelView: View {
 struct SettingsView: View {
     @ObservedObject var settings: SettingsStore
     @State private var showOnlineQuotaAlert = false
+    @State private var showAdaptiveAlert = false
     @AppStorage("panelAppearanceMode") private var appearanceMode = "system"
 
     var body: some View {
@@ -828,8 +829,17 @@ struct SettingsView: View {
                 // 面板外观
                 card(title: "面板外观", icon: "circle.lefthalf.filled", subtitle: "背景自适应会按面板下方内容明暗自动反差") {
                     row("面板配色") {
-                        modePicker($appearanceMode, options: [("浅色", "light"), ("深色", "dark"),
+                        modePicker(appearanceModeBinding, options: [("浅色", "light"), ("深色", "dark"),
                                                               ("跟随系统", "system"), ("背景自适应", "adaptive")])
+                    }
+                    .alert("需要录屏权限", isPresented: $showAdaptiveAlert) {
+                        Button("取消", role: .cancel) {}
+                        Button("同意并授权") {
+                            appearanceMode = "adaptive"
+                            (NSApp.delegate as? AppDelegate)?.requestScreenCaptureAccessIfNeeded()
+                        }
+                    } message: {
+                        Text("背景自适应需要截取面板正下方一小块屏幕区域来判断明暗，因此需要录屏权限。截图只在内存中计算，不会保存或上传。")
                     }
                 }
 
@@ -959,6 +969,21 @@ struct SettingsView: View {
     }
 
     // MARK: 动作
+
+    /// 面板配色绑定：选"背景自适应"且未授权时不直接写入，先弹说明；
+    /// 用户确认后才写入模式并触发系统授权框（见 row 上的 alert）。
+    private var appearanceModeBinding: Binding<String> {
+        Binding(
+            get: { appearanceMode },
+            set: { mode in
+                if mode == "adaptive", !CGPreflightScreenCaptureAccess() {
+                    showAdaptiveAlert = true
+                } else {
+                    appearanceMode = mode
+                }
+            }
+        )
+    }
 
     private func perToolBinding(_ key: String) -> Binding<Int> {
         Binding(
@@ -1110,14 +1135,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } catch {}
     }
 
-    /// 面板外观模式：light / dark / system / adaptive（默认 adaptive）。
-    /// 旧 Bool 键 panelAdaptiveAppearance 迁移只在这里做：false→system，其余→adaptive。
+    /// 面板外观模式：light / dark / system / adaptive（默认 system，跟随系统，不需要录屏权限）。
+    /// 旧 Bool 键 panelAdaptiveAppearance 迁移只在这里做：true→adaptive，其余→system。
     private func panelAppearanceMode() -> String {
         if let m = UserDefaults.standard.string(forKey: "panelAppearanceMode") {
             return m
         }
         let legacy = UserDefaults.standard.object(forKey: "panelAdaptiveAppearance") as? Bool
-        return legacy == false ? "system" : "adaptive"
+        return legacy == true ? "adaptive" : "system"
+    }
+
+    /// 设置里确认启用"背景自适应"后立刻请求录屏权限；已授权则什么都不做。
+    /// 系统授权框只在无 TCC 记录时弹一次，已有记录（曾拒绝/启动时已请求过）时静默返回，
+    /// 因此延迟复查仍未授权就直接打开"录屏"设置页，保证用户总有地方可以开。
+    func requestScreenCaptureAccessIfNeeded() {
+        guard !CGPreflightScreenCaptureAccess() else { return }
+        requestedCaptureAccess = true
+        CGRequestScreenCaptureAccess()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            guard !CGPreflightScreenCaptureAccess(),
+                  let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+            else { return }
+            NSWorkspace.shared.open(url)
+        }
     }
 
     /// 同步设置 SwiftUI、窗口和玻璃容器。macOS 26 的玻璃只改 appearance 不保证底色有足够反差，
