@@ -1565,8 +1565,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// 构建桌面浮窗右键菜单（置顶切换 + 退出）。复用 togglePin() 动作，
-    /// 与菜单栏下拉的"置顶桌面卡片"项保持同一套置顶逻辑。
+    /// 构建桌面浮窗右键菜单（置顶切换 + 设置 + 退出）。复用 togglePin()/openSettings() 动作，
+    /// 与菜单栏下拉的"置顶桌面卡片"、"设置…"项保持同一套逻辑。
     private func buildPanelContextMenu() -> NSMenu {
         let menu = NSMenu()
         let pinned = UserDefaults.standard.object(forKey: "panelPinned") == nil
@@ -1577,6 +1577,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             keyEquivalent: "")
         pinItem.target = self
         menu.addItem(pinItem)
+        let settingsItem = NSMenuItem(
+            title: "设置…",
+            action: #selector(openSettings),
+            keyEquivalent: "")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
         menu.addItem(.separator())
         let quitItem = NSMenuItem(
             title: "退出灵眸",
