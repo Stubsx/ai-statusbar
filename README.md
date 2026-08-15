@@ -32,7 +32,7 @@ swift --version
 git clone https://github.com/Stubsx/ai-statusbar.git
 cd ai-statusbar
 ./AIStatusBar/build.sh
-cp -R AIStatusBar/AIStatusBar.app /Applications/灵眸.app
+cp -R AIStatusBar/灵眸.app /Applications/灵眸.app
 open /Applications/灵眸.app
 ```
 
@@ -47,7 +47,7 @@ open /Applications/灵眸.app
 ## 权限说明
 
 - **通知**：仅在用户启用任务完成提醒后申请。任务标题可能出现在通知中心或锁屏上。
-- **屏幕录制**：仅在用户选择“背景自适应”外观时申请，用于截取桌面卡片下方的低分辨率区域并计算明暗；截图不保存、不上传。
+- **屏幕录制**：仅在用户选择“背景自适应”外观时申请，用于截取桌面卡片下方的低分辨率区域并计算明暗；截图不保存、不上传。授权跟随 App 的签名证书：更换签名（如本地构建、不同机器签出的安装包混装）后，系统会视作新 App 重新请求一次；每个签名身份只会自动弹一次授权框，之后可随时在设置里重新触发引导。
 - **本地文件**：读取各工具保存的会话元数据、日志、数据库和登录状态，以判断任务状态和计算用量。
 
 详细的数据范围、联网地址和本地缓存见 [PRIVACY.md](PRIVACY.md)。
@@ -63,6 +63,20 @@ swift run lingmou-collector --json
 ```
 
 状态采集器和原生界面均使用 Swift 与 macOS 系统框架，没有第三方运行时包依赖。`LingmouCollectorCore` 提供共享采集逻辑，`lingmou-collector` 提供 JSON 和 SwiftBar 命令行输出。提交代码前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。安全问题请按 [SECURITY.md](SECURITY.md) 报告。
+
+本地构建默认用自签名身份 `Lingmou Local` 签名，系统授权（录屏/通知）跟随该证书跨构建保留。多台机器协作时请共用同一张证书：在主力构建机导出 `.p12`，其他机器执行 `./scripts/import-signing-identity.sh lingmou-local.p12` 导入，避免各机器各签各的导致授权反复失效。
+
+## 版本与发布
+
+App 的公开版本号来自最近的 `vX.Y.Z` tag，普通 commit 只更新内部构建号，不会改变用户看到的版本。正式发布由维护者在 `main` 已推送、Developer ID 和公证配置就绪后执行：
+
+```bash
+SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
+NOTARY_PROFILE="lingmou-notary" \
+./scripts/release.sh v1.0.1
+```
+
+脚本会构建 `Lingmou-1.0.1.dmg`、推送 annotated tag，并创建附带 SHA-256 校验文件的 GitHub Release。
 
 ## 卸载
 

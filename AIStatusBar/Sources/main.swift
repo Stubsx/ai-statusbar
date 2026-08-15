@@ -2,6 +2,7 @@ import Cocoa
 import SwiftUI
 import UserNotifications
 import ScreenCaptureKit
+import CryptoKit
 
 // MARK: - 图标规范（与 ZSpaceMonitor 对齐）
 // 运行时图标一律用 SF Symbol 程序化绘制 + 语义状态色，
@@ -1163,6 +1164,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: 面板配色跟随背景
 
     private var requestedCaptureAccess = false  // 每次启动只请求一次录屏权限
+
+    /// 录屏授权弹框的去重键：当前签名证书的 SHA-1。
+    /// TCC 授权跟随签名身份——换了证书（或 ad-hoc 重建）后系统视为新 app，会重新弹框；
+    /// 对比"上次弹框时的证书哈希"，保证每个签名身份只自动弹一次，而不是每次启动都弹。
+    /// ad-hoc 签名取不到证书链，统一归为 "adhoc"：宁可少弹，需要授权时走设置里的引导。
+    private var capturePromptSignerKey: String {
+        var code: SecCode?
+        guard SecCodeCopySelf([], &code) == errSecSuccess, let code else { return "unknown" }
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode else { return "unknown" }
+        var info: CFDictionary?
+        guard SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
+              let certs = (info as? [String: Any])?[kSecCodeInfoCertificates as String] as? [SecCertificate],
+              let leaf = certs.first else { return "adhoc" }
+        let der = SecCertificateCopyData(leaf) as Data
+        return Insecure.SHA1.hash(data: der).map { String(format: "%02x", $0) }.joined()
+    }
     private var appearanceCaptureGeneration: UInt = 0  // 丢弃异步返回的过期截图
     private var adaptiveAppearanceName: NSAppearance.Name?  // 滞回区内保持上次自适应判定
 
@@ -1201,6 +1219,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func requestScreenCaptureAccessIfNeeded() {
         guard !CGPreflightScreenCaptureAccess() else { return }
         requestedCaptureAccess = true
+        // 用户在设置里显式开启，允许重新弹框；同时记录签名身份，启动时的自动弹框保持安静
+        UserDefaults.standard.set(capturePromptSignerKey, forKey: "capturePromptSigner")
         CGRequestScreenCaptureAccess()
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             guard !CGPreflightScreenCaptureAccess(),
@@ -1265,12 +1285,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard panel.isVisible else { return }  // 面板不可见直接返回，省电
         // SCScreenshotManager 需要 macOS 14；低版本静默降级（不动 appearance）
         guard #available(macOS 14.0, *) else { return }
-        // 无录屏权限：请求一次（系统弹授权框），本次采样放弃，授权后下个周期生效
+        // 无录屏权限：每个签名身份只自动弹一次授权框（TCC 跟随签名证书，
+        // 本地构建/下载的 release/CI 产物签名不同时各自是"新 app"，不能每次启动都弹）
         if !CGPreflightScreenCaptureAccess() {
-            if !requestedCaptureAccess {
+            let prompted = UserDefaults.standard.string(forKey: "capturePromptSigner")
+            if !requestedCaptureAccess, prompted != capturePromptSignerKey {
                 requestedCaptureAccess = true
+                UserDefaults.standard.set(capturePromptSignerKey, forKey: "capturePromptSigner")
                 CGRequestScreenCaptureAccess()
-                adaptLog("无录屏权限，已弹授权请求，本次采样放弃")
+                adaptLog("无录屏权限，已弹授权请求（每个签名身份仅自动弹一次），本次采样放弃")
             } else {
                 adaptLog("无录屏权限（已申请过，等待授权），跳过本次采样")
             }
