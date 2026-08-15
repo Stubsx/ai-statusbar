@@ -5,17 +5,24 @@ public struct CollectorSettings: Sendable {
     public var perToolBusySeconds: [String: Int]
     public var offlineAfterSeconds: Int
     public var onlineQuota: Bool
+    /// 用量同步（多设备汇总）。默认关闭；目录为空时用 iCloud Drive 默认目录
+    public var usageSyncEnabled: Bool
+    public var usageSyncDir: String?
 
     public init(
         defaultBusySeconds: Int = 300,
         perToolBusySeconds: [String: Int] = [:],
         offlineAfterSeconds: Int = 10_800,
-        onlineQuota: Bool = true
+        onlineQuota: Bool = true,
+        usageSyncEnabled: Bool = false,
+        usageSyncDir: String? = nil
     ) {
         self.defaultBusySeconds = defaultBusySeconds
         self.perToolBusySeconds = perToolBusySeconds
         self.offlineAfterSeconds = offlineAfterSeconds
         self.onlineQuota = onlineQuota
+        self.usageSyncEnabled = usageSyncEnabled
+        self.usageSyncDir = usageSyncDir
     }
 
     public func busySeconds(for tool: String) -> Int {
@@ -31,11 +38,16 @@ public struct CollectorSettings: Sendable {
             (object["per_tool"] as? JSONObject)?.reduce(into: [String: Int]()) {
                 if let value = JSONValue.int($1.value) { $0[$1.key] = value }
             } ?? [:]
+        let sync = object["usage_sync"] as? JSONObject
+        let syncDir = JSONValue.string(sync?["dir"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return CollectorSettings(
             defaultBusySeconds: JSONValue.int(object["default_busy_sec"]) ?? 300,
             perToolBusySeconds: perTool,
             offlineAfterSeconds: JSONValue.int(object["offline_after_sec"]) ?? 10_800,
-            onlineQuota: online
+            onlineQuota: online,
+            usageSyncEnabled: JSONValue.bool(sync?["enabled"]) ?? false,
+            usageSyncDir: syncDir.isEmpty ? nil : syncDir
         )
     }
 }

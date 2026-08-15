@@ -74,11 +74,30 @@ struct UsageParsers {
 
 struct UsageCollector {
     let environment: CollectorEnvironment
+    let settings: CollectorSettings
     let files: FileSupport
+
+    init(
+        environment: CollectorEnvironment,
+        settings: CollectorSettings = CollectorSettings(),
+        files: FileSupport
+    ) {
+        self.environment = environment
+        self.settings = settings
+        self.files = files
+    }
 
     private let maximumAge: TimeInterval = 70 * 86_400
 
     func collect() -> UsageData? {
+        collectWithSync().local
+    }
+
+    /// 采集本机用量；开启同步时同时导出本机数据并合并同步目录中其他设备的数据。
+    /// 同步关闭时 merged/sync 为 nil，JSON 输出与旧版完全一致。
+    func collectWithSync() -> (
+        local: UsageData?, merged: UsageData?, sync: UsageSyncStatus?
+    ) {
         do {
             let database = try openDatabase()
             let sources: [([String], String, (String) -> ParsedUsage?)] = [
@@ -115,34 +134,86 @@ struct UsageCollector {
                 }
             }
             collectHermes(database: database)
-            let today = DateSupport.localDay(environment.now)
-            let rows = try database.query(
-                "SELECT tool, input, output, cache FROM daily WHERE date=?",
-                binds: [.text(today)]
-            )
-            var tools: [String: UsageEntry] = [:]
-            var total = UsageEntry()
-            for row in rows {
-                guard let tool = row["tool"]?.string else { continue }
-                let entry = UsageEntry(
+            let rows = try localDaily(database: database)
+            let local = Self.usageData(
+                from: UsageSync.mergedDaily([rows]), now: environment.now)
+            guard settings.usageSyncEnabled else { return (local, nil, nil) }
+            let synced = try syncUsage(localRows: rows)
+            return (local, synced.merged, synced.status)
+        } catch {
+            return (nil, nil, nil)
+        }
+    }
+
+    /// 导出本机数据到同步目录，并合并目录中所有设备的数据与来源状态
+    private func syncUsage(localRows: [UsageSyncDay]) throws -> (
+        merged: UsageData, status: UsageSyncStatus
+    ) {
+        let directory =
+            settings.usageSyncDir ?? UsageSync.defaultDirectory(home: environment.homeDirectory)
+        let device = UsageSync.deviceIdentity(home: environment.homeDirectory, files: files)
+        let export = UsageSync.writeExport(
+            directory: directory, device: device, daily: localRows, now: environment.now,
+            statePath: environment.path(".ai-statusbar", "sync-state.json"), files: files)
+        // 排除自己导出的文件：本机数据以 sqlite 为准并入一次，
+        // 否则目录里自己的导出会被当远端再合并一遍（计数翻倍）
+        let remotes = UsageSync.loadRemotes(directory: directory, files: files)
+            .filter { $0.device != device.id }
+        let merged = Self.usageData(
+            from: UsageSync.mergedDaily([localRows] + remotes.map(\.daily)),
+            now: environment.now)
+        var sources = remotes.map { file in
+            UsageSyncSource(
+                device: file.device, name: file.name, updatedAt: file.updatedAt,
+                days: Set(file.daily.map(\.date)).count)
+        }
+        sources.append(
+            UsageSyncSource(
+                device: device.id, name: device.name, updatedAt: export.lastWrite,
+                days: Set(localRows.map(\.date)).count))
+        let status = UsageSyncStatus(
+            enabled: true, dir: directory, device: device.id, name: device.name,
+            sources: sources.sorted { $0.name < $1.name })
+        return (merged, status)
+    }
+
+    private func localDaily(database: SQLiteDatabase) throws -> [UsageSyncDay] {
+        try database.query("SELECT date, tool, input, output, cache FROM daily")
+            .compactMap { row in
+                guard let date = row["date"]?.string, let tool = row["tool"]?.string else {
+                    return nil
+                }
+                return UsageSyncDay(
+                    date: date, tool: tool,
                     input: row["input"]?.int ?? 0,
                     output: row["output"]?.int ?? 0,
-                    cache: row["cache"]?.int ?? 0
-                )
-                tools[tool] = entry
-                total.add(entry)
+                    cache: row["cache"]?.int ?? 0)
             }
-            let heat = try heatmap(database: database)
-            return UsageData(
-                date: DateSupport.displayDay(Date(timeIntervalSince1970: environment.now)),
-                tools: tools,
-                total: total,
-                heatmap: heat.days,
-                heatmax: heat.maximum
-            )
-        } catch {
-            return nil
+    }
+
+    /// 由 date → tool → 计数 构建 UsageData：今日分工具视图 + 热力图。
+    /// 本机 sqlite 与多设备合并共用这一入口，保证两套视图的口径一致。
+    static func usageData(
+        from daily: [String: [String: UsageEntry]], now: TimeInterval
+    ) -> UsageData {
+        let today = DateSupport.localDay(now)
+        var tools: [String: UsageEntry] = [:]
+        var total = UsageEntry()
+        for (tool, entry) in daily[today] ?? [:] {
+            tools[tool] = entry
+            total.add(entry)
         }
+        let totals = daily.mapValues { day in
+            day.values.reduce(0) { $0 + $1.input + $1.output + $1.cache }
+        }
+        let heat = heatmap(totals: totals, now: now)
+        return UsageData(
+            date: DateSupport.displayDay(Date(timeIntervalSince1970: now)),
+            tools: tools,
+            total: total,
+            heatmap: heat.days,
+            heatmax: heat.maximum
+        )
     }
 
     private func kimiWorkUsageFiles() -> [String] {
@@ -305,22 +376,19 @@ struct UsageCollector {
         }
     }
 
-    private func heatmap(database: SQLiteDatabase) throws -> (days: [HeatDay], maximum: Int) {
-        let rows = try database.query(
-            "SELECT date, SUM(input + output + cache) AS total FROM daily GROUP BY date")
-        let totals = rows.reduce(into: [String: Int]()) {
-            if let day = $1["date"]?.string { $0[day] = $1["total"]?.int ?? 0 }
-        }
+    /// 热力图（GitHub 风格：列=周，行=周一~周日），按 date → 总量 构建。
+    /// 本机 sqlite 与多设备合并数据共用，保持口径一致。
+    static func heatmap(totals: [String: Int], now: TimeInterval) -> (days: [HeatDay], maximum: Int) {
         let calendar = Calendar.current
-        let now = Date(timeIntervalSince1970: environment.now)
-        var start = calendar.date(byAdding: .day, value: -69, to: now) ?? now
+        let nowDate = Date(timeIntervalSince1970: now)
+        var start = calendar.date(byAdding: .day, value: -69, to: nowDate) ?? nowDate
         let weekday = calendar.component(.weekday, from: start)
         let daysAfterMonday = (weekday + 5) % 7
         start = calendar.startOfDay(
             for: calendar.date(byAdding: .day, value: -daysAfterMonday, to: start) ?? start)
         var dates: [Date] = []
         var current = start
-        while current <= now {
+        while current <= nowDate {
             dates.append(current)
             guard let next = calendar.date(byAdding: .day, value: 1, to: current) else { break }
             current = next
@@ -331,7 +399,7 @@ struct UsageCollector {
             dates.append(next)
         }
         var maximum = 0
-        let today = calendar.startOfDay(for: now)
+        let today = calendar.startOfDay(for: nowDate)
         let days = dates.map { date -> HeatDay in
             let key = DateSupport.localDay(date.timeIntervalSince1970)
             let total = totals[key] ?? 0

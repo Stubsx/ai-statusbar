@@ -146,15 +146,77 @@ public struct UsageData: Codable, Hashable, Sendable {
     }
 }
 
+/// 用量同步文件中的一行：某设备某天某工具的 token 计数。
+public struct UsageSyncDay: Codable, Hashable, Sendable {
+    public let date: String
+    public let tool: String
+    public let input: Int
+    public let output: Int
+    public let cache: Int
+
+    public init(date: String, tool: String, input: Int, output: Int, cache: Int) {
+        self.date = date
+        self.tool = tool
+        self.input = input
+        self.output = output
+        self.cache = cache
+    }
+}
+
+/// 用量同步来源：一台已导出到同步目录的设备。
+public struct UsageSyncSource: Codable, Hashable, Sendable {
+    public let device: String
+    public let name: String
+    public let updatedAt: TimeInterval
+    public let days: Int
+
+    public init(device: String, name: String, updatedAt: TimeInterval, days: Int) {
+        self.device = device
+        self.name = name
+        self.updatedAt = updatedAt
+        self.days = days
+    }
+}
+
+/// 用量同步状态：开关、目录与当前可见的设备来源。
+public struct UsageSyncStatus: Codable, Hashable, Sendable {
+    public let enabled: Bool
+    public let dir: String?
+    public let device: String
+    public let name: String
+    public let sources: [UsageSyncSource]
+
+    public init(
+        enabled: Bool, dir: String?, device: String, name: String, sources: [UsageSyncSource]
+    ) {
+        self.enabled = enabled
+        self.dir = dir
+        self.device = device
+        self.name = name
+        self.sources = sources
+    }
+}
+
 public struct StatusData: Codable, Hashable, Sendable {
     public let updatedAt: String
     public let tools: [ToolStatus]
     public let usage: UsageData?
+    /// 合并同步目录中所有设备后的用量/热力图；usage 恒为本机数据，前端按需选择展示
+    public let usageMerged: UsageData?
+    public let sync: UsageSyncStatus?
 
-    public init(updatedAt: String, tools: [ToolStatus], usage: UsageData?) {
+    public init(
+        updatedAt: String,
+        tools: [ToolStatus],
+        usage: UsageData?,
+        usageMerged: UsageData? = nil,
+        sync: UsageSyncStatus? = nil
+    ) {
         self.updatedAt = updatedAt
         self.tools = tools
         self.usage = usage
+        self.usageMerged = usageMerged
+        self.sync = sync
     }
 }
 

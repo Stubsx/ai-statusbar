@@ -37,7 +37,8 @@ public final class LingmouCollector {
         let zcode = local.zcode()
         let quota = QuotaCollector(environment: environment, settings: settings, files: files)
             .collect()
-        let usage = UsageCollector(environment: environment, files: files).collect()
+        let usage = UsageCollector(environment: environment, settings: settings, files: files)
+            .collectWithSync()
         var tools = [
             makeTool(
                 key: "codex-ide", letter: "C", name: "Codex App", raw: codex.ide,
@@ -63,7 +64,9 @@ public final class LingmouCollector {
         return StatusData(
             updatedAt: formatter.string(from: Date(timeIntervalSince1970: environment.now)),
             tools: tools,
-            usage: usage
+            usage: usage.local,
+            usageMerged: usage.merged,
+            sync: usage.sync
         )
     }
 
