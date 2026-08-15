@@ -3,7 +3,7 @@
 # 通用二进制（arm64 + x86_64）；本地默认自签名，公开发布支持 Developer ID 签名
 set -euo pipefail
 cd "$(dirname "$0")"
-APP="AIStatusBar.app"
+APP="灵眸.app"  # 产物名与 release/安装版一致，避免本地出现英文 AIStatusBar.app 与授权列表名不一致
 
 for tool in swift swiftc lipo codesign security git; do
   if ! command -v "$tool" >/dev/null 2>&1; then

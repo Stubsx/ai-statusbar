@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 APP_NAME="灵眸"
 BUNDLE_ID="io.github.stubsx.lingmou"
-SRC_APP="$ROOT/AIStatusBar/AIStatusBar.app"
+SRC_APP="$ROOT/AIStatusBar/灵眸.app"
 INSTALLED_APP="/Applications/${APP_NAME}.app"
 
 # 1) 构建。失败则 set -e 直接退出 —— 绝不动正在运行的可用版本

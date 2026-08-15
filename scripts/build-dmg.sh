@@ -14,16 +14,17 @@ fi
 "$ROOT/AIStatusBar/build.sh"
 
 VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" \
-    "$ROOT/AIStatusBar/AIStatusBar.app/Contents/Info.plist")
+    "$ROOT/AIStatusBar/灵眸.app/Contents/Info.plist")
 PRODUCT_NAME="灵眸"
 mkdir -p dist
-DMG="dist/${PRODUCT_NAME}-${VER}.dmg"
-# 清理当前版本的产物，包括改用中文命名前遗留的英文 DMG，避免误装旧包。
-rm -f "$DMG" "dist/AIStatusBar-${VER}.dmg"
+# Release 附件使用 ASCII 文件名，避免托管平台把中文前缀清理成空字符串。
+DMG="dist/Lingmou-${VER}.dmg"
+# 清理当前版本的产物，包括历史中文名和旧英文名，避免误装旧包。
+rm -f "$DMG" "dist/${PRODUCT_NAME}-${VER}.dmg" "dist/AIStatusBar-${VER}.dmg"
 
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
-cp -R "AIStatusBar/AIStatusBar.app" "$STAGE/${PRODUCT_NAME}.app"
+cp -R "AIStatusBar/灵眸.app" "$STAGE/${PRODUCT_NAME}.app"
 ln -s /Applications "$STAGE/应用程序"
 
 hdiutil create -volname "${PRODUCT_NAME}安装" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
@@ -40,10 +41,10 @@ fi
 
 # 当前刚构建的 DMG 始终保留；其余历史产物只保留版本号最高的 2 个。
 # 版本号格式为 x.y.z；sort -t. -k1,1n -k2,2n -k3,3n 按数字段排序，
-# 跳过文件名前缀差异（中文 灵眸- 与遗留英文 AIStatusBar-）。
+# 跳过文件名前缀差异（Lingmou-、中文 灵眸- 与遗留英文 AIStatusBar-）。
 KEEP_OLD=2
 index=0
-find dist -maxdepth 1 -type f \( -name "${PRODUCT_NAME}-*.dmg" -o -name 'AIStatusBar-*.dmg' \) \
+find dist -maxdepth 1 -type f \( -name 'Lingmou-*.dmg' -o -name "${PRODUCT_NAME}-*.dmg" -o -name 'AIStatusBar-*.dmg' \) \
   | sed -nE 's#(.*-([0-9]+\.[0-9]+\.[0-9]+)\.dmg)$#\2 \1#p' \
   | sort -t. -k1,1nr -k2,2nr -k3,3nr \
   | cut -d' ' -f2- \

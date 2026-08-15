@@ -16,7 +16,7 @@ swiftc -typecheck -target arm64-apple-macosx12.0 AIStatusBar/Sources/main.swift
 
 if rg -n --hidden \
     -g '*.swift' -g '*.sh' -g '*.jsx' -g '*.plist' -g '*.md' -g '*.yml' -g '.gitignore' \
-    -g '!AGENTS.md' -g '!scripts/check-open-source.sh' -g '!AIStatusBar/AIStatusBar.app/**' -g '!dist/**' \
+    -g '!AGENTS.md' -g '!scripts/check-open-source.sh' -g '!AIStatusBar/灵眸.app/**' -g '!AIStatusBar/AIStatusBar.app/**' -g '!dist/**' \
     '(/Users/[^/]+/|BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|AKIA[0-9A-Z]{16}|xox[baprs]-|gh[pousr]_[A-Za-z0-9_]{20,})' .; then
   echo "错误：发现个人绝对路径或疑似凭据，请核查以上结果" >&2
   exit 1

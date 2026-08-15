@@ -18,7 +18,7 @@ swift run lingmou-collector --json
 ./AIStatusBar/build.sh
 ```
 
-界面改动还应检查菜单栏、桌面卡片、设置窗口和通知。不要提交 `AIStatusBar.app` 或 `dist/` 下的构建产物。
+界面改动还应检查菜单栏、桌面卡片、设置窗口和通知。不要提交 `灵眸.app` 或 `dist/` 下的构建产物。
 
 ## 提交与 Pull Request
 
