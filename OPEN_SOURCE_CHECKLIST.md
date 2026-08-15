@@ -26,7 +26,9 @@
 ```bash
 SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
 NOTARY_PROFILE="lingmou-notary" \
-./scripts/release.sh v1.0.0
+./scripts/release.sh v1.0.1
 ```
 
-脚本只在本地构建并创建 tag，不会自动推送或公开仓库。
+脚本会检查 `main` 已推送到远端，构建并公证 DMG，创建并推送 annotated tag，
+最后创建带 SHA-256 校验文件的 GitHub Release。失败后可用同一 tag 重试；已发布的
+Release 不会被覆盖。
