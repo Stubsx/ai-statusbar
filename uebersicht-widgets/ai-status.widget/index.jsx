@@ -63,6 +63,9 @@ export const className = `
     list-style: none;
   }
   .tasks li {
+    display: flex;
+    align-items: center;
+    gap: 5px;
     font-size: 11px;
     color: ${COLORS.busy};
     opacity: 0.85;
@@ -72,6 +75,7 @@ export const className = `
     max-width: 300px;
     padding: 1px 0;
   }
+  .tasks svg { flex-shrink: 0; }
   .latest {
     margin: 0 0 4px 18px;
     font-size: 10px;
@@ -102,7 +106,15 @@ export const render = ({ output, error }) => {
           </div>
           {t.busy_items.length > 0 && (
             <ul className="tasks">
-              {t.busy_items.map(item => <li key={item.id}>▶ {item.title}</li>)}
+              {t.busy_items.map(item => (
+                <li key={item.id}>
+                  {/* 与原生 App 的 SF Symbol play.fill 对齐的运行中标记 */}
+                  <svg width="8" height="8" viewBox="0 0 12 12" aria-hidden="true">
+                    <path d="M3 1.8 L10.4 6 L3 10.2 Z" fill={COLORS.busy} />
+                  </svg>
+                  {item.title}
+                </li>
+              ))}
             </ul>
           )}
           {t.busy_items.length === 0 && t.latest_title && (

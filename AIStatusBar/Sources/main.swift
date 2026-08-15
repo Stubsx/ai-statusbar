@@ -3,6 +3,63 @@ import SwiftUI
 import UserNotifications
 import ScreenCaptureKit
 
+// MARK: - 图标规范（与 ZSpaceMonitor 对齐）
+// 运行时图标一律用 SF Symbol 程序化绘制 + 语义状态色，
+// 不用 emoji 或 ●/▶ 等文本字符（渲染随系统字体漂移、明暗外观下不可控）。
+// App 图标资产（AppIcon.icns / iconset）的规范见 ../icons/README.md。
+
+extension NSColor {
+    /// 三态语义色：busy=绿 idle=黄 off=灰。
+    /// 菜单栏徽标、下拉菜单、面板共用同一映射，避免各处硬编码 RGB 后失配。
+    static func toolStatusColor(_ state: String) -> NSColor {
+        switch state {
+        case "busy": return .systemGreen
+        case "idle": return .systemYellow
+        default: return .systemGray
+        }
+    }
+}
+
+/// 生成带颜色的 SF Symbol 图标（用于菜单行 NSMenuItem.image）。
+/// 先绘制符号作为 alpha 蒙版，再用 sourceAtop 着色，保持背景透明。
+func symbol(_ name: String, color: NSColor = .secondaryLabelColor,
+            size: CGFloat = 13, weight: NSFont.Weight = .regular) -> NSImage? {
+    let cfg = NSImage.SymbolConfiguration(pointSize: size, weight: weight)
+    guard let base = NSImage(systemSymbolName: name, accessibilityDescription: nil) else { return nil }
+    let src = base.withSymbolConfiguration(cfg) ?? base
+
+    // 创建位图，固定 2x retina 尺寸保证菜单渲染稳定
+    let scale: CGFloat = 2
+    let canvasSize = NSSize(width: ceil(src.size.width), height: ceil(src.size.height))
+    let pxW = Int(canvasSize.width * scale)
+    let pxH = Int(canvasSize.height * scale)
+    guard let bmp = NSBitmapImageRep(
+        bitmapDataPlanes: nil, pixelsWide: pxW, pixelsHigh: pxH,
+        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+        isPlanar: false, colorSpaceName: .deviceRGB,
+        bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
+    // NSBitmapImageRep 默认以像素作为逻辑尺寸；显式设为 point 尺寸，
+    // 否则 2x Retina 位图会把 SF Symbol 显示成正常大小的一半。
+    bmp.size = canvasSize
+    let out = NSImage(size: canvasSize)
+    out.addRepresentation(bmp)
+
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bmp)
+
+    // 先画符号建立透明蒙版，再把颜色 sourceAtop 到符号区域。
+    // 若先填整张位图，透明背景也会保留下来，菜单中就会显示成色块。
+    let bounds = NSRect(origin: .zero, size: canvasSize)
+    src.draw(in: bounds,
+             from: .zero, operation: .sourceOver, fraction: 1.0)
+    color.set()
+    bounds.fill(using: .sourceAtop)
+
+    NSGraphicsContext.restoreGraphicsState()
+    out.isTemplate = false
+    return out
+}
+
 // MARK: - 数据模型（对应 lingmou-collector --json 的输出）
 
 struct BusyItem: Codable, Hashable {
@@ -382,21 +439,31 @@ struct PanelView: View {
                         .padding(.vertical, 4)
 
                         ForEach(t.busyItems, id: \.id) { item in
-                            Text("▶ \(item.title)")
-                                .font(.system(size: 11))
-                                .foregroundColor(Color(red: 0.19, green: 0.82, blue: 0.35).opacity(0.85))
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-                                .padding(.leading, 18)
+                            HStack(spacing: 4) {
+                                Image(systemName: "play.fill")
+                                    .font(.system(size: 8, weight: .bold))
+                                    .foregroundColor(color(for: "busy").opacity(0.85))
+                                Text(item.title)
+                                    .font(.system(size: 11))
+                                    .foregroundColor(color(for: "busy").opacity(0.85))
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                            }
+                            .padding(.leading, 18)
                         }
                         if t.busyItems.isEmpty, let latest = t.latestTitle {
-                            Text("最近：\(latest) · \(t.latestAge ?? "")")
-                                .font(.system(size: 10))
-                                .foregroundColor(.secondary.opacity(0.7))
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-                                .padding(.leading, 18)
-                                .padding(.bottom, 4)
+                            HStack(spacing: 4) {
+                                Image(systemName: "clock")
+                                    .font(.system(size: 8))
+                                    .foregroundColor(.secondary.opacity(0.7))
+                                Text("最近：\(latest) · \(t.latestAge ?? "")")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(.secondary.opacity(0.7))
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                            }
+                            .padding(.leading, 18)
+                            .padding(.bottom, 4)
                         }
                     }
                 }
@@ -588,12 +655,12 @@ struct PanelView: View {
             : Color(red: 0.48, green: 0.38, blue: 0.96)
     }
 
-    /// 按用量升档着色：低用量绿、中等黄、逼近上限红
+    /// 按用量升档着色：低用量绿、中等黄、逼近上限红（与状态语义色同源）
     private func quotaColor(_ usedPercent: Double) -> Color {
         switch usedPercent {
-        case ..<50: return Color(red: 0.19, green: 0.82, blue: 0.35)
-        case ..<80: return Color(red: 1.0, green: 0.84, blue: 0.04)
-        default: return Color(red: 0.96, green: 0.34, blue: 0.30)
+        case ..<50: return Color(NSColor.systemGreen)
+        case ..<80: return Color(NSColor.systemYellow)
+        default: return Color(NSColor.systemRed)
         }
     }
 
@@ -770,11 +837,7 @@ struct PanelView: View {
     }
 
     private func color(for state: String) -> Color {
-        switch state {
-        case "busy": return Color(red: 0.19, green: 0.82, blue: 0.35)
-        case "idle": return Color(red: 1.0, green: 0.84, blue: 0.04)
-        default: return Color(white: 0.39)
-        }
+        Color(NSColor.toolStatusColor(state))
     }
 
     private func label(for state: String) -> String {
@@ -1056,12 +1119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ]
         for (i, t) in tools.enumerated() {
             out.append(NSAttributedString(string: t.letter, attributes: letterAttrs))
-            let dotColor: NSColor
-            switch t.state {
-            case "busy": dotColor = .systemGreen
-            case "idle": dotColor = .systemYellow
-            default: dotColor = .systemGray
-            }
+            let dotColor = NSColor.toolStatusColor(t.state)
             out.append(NSAttributedString(string: "●", attributes: [
                 .font: NSFont.systemFont(ofSize: 7, weight: .bold),
                 .foregroundColor: dotColor,
@@ -1099,14 +1157,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             f.origin.y += f.size.height - size.height  // 保持顶边不动
             f.size = size
             panel.setFrame(f, display: true)
-        }
-    }
-
-    private func mark(_ state: String) -> String {
-        switch state {
-        case "busy": return "🟢"
-        case "idle": return "🟡"
-        default: return "⚪️"
         }
     }
 
@@ -1374,17 +1424,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let visible = data.tools.filter { $0.state != "off" }
             if visible.isEmpty {
                 let empty = NSMenuItem(title: "全部未运行", action: nil, keyEquivalent: "")
+                empty.image = symbol("moon.zzz", color: .systemGray, size: 12)
                 empty.isEnabled = false
                 menu.addItem(empty)
                 menu.addItem(.separator())
             }
             for t in visible {
-                let header = NSMenuItem(title: "\(mark(t.state)) \(t.name)：\(label[t.state] ?? t.state)（\(t.detail)）",
+                let header = NSMenuItem(title: "\(t.name)：\(label[t.state] ?? t.state)（\(t.detail)）",
                                         action: nil, keyEquivalent: "")
+                header.image = symbol("circle.fill", color: NSColor.toolStatusColor(t.state), size: 10)
                 header.isEnabled = false
                 menu.addItem(header)
                 for busy in t.busyItems.prefix(3) {
-                    let item = NSMenuItem(title: "▶ \(truncate(busy.title))", action: nil, keyEquivalent: "")
+                    let item = NSMenuItem(title: truncate(busy.title), action: nil, keyEquivalent: "")
+                    item.image = symbol("play.fill", color: .systemGreen, size: 11)
                     item.isEnabled = false
                     item.attributedTitle = NSAttributedString(string: item.title, attributes: [
                         .font: NSFont.systemFont(ofSize: 11),
@@ -1394,6 +1447,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 if t.busyItems.isEmpty, let latest = t.latestTitle {
                     let item = NSMenuItem(title: "最近任务：\(truncate(latest, 34)) · \(t.latestAge ?? "")", action: nil, keyEquivalent: "")
+                    item.image = symbol("clock", color: .secondaryLabelColor, size: 11)
                     item.isEnabled = false
                     item.attributedTitle = NSAttributedString(string: item.title, attributes: [
                         .font: NSFont.systemFont(ofSize: 11),
@@ -1406,19 +1460,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let settingsItem = NSMenuItem(title: "设置…", action: #selector(openSettings), keyEquivalent: ",")
         settingsItem.target = self
+        settingsItem.image = symbol("gearshape")
         menu.addItem(settingsItem)
         let toggle = NSMenuItem(title: UserDefaults.standard.bool(forKey: "panelVisible") ? "隐藏桌面卡片" : "显示桌面卡片",
                                 action: #selector(togglePanel), keyEquivalent: "p")
         toggle.target = self
+        toggle.image = symbol("rectangle.on.rectangle")
         menu.addItem(toggle)
         let pinned = UserDefaults.standard.object(forKey: "panelPinned") == nil
             ? true : UserDefaults.standard.bool(forKey: "panelPinned")
         let pin = NSMenuItem(title: "置顶桌面卡片", action: #selector(togglePin), keyEquivalent: "t")
         pin.target = self
+        pin.image = symbol("pin")
         pin.state = pinned ? .on : .off
         menu.addItem(pin)
         let refresh = NSMenuItem(title: "刷新", action: #selector(doRefresh), keyEquivalent: "r")
         refresh.target = self
+        refresh.image = symbol("arrow.clockwise")
         menu.addItem(refresh)
         menu.addItem(.separator())
         let legend = NSMenuItem(title: "C=Codex App  X=Codex CLI  K=Kimi  L=Claude  H=Hermes  Z=ZCode", action: nil, keyEquivalent: "")
@@ -1429,6 +1487,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ])
         menu.addItem(legend)
         let quit = NSMenuItem(title: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        quit.image = symbol("power", color: .systemRed)
         menu.addItem(quit)
     }
 
