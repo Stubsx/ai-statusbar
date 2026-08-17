@@ -393,26 +393,10 @@ struct QuotaCollector {
     }
 
     private func zcodeQuota() -> ToolQuota? {
-        let path = environment.path(".zcode", "v2", "model-providers.json")
-        guard let data = files.read(path),
-            let providers = try? JSONSerialization.jsonObject(with: data) as? [JSONObject]
-        else { return nil }
-        var credential: (String, String)?
-        for (name, base) in [
-            ("Bigmodel - Coding Plan", "https://open.bigmodel.cn"),
-            ("Z.AI - Coding Plan", "https://api.z.ai"),
-        ] {
-            if let provider = providers.first(where: { JSONValue.string($0["name"]) == name }),
-                let key = JSONValue.string(provider["apiKey"]), !key.isEmpty
-            {
-                credential = (key, base)
-                break
-            }
-        }
-        guard let credential,
+        guard let credential = zcodeCredential(),
             let object = request(
-                url: credential.1 + "/api/monitor/usage/quota/limit",
-                headers: ["Authorization": "Bearer \(credential.0)"]
+                url: credential.base + "/api/monitor/usage/quota/limit",
+                headers: ["Authorization": "Bearer \(credential.key)"]
             ), JSONValue.int(object["code"]) == 200,
             let dataObject = object["data"] as? JSONObject
         else { return nil }
@@ -434,6 +418,58 @@ struct QuotaCollector {
             plan: JSONValue.string(dataObject["level"]), windows: windows,
             updatedAt: Int(environment.now)
         )
+    }
+
+    /// 找 ZCode 带额度的 API 凭证。新版 ZCode 把提供商存在 config.json 的 provider
+    /// 字典里（按 builtin id 标识，密钥在 options.apiKey，入口在 options.baseURL）；
+    /// 旧版 model-providers.json 数组保留为回退。只认 open.bigmodel.cn / api.z.ai
+    /// 两个配额接口域名，start-plan 的 zcode.z.ai 等其他入口直接跳过。
+    private func zcodeCredential() -> (key: String, base: String)? {
+        let configPath = environment.path(".zcode", "v2", "config.json")
+        if let data = files.read(configPath),
+            let object = try? JSONSerialization.jsonObject(with: data) as? JSONObject,
+            let providers = object["provider"] as? JSONObject
+        {
+            func pick(enabledOnly: Bool) -> (String, String)? {
+                for (id, raw) in providers {
+                    guard id.hasSuffix("coding-plan"), let provider = raw as? JSONObject,
+                        !enabledOnly || JSONValue.bool(provider["enabled"]) == true,
+                        let options = provider["options"] as? JSONObject,
+                        let key = JSONValue.string(options["apiKey"]), !key.isEmpty,
+                        let baseURL = JSONValue.string(options["baseURL"]),
+                        let base = zcodeQuotaBase(from: baseURL)
+                    else { continue }
+                    return (key, base)
+                }
+                return nil
+            }
+            if let credential = pick(enabledOnly: true) ?? pick(enabledOnly: false) {
+                return credential
+            }
+        }
+        let legacyPath = environment.path(".zcode", "v2", "model-providers.json")
+        if let data = files.read(legacyPath),
+            let providers = try? JSONSerialization.jsonObject(with: data) as? [JSONObject]
+        {
+            for (name, base) in [
+                ("Bigmodel - Coding Plan", "https://open.bigmodel.cn"),
+                ("Z.AI - Coding Plan", "https://api.z.ai"),
+            ] {
+                if let provider = providers.first(where: { JSONValue.string($0["name"]) == name }),
+                    let key = JSONValue.string(provider["apiKey"]), !key.isEmpty
+                {
+                    return (key, base)
+                }
+            }
+        }
+        return nil
+    }
+
+    /// 提供商 baseURL（如 https://open.bigmodel.cn/api/anthropic）→ 配额接口域名
+    private func zcodeQuotaBase(from baseURL: String) -> String? {
+        if baseURL.contains("open.bigmodel.cn") { return "https://open.bigmodel.cn" }
+        if baseURL.contains("api.z.ai") { return "https://api.z.ai" }
+        return nil
     }
 
     private func window(minutes: Int, percent: Double, resetsAt: Int) -> QuotaWindow {

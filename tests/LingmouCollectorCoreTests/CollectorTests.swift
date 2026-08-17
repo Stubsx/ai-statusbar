@@ -307,6 +307,53 @@ final class CollectorTests: XCTestCase {
             })
     }
 
+    /// 新版 ZCode 把提供商存进 config.json 的 provider 字典（密钥在 options 里、
+    /// 按 builtin id 标识），且名称大小写与旧版数组写法不同；此时应从 config.json
+    /// 取启用项的密钥，而不是依赖已不存在的 model-providers.json。
+    func testZCodeQuotaReadsNewConfigProviderLayout() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        try write(
+            """
+            {"provider":{
+              "builtin:bigmodel-coding-plan":{"name":"BigModel - Coding Plan","enabled":true,
+                "options":{"apiKey":"new-layout-key","baseURL":"https://open.bigmodel.cn/api/anthropic"}},
+              "builtin:zai-coding-plan":{"name":"Z.ai - Coding Plan","enabled":false,
+                "options":{"apiKey":"","baseURL":"https://api.z.ai/api/anthropic"}}
+            }}
+            """,
+            to: home.appendingPathComponent(".zcode/v2/config.json"))
+        var authHeaders: [String] = []
+        let collector = QuotaCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: 2_000_000_000),
+            settings: CollectorSettings(onlineQuota: true),
+            files: FileSupport(),
+            requestOverride: { request in
+                guard request.url?.host == "open.bigmodel.cn" else { return nil }
+                authHeaders.append(request.value(forHTTPHeaderField: "Authorization") ?? "")
+                return [
+                    "code": 200,
+                    "data": [
+                        "level": "lite",
+                        "limits": [
+                            [
+                                "type": "TOKENS_LIMIT", "number": 5, "percentage": 25.5,
+                                "nextResetTime": 42_000,
+                            ]
+                        ],
+                    ],
+                ]
+            }
+        )
+        let quota = collector.collect()
+        XCTAssertEqual(quota["zcode"]??.plan, "lite")
+        XCTAssertEqual(quota["zcode"]??.windows.first?.kind, "5h")
+        XCTAssertEqual(quota["zcode"]??.windows.first?.usedPercent, 25.5)
+        XCTAssertEqual(quota["zcode"]??.windows.first?.resetsAt, 42)
+        XCTAssertEqual(quota["zcode"]??.windows.first?.windowMinutes, 300)
+        XCTAssertEqual(authHeaders, ["Bearer new-layout-key"])
+    }
+
     func testKimiCodeAndKimiWorkQuotasStaySeparate() throws {
         let home = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: home) }
