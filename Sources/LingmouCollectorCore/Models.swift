@@ -27,6 +27,7 @@ public struct QuotaWindow: Codable, Hashable, Sendable {
     public let label: String
     public let usedPercent: Double
     public let resetsAt: Int
+    public let windowMinutes: Int?
     public let components: [QuotaComponent]?
 
     public init(
@@ -34,12 +35,14 @@ public struct QuotaWindow: Codable, Hashable, Sendable {
         label: String,
         usedPercent: Double,
         resetsAt: Int,
+        windowMinutes: Int? = nil,
         components: [QuotaComponent]? = nil
     ) {
         self.kind = kind
         self.label = label
         self.usedPercent = usedPercent
         self.resetsAt = resetsAt
+        self.windowMinutes = windowMinutes
         self.components = components
     }
 }

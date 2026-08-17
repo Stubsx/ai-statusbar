@@ -248,7 +248,8 @@ struct QuotaCollector {
                 kind: value.kind,
                 label: label,
                 usedPercent: value.usedPercent,
-                resetsAt: value.resetsAt
+                resetsAt: value.resetsAt,
+                windowMinutes: minutes
             )
         }
         var windows: [QuotaWindow] = []
@@ -367,12 +368,20 @@ struct QuotaCollector {
         let code = min(total, max(0, JSONValue.double(balance["kimiCodeUsedRatio"]) ?? 0) * 100)
         let reset = Int(DateSupport.timestamp(balance["expireTime"]) ?? 0)
         guard reset > 0 else { return (nil, nil) }
+        // 月度订阅按对日续期（到期 9月6日则本周期自 8月6日起）。
+        // 用 UTC 日历取上月同日，误差至多一天，仅供前端时间游标推算窗口起点。
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC") ?? .current
+        let resetDate = Date(timeIntervalSince1970: TimeInterval(reset))
+        let monthMinutes = calendar.date(byAdding: .month, value: -1, to: resetDate)
+            .map { max(0, Int(resetDate.timeIntervalSince($0) / 60)) }
         let windows = [
             QuotaWindow(
                 kind: "month",
                 label: "本月",
                 usedPercent: total.roundedTenth,
                 resetsAt: reset,
+                windowMinutes: (monthMinutes ?? 0) > 0 ? monthMinutes : nil,
                 components: [
                     QuotaComponent(
                         key: "kimi", label: "Kimi", usedPercent: max(0, total - code).roundedTenth),
@@ -410,12 +419,14 @@ struct QuotaCollector {
         var windows: [QuotaWindow] = []
         for limit in dataObject["limits"] as? [JSONObject] ?? []
         where JSONValue.string(limit["type"]) == "TOKENS_LIMIT" {
+            let hours = JSONValue.int(limit["number"]) ?? 0
             windows.append(
                 QuotaWindow(
                     kind: "5h",
-                    label: "\(JSONValue.int(limit["number"]) ?? 0)小时",
+                    label: "\(hours)小时",
                     usedPercent: (JSONValue.double(limit["percentage"]) ?? 0).roundedTenth,
-                    resetsAt: (JSONValue.int(limit["nextResetTime"]) ?? 0) / 1_000
+                    resetsAt: (JSONValue.int(limit["nextResetTime"]) ?? 0) / 1_000,
+                    windowMinutes: hours > 0 ? hours * 60 : nil
                 ))
         }
         guard !windows.isEmpty else { return nil }
@@ -439,7 +450,8 @@ struct QuotaCollector {
             label = "\(minutes / 60)小时"
         }
         return QuotaWindow(
-            kind: kind, label: label, usedPercent: percent.roundedTenth, resetsAt: resetsAt)
+            kind: kind, label: label, usedPercent: percent.roundedTenth, resetsAt: resetsAt,
+            windowMinutes: minutes)
     }
 
     private func jwtExpiration(_ token: String) -> TimeInterval {

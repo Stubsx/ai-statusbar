@@ -232,6 +232,8 @@ final class CollectorTests: XCTestCase {
         ).collect()
         XCTAssertEqual(quota["codex"]??.plan, "test")
         XCTAssertEqual(quota["codex"]??.windows.first?.usedPercent, 12.3)
+        // 旧 Python 缓存没有 window_minutes，解码为 nil 而不是失败。
+        XCTAssertNil(quota["codex"]??.windows.first?.windowMinutes)
     }
 
     func testOnlineQuotaResponsesPreserveContractWithoutTouchingCredentials() throws {
@@ -288,10 +290,13 @@ final class CollectorTests: XCTestCase {
         let quota = collector.collect()
         XCTAssertEqual(quota["codex"]??.plan, "plus")
         XCTAssertEqual(quota["codex"]??.windows.first?.kind, "5h")
+        XCTAssertEqual(quota["codex"]??.windows.first?.windowMinutes, 300)
         XCTAssertEqual(quota["kimi"]??.plan, "pro")
         XCTAssertEqual(quota["kimi"]??.windows.first?.usedPercent, 25)
+        XCTAssertEqual(quota["kimi"]??.windows.first?.windowMinutes, 10_080)
         XCTAssertEqual(quota["zcode"]??.plan, "max")
         XCTAssertEqual(quota["zcode"]??.windows.first?.resetsAt, 42)
+        XCTAssertEqual(quota["zcode"]??.windows.first?.windowMinutes, 300)
         XCTAssertEqual(try String(contentsOf: kimi, encoding: .utf8), kimiOriginal)
         XCTAssertEqual(
             Set(requested.compactMap { $0.url?.host }),
@@ -357,8 +362,11 @@ final class CollectorTests: XCTestCase {
         XCTAssertEqual(kimi.plan, "pro")
         XCTAssertEqual(kimi.windows.map(\.kind), ["week", "5h"])
         XCTAssertEqual(kimi.windows.map(\.usedPercent), [25, 10])
+        XCTAssertEqual(kimi.windows.map(\.windowMinutes), [10_080, 300])
         XCTAssertEqual(kimiWork.windows.map(\.kind), ["month"])
         XCTAssertEqual(kimiWork.windows.map(\.usedPercent), [20])
+        // 月度窗口按对日续期：到期 2033-05-18，起点 2033-04-18，共 30 天。
+        XCTAssertEqual(kimiWork.windows.first?.windowMinutes, 43_200)
         XCTAssertEqual(Set(requestedHosts), Set(["api.kimi.com", "www.kimi.com"]))
     }
 

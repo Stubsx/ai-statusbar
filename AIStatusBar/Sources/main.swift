@@ -79,6 +79,7 @@ struct QuotaWindow: Codable, Hashable {
     let label: String
     let usedPercent: Double
     let resetsAt: Int
+    let windowMinutes: Int?
     let components: [QuotaComponent]?
 }
 
@@ -590,7 +591,7 @@ struct PanelView: View {
                     }
                 }
                 .foregroundColor(.secondary)
-                .padding(.bottom, 4)
+                .padding(.bottom, 8)
                 usageRow("总计", u.total, bold: true)
                 Divider().background(Color.primary.opacity(0.1))
                 ForEach(["codex", "kimi", "kimi-work", "claude", "zcode", "hermes"], id: \.self) { key in
@@ -681,12 +682,16 @@ struct PanelView: View {
 
     private func quotaRow(_ w: QuotaWindow) -> some View {
         let used = min(max(w.usedPercent, 0), 100) / 100
+        let elapsed = timeElapsedFraction(w)
         return VStack(alignment: .leading, spacing: 3) {
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     Capsule().fill(Color.primary.opacity(0.08))
                     Capsule().fill(quotaColor(w.usedPercent))
                         .frame(width: max(4, geo.size.width * CGFloat(used)))
+                    if let elapsed {
+                        timeCursor(elapsed, width: geo.size.width)
+                    }
                 }
             }
             .frame(height: 6)
@@ -700,6 +705,7 @@ struct PanelView: View {
     /// Kimi 月度额度：两段宽度均按整月额度计算，直观看出网页 Kimi 与 Code 的构成。
     private func monthlyQuotaRow(_ w: QuotaWindow) -> some View {
         let components = w.components ?? []
+        let elapsed = timeElapsedFraction(w)
         return VStack(alignment: .leading, spacing: 3) {
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
@@ -713,6 +719,9 @@ struct PanelView: View {
                         }
                     }
                     .clipShape(Capsule())
+                    if let elapsed {
+                        timeCursor(elapsed, width: geo.size.width)
+                    }
                 }
             }
             .frame(height: 6)
@@ -733,6 +742,25 @@ struct PanelView: View {
             }
         }
         .padding(.bottom, 2)
+    }
+
+    /// 时间游标：当前时刻在配额窗口时间轴上的位置（0~1）。
+    /// 窗口起点 = 重置时间 - 窗口时长（月度按对日推算）；无时长或不在窗口内时不显示。
+    private func timeElapsedFraction(_ w: QuotaWindow) -> Double? {
+        guard let minutes = w.windowMinutes, minutes > 0, w.resetsAt > 0 else { return nil }
+        let span = TimeInterval(minutes) * 60
+        let fraction = (Date().timeIntervalSince1970 - (TimeInterval(w.resetsAt) - span)) / span
+        guard fraction >= 0, fraction <= 1 else { return nil }
+        return fraction
+    }
+
+    /// 游标本体：2pt 竖线与进度条同高（6pt），完全落在条内，
+    /// 不改变条的粗细与行距，深浅色自适应。
+    private func timeCursor(_ fraction: Double, width: CGFloat) -> some View {
+        Capsule()
+            .fill(Color.primary.opacity(0.9))
+            .frame(width: 2, height: 6)
+            .offset(x: width * CGFloat(fraction) - 1)
     }
 
     private func monthlyComponentColor(_ key: String) -> Color {
@@ -766,15 +794,26 @@ struct PanelView: View {
 
     @State private var hoveredDay: HeatDay? = nil
 
+    /// 热力图覆盖的周数（列数），供未开同步时的标题行图例使用
+    private var heatWeekCount: Int {
+        (usageForDisplay?.heatmap ?? []).count / 7
+    }
+
     private var heatView: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if syncAvailable {
-                HStack {
-                    Text("活跃热力")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(.secondary)
-                    Spacer()
+            // 标题行常驻：未开同步时右侧显示周数图例，与用量页行结构对称，
+            // 保证「全部/本机」切换在两页出现在同一槽位
+            HStack {
+                Text("活跃热力")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.secondary)
+                Spacer()
+                if syncAvailable {
                     scopeSwitch
+                } else if heatWeekCount > 0 {
+                    Text("近 \(heatWeekCount) 周")
+                        .font(.system(size: 9))
+                        .foregroundColor(.secondary.opacity(0.7))
                 }
             }
             if let h = usageForDisplay?.heatmap, !h.isEmpty {
@@ -846,7 +885,6 @@ struct PanelView: View {
                     .foregroundColor(.secondary)
             }
         }
-        .padding(.top, 2)
     }
 
     /// 未来日 = 全透明；无活动日 = 不填充（由 heatStroke 画淡描边"空槽"，
