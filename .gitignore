@@ -3,6 +3,8 @@
 .env
 .env.*
 !.env.example
+# 签名证书私钥（如 lingmou-local.p12），只存本机，永不提交
+*.p12
 __pycache__/
 *.pyc
 *.log
