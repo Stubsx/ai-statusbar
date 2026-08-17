@@ -1377,6 +1377,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let settings = SettingsStore()
     private var settingsWindow: NSWindow?
     private var activityToken: NSObjectProtocol?  // App Nap 防护 token，app 生命周期内持有
+    private var fullscreenAutoHidden = false  // 当前是否因检测到全屏 App 而自动隐藏（区别于用户手动隐藏）
+    private var fullscreenAutoHideSuppressed = false  // 用户在全屏期间手动重新显示后，本次会话内不再自动隐藏
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let collectorPath = Bundle.main.path(forResource: "lingmou-collector", ofType: nil)
@@ -1785,6 +1787,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pin.image = symbol("pin")
         pin.state = pinned ? .on : .off
         menu.addItem(pin)
+        let fullscreenHide = NSMenuItem(title: "全屏时自动隐藏", action: #selector(toggleAutoHideFullscreen), keyEquivalent: "")
+        fullscreenHide.target = self
+        fullscreenHide.image = symbol("arrow.up.left.and.arrow.down.right")
+        fullscreenHide.state = autoHideInFullscreenEnabled ? .on : .off
+        menu.addItem(fullscreenHide)
         let refresh = NSMenuItem(title: "刷新", action: #selector(doRefresh), keyEquivalent: "r")
         refresh.target = self
         refresh.image = symbol("arrow.clockwise")
@@ -1864,11 +1871,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
             self?.applyPanelAppearanceMode()
+            self?.updateFullscreenAutoHide()
         }
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
             self?.applyPanelAppearanceMode()
+            self?.updateFullscreenAutoHide()
         }
+        // 全屏自动隐藏：进出原生全屏伴随切 Space 事件可即时响应；网页全屏（不切 Space、
+        // 只改窗口尺寸）没有系统通知，靠 1 秒轮询兜底
+        let fullscreenTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            self?.updateFullscreenAutoHide()
+        }
+        RunLoop.main.add(fullscreenTimer, forMode: .common)
         // 设置改动（外观模式切换）立即生效，不等下个 3 秒周期
         NotificationCenter.default.addObserver(
             forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
@@ -1914,7 +1929,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func togglePanel() {
         let show = !panel.isVisible
         UserDefaults.standard.set(show, forKey: "panelVisible")
-        if show { panel.orderFront(nil) } else { panel.orderOut(nil) }
+        if show {
+            fullscreenAutoHideSuppressed = true  // 用户在全屏中手动显示：本次会话内不被自动隐藏抢走
+            panel.orderFront(nil)
+        } else {
+            panel.orderOut(nil)
+        }
     }
 
     @objc private func togglePin() {
@@ -1931,6 +1951,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // MARK: 全屏自动隐藏
+
+    /// 「全屏时自动隐藏」开关（默认开启），与 panelPinned 一致存 UserDefaults
+    private var autoHideInFullscreenEnabled: Bool {
+        UserDefaults.standard.object(forKey: "panelAutoHideFullscreen") == nil
+            ? true : UserDefaults.standard.bool(forKey: "panelAutoHideFullscreen")
+    }
+
+    /// 面板所在屏幕的最前台窗口是否全屏：原生全屏（游戏、⌃⌘F）与浏览器网页全屏（看视频）的
+    /// 窗口 bounds 都会覆盖整屏（含菜单栏区域），普通最大化窗口只占 visibleFrame 不会命中。
+    /// 只读 layer/bounds/PID、不读窗口标题，无需屏幕录制或辅助功能授权。
+    private func panelScreenHasFullscreenApp() -> Bool {
+        guard let panelFrame = panel?.frame,
+              let target = (NSScreen.screens.first { $0.frame.intersects(panelFrame) } ?? NSScreen.main)?.frame,
+              let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+                                                    kCGNullWindowID) as? [[String: Any]]
+        else { return false }
+        let myPID = Int(ProcessInfo.processInfo.processIdentifier)
+        // 列表按前到后排序，只判定第一个非本进程的普通窗口：后台恰好等于全屏尺寸的
+        // 窗口（如虚拟显示器控制窗）不能当成全屏
+        for info in list {
+            guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0 else { continue }
+            guard let ownerPID = info[kCGWindowOwnerPID as String] as? Int, ownerPID != myPID else { continue }
+            guard let bounds = info[kCGWindowBounds as String] as? NSDictionary,
+                  let frame = CGRect(dictionaryRepresentation: bounds) else { continue }
+            // 覆盖整屏即判定全屏（±2pt 容差）；多显示器时只认面板所在的那块屏
+            return frame.minX <= target.minX + 2 && frame.minY <= target.minY + 2
+                && frame.maxX >= target.maxX - 2 && frame.maxY >= target.maxY - 2
+        }
+        return false
+    }
+
+    /// 全屏状态机：进全屏隐藏（不动 panelVisible 手动偏好），退全屏按原偏好恢复；
+    /// 用户手动显示优先，不与用户抢
+    private func updateFullscreenAutoHide() {
+        guard panel != nil else { return }
+        guard autoHideInFullscreenEnabled else {
+            // 开关刚被关掉：撤销仍在生效的自动隐藏，回到永远置顶的旧行为
+            fullscreenAutoHideSuppressed = false
+            if fullscreenAutoHidden {
+                fullscreenAutoHidden = false
+                if (UserDefaults.standard.object(forKey: "panelVisible") as? Bool) ?? true {
+                    panel.orderFront(nil)
+                }
+            }
+            return
+        }
+        if panelScreenHasFullscreenApp() {
+            if panel.isVisible && !fullscreenAutoHideSuppressed {
+                fullscreenAutoHidden = true
+                panel.orderOut(nil)
+            }
+        } else {
+            fullscreenAutoHideSuppressed = false
+            if fullscreenAutoHidden {
+                fullscreenAutoHidden = false
+                if (UserDefaults.standard.object(forKey: "panelVisible") as? Bool) ?? true {
+                    panel.orderFront(nil)
+                }
+            }
+        }
+    }
+
+    @objc private func toggleAutoHideFullscreen() {
+        UserDefaults.standard.set(!autoHideInFullscreenEnabled, forKey: "panelAutoHideFullscreen")
+        updateFullscreenAutoHide()  // 立即生效：打开且正处全屏马上隐藏，关掉立即恢复
+    }
+
     /// 构建桌面浮窗右键菜单（置顶切换 + 设置 + 退出）。复用 togglePin()/openSettings() 动作，
     /// 与菜单栏下拉的"置顶桌面卡片"、"设置…"项保持同一套逻辑。
     private func buildPanelContextMenu() -> NSMenu {
@@ -1943,6 +2031,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             keyEquivalent: "")
         pinItem.target = self
         menu.addItem(pinItem)
+        let autoHideItem = NSMenuItem(
+            title: "全屏时自动隐藏",
+            action: #selector(toggleAutoHideFullscreen),
+            keyEquivalent: "")
+        autoHideItem.target = self
+        autoHideItem.state = autoHideInFullscreenEnabled ? .on : .off
+        menu.addItem(autoHideItem)
         let settingsItem = NSMenuItem(
             title: "设置…",
             action: #selector(openSettings),
