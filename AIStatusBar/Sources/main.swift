@@ -924,15 +924,16 @@ struct PanelView: View {
 
     /// 两种模式统一原则："无活动"是描边空槽，L1 起就是清晰可辨的蓝。
     /// 浅色：饱和度与深度同步递增（白底上越深越强）。
-    /// 深色：以饱和度递增为主，亮度只在窄区间内爬升，峰值是最高饱和的电蓝
-    /// 而非最白；色相随级别从宝蓝微滑向青蓝以增强"热"感。
+    /// 深色：以不透明度递增为主——低档是高透明的浅暗蓝、近乎融进背板，
+    /// 档位越高越实越亮，峰值是最高饱和的电蓝；两个模式的信号因此统一为
+    /// "离背板越远越活跃"，面板外观自适应翻转时深浅含义不再反转。
     private var heatPalette: [Color] {
         if colorScheme == .dark {
             return [
-                Color(hue: 215.0 / 360, saturation: 0.55, brightness: 0.45),
-                Color(hue: 210.0 / 360, saturation: 0.68, brightness: 0.58),
-                Color(hue: 205.0 / 360, saturation: 0.80, brightness: 0.72),
-                Color(hue: 198.0 / 360, saturation: 0.90, brightness: 0.85),
+                Color(hue: 214.0 / 360, saturation: 0.90, brightness: 0.90).opacity(0.25),
+                Color(hue: 210.0 / 360, saturation: 0.92, brightness: 0.92).opacity(0.42),
+                Color(hue: 205.0 / 360, saturation: 0.94, brightness: 0.95).opacity(0.60),
+                Color(hue: 198.0 / 360, saturation: 0.95, brightness: 0.97).opacity(0.80),
                 Color(hue: 192.0 / 360, saturation: 0.95, brightness: 0.98),
             ]
         }
