@@ -58,6 +58,12 @@ struct QuotaCollector {
             if kimiWork == nil, kimiWorkInstalled { kimiWork = old?.kimiWork }
             if zcode == nil { zcode = old?.zcode }
         }
+        // Kimi Code 徽标优先用订阅档位名（如 Allegro，随 Kimi Work 凭证获得并缓存于其 plan）；
+        // 没有 Kimi Work 的机器取不到，回退 Coding API 的原始等级（如 LEVEL_ADVANCED）。
+        if let title = kimiWork?.plan, !title.isEmpty, var quota = kimi {
+            quota.plan = title
+            kimi = quota
+        }
         let value = CachedQuota(
             codex: codex,
             kimi: kimi,
@@ -368,6 +374,10 @@ struct QuotaCollector {
         let code = min(total, max(0, JSONValue.double(balance["kimiCodeUsedRatio"]) ?? 0) * 100)
         let reset = Int(DateSupport.timestamp(balance["expireTime"]) ?? 0)
         guard reset > 0 else { return (nil, nil) }
+        // 同一凭证顺带查订阅档位名（如 Allegro）放进 plan：Kimi Work 卡片直接显示，
+        // collect() 再把它提升为 Kimi Code 徽标（无 Kimi Work 的机器回退 Coding 原始等级）。
+        // 查询失败仅降级为无档位名，不影响月度额度。
+        let planTitle = subscriptionTitle(token: token)
         // 月度订阅按对日续期（到期 9月6日则本周期自 8月6日起）。
         // 用 UTC 日历取上月同日，误差至多一天，仅供前端时间游标推算窗口起点。
         var calendar = Calendar(identifier: .gregorian)
@@ -389,7 +399,21 @@ struct QuotaCollector {
                 ]
             )
         ]
-        return (ToolQuota(plan: nil, windows: windows, updatedAt: Int(environment.now)), nil)
+        return (ToolQuota(plan: planTitle, windows: windows, updatedAt: Int(environment.now)), nil)
+    }
+
+    private func subscriptionTitle(token: String) -> String? {
+        guard
+            let object = request(
+                url:
+                    "https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscription",
+                method: "POST",
+                headers: ["Authorization": "Bearer \(token)", "Content-Type": "application/json"],
+                body: Data("{}".utf8)
+            ), let subscription = object["subscription"] as? JSONObject,
+            let goods = subscription["goods"] as? JSONObject
+        else { return nil }
+        return JSONValue.string(goods["title"])
     }
 
     private func zcodeQuota() -> ToolQuota? {

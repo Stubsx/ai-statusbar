@@ -417,6 +417,71 @@ final class CollectorTests: XCTestCase {
         XCTAssertEqual(Set(requestedHosts), Set(["api.kimi.com", "www.kimi.com"]))
     }
 
+    func testKimiBadgeUsesSubscriptionTitleWhenWorkPresent() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        try write(
+            "{\"access_token\":\"coding-token\",\"expires_at\":3000000000}",
+            to: home.appendingPathComponent(".kimi-code/credentials/kimi-code.json"))
+        try write(
+            "{\"tokens\":{\"access_token\":\"desktop-token\"}}",
+            to: home.appendingPathComponent(
+                "Library/Application Support/kimi-desktop/bridge-store/token-store.json"))
+        let quota = QuotaCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: 2_000_000_000),
+            settings: CollectorSettings(onlineQuota: true),
+            files: FileSupport(),
+            requestOverride: { request in
+                switch request.url?.host {
+                case "api.kimi.com":
+                    return [
+                        "usage": ["used": 25, "limit": 100, "resetTime": "2033-05-18T03:33:20Z"],
+                        "user": ["membership": ["level": "LEVEL_ADVANCED"]],
+                    ]
+                case "www.kimi.com":
+                    // GetSubscriptionStats 与 GetSubscription 路径有前缀包含关系，先匹配长的
+                    if request.url?.path.contains("GetSubscriptionStats") == true {
+                        return [
+                            "subscriptionBalance": [
+                                "amountUsedRatio": 0.2,
+                                "kimiCodeUsedRatio": 0.08,
+                                "expireTime": "2033-05-18T03:33:20Z",
+                            ]
+                        ]
+                    }
+                    return ["subscription": ["goods": ["title": "Allegro"]]]
+                default: return nil
+                }
+            }
+        ).collect()
+        // Kimi Work 配额携带档位名，并提升为 Kimi Code 的徽标
+        XCTAssertEqual(quota["kimi-work"]??.plan, "Allegro")
+        XCTAssertEqual(quota["kimi"]??.plan, "Allegro")
+    }
+
+    func testKimiBadgeFallsBackToCodingLevelWithoutWork() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        try write(
+            "{\"access_token\":\"coding-token\",\"expires_at\":3000000000}",
+            to: home.appendingPathComponent(".kimi-code/credentials/kimi-code.json"))
+        let quota = QuotaCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: 2_000_000_000),
+            settings: CollectorSettings(onlineQuota: true),
+            files: FileSupport(),
+            requestOverride: { request in
+                guard request.url?.host == "api.kimi.com" else { return nil }
+                return [
+                    "usage": ["used": 25, "limit": 100, "resetTime": "2033-05-18T03:33:20Z"],
+                    "user": ["membership": ["level": "LEVEL_ADVANCED"]],
+                ]
+            }
+        ).collect()
+        // 未装 Kimi Work 的机器拿不到订阅档位名，回退 Coding API 的原始等级
+        XCTAssertEqual(quota["kimi"]??.plan, "LEVEL_ADVANCED")
+        XCTAssertNil(quota["kimi-work"] ?? nil)
+    }
+
     func testOnlyKimiWorkShowsMonthlyQuotaWithoutKimiCode() throws {
         let home = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: home) }
@@ -448,7 +513,9 @@ final class CollectorTests: XCTestCase {
         let kimiWork = try XCTUnwrap(quota["kimi-work"] ?? nil)
         XCTAssertEqual(kimiWork.windows.map(\.kind), ["month"])
         XCTAssertEqual(kimiWork.windows.map(\.usedPercent), [35])
-        XCTAssertEqual(requestedHosts, ["www.kimi.com"])
+        // 只访问 www.kimi.com（额度 + 订阅档位名各一次），绝不碰 Coding API
+        XCTAssertEqual(Set(requestedHosts), ["www.kimi.com"])
+        XCTAssertEqual(requestedHosts.count, 2)
         XCTAssertFalse(FileManager.default.fileExists(atPath: home.appendingPathComponent(".kimi-code").path))
     }
 
