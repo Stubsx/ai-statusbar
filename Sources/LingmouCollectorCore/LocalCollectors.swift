@@ -170,25 +170,8 @@ struct LocalCollectors {
         )
         let path = environment.path(".hermes", "state.db")
         guard let database = try? SQLiteDatabase(path: path, readOnly: true),
-            let sessionColumns = try? database.columns(in: "sessions"),
-            let usageColumns = try? database.columns(in: "session_model_usage"),
-            Set(["id", "title", "started_at"]).isSubset(of: sessionColumns),
-            usageColumns.contains("last_seen")
+            let sessionColumns = try? database.columns(in: "sessions")
         else { return result }
-        let busyRows =
-            (try? database.query(
-                """
-                SELECT DISTINCT s.id AS id, s.title AS title FROM sessions s
-                JOIN session_model_usage u ON u.session_id = s.id
-                WHERE u.last_seen > ? AND s.archived = 0 AND s.title IS NOT NULL AND s.title != ''
-                ORDER BY u.last_seen DESC
-                """,
-                binds: [.real(environment.now - TimeInterval(settings.busySeconds(for: "hermes")))]))
-            ?? []
-        result.busy = busyRows.compactMap { row in
-            guard let id = row["id"]?.string, let title = row["title"]?.string else { return nil }
-            return BusyItem(id: id, title: title)
-        }
         if let row = try? database.query(
             """
             SELECT title, started_at FROM sessions
@@ -198,10 +181,95 @@ struct LocalCollectors {
         ).first, let title = row["title"]?.string, let timestamp = row["started_at"]?.double {
             result.latest = LatestItem(title: title, timestamp: timestamp)
         }
-        result.activity =
+        var activity =
             (try? database.query("SELECT MAX(last_seen) AS activity FROM session_model_usage")
                 .first?[
                     "activity"]?.double) ?? 0
+        if sessionColumns.contains("last_activity_at"),
+            let projected = try? database.query(
+                "SELECT MAX(last_activity_at) AS activity FROM sessions"
+            ).first?["activity"]?.double
+        {
+            activity = max(activity, projected)
+        }
+        result.activity = activity
+
+        // 回合租约：回合开始即写入、进行中持续续期、结束即删除，
+        // 是"正在执行回合"的实时信号（conversation_id 为压缩轮转的血缘根）。
+        var leaseBusy: [BusyItem] = []
+        var untitledLeaseIds: [String] = []
+        if let leaseColumns = try? database.columns(in: "session_turn_leases"),
+            Set(["conversation_id", "expires_at"]).isSubset(of: leaseColumns)
+        {
+            let rows =
+                (try? database.query(
+                    """
+                    SELECT l.conversation_id AS id, s.title AS title
+                    FROM session_turn_leases l LEFT JOIN sessions s ON s.id = l.conversation_id
+                    WHERE l.expires_at > ?
+                    """,
+                    binds: [.real(environment.now)])) ?? []
+            for row in rows {
+                guard let id = row["id"]?.string else { continue }
+                if let title = row["title"]?.string, !title.isEmpty {
+                    leaseBusy.append(BusyItem(id: id, title: title))
+                } else {
+                    untitledLeaseIds.append(id)
+                }
+            }
+        }
+        // 会话活动心跳：回合内各节点触碰、至多 30 秒落库一次，
+        // 覆盖全新会话首轮（sessions 行尚未建、跳过租约）的场景。
+        var heartbeatBusy: [BusyItem] = []
+        if sessionColumns.contains("last_activity_at") {
+            let rows =
+                (try? database.query(
+                    """
+                    SELECT id, title FROM sessions
+                    WHERE last_activity_at > ? AND archived = 0
+                        AND title IS NOT NULL AND title != ''
+                    """,
+                    binds: [.real(environment.now - 90)])) ?? []
+            heartbeatBusy = rows.compactMap { row in
+                guard let id = row["id"]?.string, let title = row["title"]?.string else {
+                    return nil
+                }
+                return BusyItem(id: id, title: title)
+            }
+        }
+        // 模型调用完成窗口：老 schema 或无租约路径的兜底。
+        var usageBusy: [BusyItem] = []
+        if let usageColumns = try? database.columns(in: "session_model_usage"),
+            usageColumns.contains("last_seen"),
+            Set(["id", "title", "archived"]).isSubset(of: sessionColumns)
+        {
+            let rows =
+                (try? database.query(
+                    """
+                    SELECT DISTINCT s.id AS id, s.title AS title FROM sessions s
+                    JOIN session_model_usage u ON u.session_id = s.id
+                    WHERE u.last_seen > ? AND s.archived = 0 AND s.title IS NOT NULL AND s.title != ''
+                    ORDER BY u.last_seen DESC
+                    """,
+                    binds: [.real(environment.now - TimeInterval(settings.busySeconds(for: "hermes")))]))
+                ?? []
+            usageBusy = rows.compactMap { row in
+                guard let id = row["id"]?.string, let title = row["title"]?.string else {
+                    return nil
+                }
+                return BusyItem(id: id, title: title)
+            }
+        }
+        var seen: Set<String> = []
+        result.busy = (leaseBusy + heartbeatBusy + usageBusy).filter {
+            seen.insert($0.id).inserted
+        }
+        // 血缘根在压缩轮转后可能查无标题；该回合的当前 segment
+        // 已由心跳/用量层覆盖，仅在无其他信号时用最近会话名兜底。
+        if result.busy.isEmpty, !untitledLeaseIds.isEmpty {
+            let fallback = result.latest?.title ?? "(进行中会话)"
+            result.busy = untitledLeaseIds.map { BusyItem(id: $0, title: fallback) }
+        }
         if result.busy.isEmpty, let latest = result.latest {
             let pids = processes.output(
                 executable: "/usr/bin/pgrep", arguments: ["-f", "hermes_cli"]
@@ -281,9 +349,61 @@ struct LocalCollectors {
                 activity[id] = max(activity[id] ?? 0, time)
             }
         }
+        // part 表实时活动 + turn_usage 完成戳：用户消息提交即落库、
+        // 每个 part 完成即落库，而 turn_usage 在回合结束时写入完成时间。
+        // "活动晚于该会话最近一次回合完成" 即有新回合在跑——开始/结束都
+        // 是轮询间隔级，且长生成期间无需窗口续命（活动恒晚于旧完成戳）。
+        var turnFinished: [String: TimeInterval] = [:]
+        var usageDatabaseAvailable = false
+        let horizon = environment.now - TimeInterval(settings.busySeconds(for: "zcode"))
+        if let database = try? SQLiteDatabase(
+            path: environment.path(".zcode", "cli", "db", "db.sqlite"), readOnly: true),
+            let partColumns = try? database.columns(in: "part"),
+            Set(["session_id", "time_updated"]).isSubset(of: partColumns)
+        {
+            usageDatabaseAvailable = true
+            let partRows =
+                (try? database.query(
+                    """
+                    SELECT session_id, MAX(time_updated) / 1000.0 AS activity FROM part
+                    WHERE time_updated > ? AND session_id NOT LIKE 'sess\\_subagent\\_%' ESCAPE '\\'
+                    GROUP BY session_id
+                    """,
+                    binds: [.real(horizon * 1_000)])) ?? []
+            for row in partRows {
+                guard let id = row["session_id"]?.string,
+                    let time = row["activity"]?.double
+                else { continue }
+                activity[id] = max(activity[id] ?? 0, time)
+            }
+            if let turnColumns = try? database.columns(in: "turn_usage"),
+                Set(["session_id", "completed_at"]).isSubset(of: turnColumns)
+            {
+                let turnRows =
+                    (try? database.query(
+                        """
+                        SELECT session_id, MAX(completed_at) / 1000.0 AS finished FROM turn_usage
+                        WHERE completed_at > ? GROUP BY session_id
+                        """,
+                        binds: [.real(horizon * 1_000)])) ?? []
+                for row in turnRows {
+                    if let id = row["session_id"]?.string,
+                        let finished = row["finished"]?.double
+                    {
+                        turnFinished[id] = finished
+                    }
+                }
+            }
+        }
         result.busy = activity.sorted { $0.value > $1.value }.compactMap { id, time in
-            environment.now - time < TimeInterval(settings.busySeconds(for: "zcode"))
-                ? BusyItem(id: id, title: titles[id] ?? "(未知任务)") : nil
+            let withinWindow = environment.now - time < TimeInterval(
+                settings.busySeconds(for: "zcode"))
+            // db 可用时以"活动晚于完成戳（留 5 秒落库时差容差）"判定，
+            // 兜住长生成；否则退回纯窗口判定（老版本无 db.sqlite）。
+            let working =
+                withinWindow
+                && (!usageDatabaseAvailable || time > (turnFinished[id] ?? 0) + 5)
+            return working ? BusyItem(id: id, title: titles[id] ?? "(未知任务)") : nil
         }
         if result.latest == nil, let (id, time) = activity.max(by: { $0.value < $1.value }) {
             result.latest = LatestItem(title: titles[id] ?? "(未知任务)", timestamp: time)

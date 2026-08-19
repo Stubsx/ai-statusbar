@@ -758,6 +758,182 @@ final class CollectorTests: XCTestCase {
         XCTAssertEqual(collectors.zcode().busy, [BusyItem(id: "sess_test", title: "ZCode 测试")])
     }
 
+    func testHermesTurnLeaseAndActivityHeartbeat() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let hermesPath = home.appendingPathComponent(".hermes/state.db")
+        try FileManager.default.createDirectory(
+            at: hermesPath.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let hermes = try SQLiteDatabase(path: hermesPath.path)
+        try hermes.execute(
+            """
+            CREATE TABLE sessions(
+                id TEXT, title TEXT, started_at REAL, archived INT, last_activity_at REAL)
+            """)
+        try hermes.execute("CREATE TABLE session_model_usage(session_id TEXT, last_seen REAL)")
+        try hermes.execute(
+            """
+            CREATE TABLE session_turn_leases(
+                conversation_id TEXT, holder TEXT, acquired_at REAL, expires_at REAL)
+            """)
+        // last_seen 已超出 5 分钟窗口，但租约存活 → 秒级判定工作中。
+        try hermes.execute(
+            "INSERT INTO sessions VALUES('h1','租约会话',?,0,?)",
+            binds: [.real(now - 3_600), .real(now - 3_600)])
+        try hermes.execute(
+            "INSERT INTO session_model_usage VALUES('h1',?)", binds: [.real(now - 3_600)])
+        try hermes.execute(
+            "INSERT INTO session_turn_leases VALUES('h1','pid=1',?,?)",
+            binds: [.real(now - 60), .real(now + 240)])
+        // 新会话首轮无租约，靠 last_activity_at 心跳判定。
+        try hermes.execute(
+            "INSERT INTO sessions VALUES('h2','新会话',?,0,?)",
+            binds: [.real(now - 30), .real(now - 30)])
+
+        let collectors = LocalCollectors(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            settings: CollectorSettings(), files: FileSupport(),
+            processes: processSupport(["Hermes"])
+        )
+        let busy = collectors.hermes().busy
+        XCTAssertEqual(
+            busy,
+            [
+                BusyItem(id: "h1", title: "租约会话"),
+                BusyItem(id: "h2", title: "新会话"),
+            ])
+        XCTAssertEqual(collectors.hermes().activity, now - 30)
+
+        // 租约过期、心跳超出 90 秒 → 不再工作中。
+        try hermes.execute("DELETE FROM session_turn_leases")
+        try hermes.execute(
+            "INSERT INTO session_turn_leases VALUES('h1','pid=1',?,?)",
+            binds: [.real(now - 400), .real(now - 100)])
+        try hermes.execute(
+            "UPDATE sessions SET last_activity_at = ? WHERE id = 'h2'", binds: [.real(now - 200)])
+        XCTAssertTrue(collectors.hermes().busy.isEmpty)
+    }
+
+    func testHermesRotatedLeaseFallsBackToSegmentUsageTitle() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let hermesPath = home.appendingPathComponent(".hermes/state.db")
+        try FileManager.default.createDirectory(
+            at: hermesPath.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let hermes = try SQLiteDatabase(path: hermesPath.path)
+        try hermes.execute(
+            """
+            CREATE TABLE sessions(
+                id TEXT, title TEXT, started_at REAL, archived INT, last_activity_at REAL)
+            """)
+        try hermes.execute("CREATE TABLE session_model_usage(session_id TEXT, last_seen REAL)")
+        try hermes.execute(
+            """
+            CREATE TABLE session_turn_leases(
+                conversation_id TEXT, holder TEXT, acquired_at REAL, expires_at REAL)
+            """)
+        // 血缘根已被压缩归档、查无标题；当前 segment 的用量行仍在。
+        try hermes.execute(
+            "INSERT INTO sessions VALUES('seg2','轮转后会话',?,0,?)",
+            binds: [.real(now - 10), .real(now - 600)])
+        try hermes.execute(
+            "INSERT INTO session_model_usage VALUES('seg2',?)", binds: [.real(now - 10)])
+        try hermes.execute(
+            "INSERT INTO session_turn_leases VALUES('root1','pid=1',?,?)",
+            binds: [.real(now - 60), .real(now + 240)])
+
+        let collectors = LocalCollectors(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            settings: CollectorSettings(), files: FileSupport(),
+            processes: processSupport(["Hermes"])
+        )
+        XCTAssertEqual(
+            collectors.hermes().busy, [BusyItem(id: "seg2", title: "轮转后会话")])
+    }
+
+    func testZcodeActivityVersusTurnCompletion() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let index = home.appendingPathComponent(".zcode/v2/tasks-index.sqlite")
+        try FileManager.default.createDirectory(
+            at: index.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let tasks = try SQLiteDatabase(path: index.path)
+        try tasks.execute(
+            """
+            CREATE TABLE tasks(task_id TEXT, title TEXT, updated_at REAL, deleted INT)
+            """)
+        try tasks.execute(
+            "INSERT INTO tasks VALUES('sess_onset','ZCode 新会话',?,0)",
+            binds: [.real(now * 1_000)])
+        try tasks.execute(
+            "INSERT INTO tasks VALUES('sess_done','ZCode 已完成',?,0)",
+            binds: [.real(now * 1_000)])
+
+        let usage = home.appendingPathComponent(".zcode/cli/db/db.sqlite")
+        try FileManager.default.createDirectory(
+            at: usage.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let database = try SQLiteDatabase(path: usage.path)
+        try database.execute(
+            "CREATE TABLE part(id TEXT, message_id TEXT, session_id TEXT, time_created REAL, time_updated REAL, data TEXT)")
+        try database.execute(
+            "CREATE TABLE turn_usage(session_id TEXT, turn_id TEXT, status TEXT, started_at REAL, completed_at REAL)")
+        // 新会话首轮：用户消息提交即落库、尚无回合完成 → 秒级判定工作中。
+        try database.execute(
+            "INSERT INTO part VALUES('p1','m1','sess_onset',?,?,'{}')",
+            binds: [.real((now - 5) * 1_000), .real((now - 5) * 1_000)])
+        // 已结束回合：活动 3 秒前、完成戳 1 秒前（晚于活动）→ 立即转空闲。
+        try database.execute(
+            "INSERT INTO part VALUES('p2','m2','sess_done',?,?,'{}')",
+            binds: [.real((now - 3) * 1_000), .real((now - 3) * 1_000)])
+        try database.execute(
+            "INSERT INTO turn_usage VALUES('sess_done','t1','completed',?,?)",
+            binds: [.real((now - 60) * 1_000), .real((now - 1) * 1_000)])
+        // 僵尸活动：超出 busy 窗口且无完成戳 → 不误报。
+        try database.execute(
+            "INSERT INTO part VALUES('p3','m3','sess_stale',?,?,'{}')",
+            binds: [.real((now - 600) * 1_000), .real((now - 600) * 1_000)])
+
+        let collectors = LocalCollectors(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            settings: CollectorSettings(), files: FileSupport(),
+            processes: processSupport(["ZCode"])
+        )
+        XCTAssertEqual(
+            collectors.zcode().busy, [BusyItem(id: "sess_onset", title: "ZCode 新会话")])
+    }
+
+    func testZcodeNewTurnAfterCompletionStaysBusy() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let usage = home.appendingPathComponent(".zcode/cli/db/db.sqlite")
+        try FileManager.default.createDirectory(
+            at: usage.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let database = try SQLiteDatabase(path: usage.path)
+        try database.execute(
+            "CREATE TABLE part(id TEXT, message_id TEXT, session_id TEXT, time_created REAL, time_updated REAL, data TEXT)")
+        try database.execute(
+            "CREATE TABLE turn_usage(session_id TEXT, turn_id TEXT, status TEXT, started_at REAL, completed_at REAL)")
+        // 上一回合 60 秒前完成，新用户消息 2 秒前提交（晚于完成戳）→ 工作中。
+        try database.execute(
+            "INSERT INTO turn_usage VALUES('sess_live','t1','completed',?,?)",
+            binds: [.real((now - 120) * 1_000), .real((now - 60) * 1_000)])
+        try database.execute(
+            "INSERT INTO part VALUES('p1','m1','sess_live',?,?,'{}')",
+            binds: [.real((now - 2) * 1_000), .real((now - 2) * 1_000)])
+
+        let state = LocalCollectors(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            settings: CollectorSettings(), files: FileSupport(),
+            processes: processSupport(["ZCode"])
+        ).zcode()
+        XCTAssertEqual(state.busy, [BusyItem(id: "sess_live", title: "(未知任务)")])
+        XCTAssertEqual(state.activity, now - 2, accuracy: 0.001)
+    }
+
     func testUsageIncrementalScanDoesNotDoubleCount() throws {
         let home = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: home) }
