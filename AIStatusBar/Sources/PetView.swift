@@ -43,6 +43,13 @@ enum PetMood: Equatable {
         }
     }
 
+    var typingResourceNames: [String] {
+        if case .working = self {
+            return ["\(resourceName)-type-left", "\(resourceName)-type-right"]
+        }
+        return []
+    }
+
     var blinkDelayRange: ClosedRange<Double> {
         switch self {
         case .celebrating: return 0.85...1.25
@@ -173,9 +180,16 @@ private struct PetSprite: View {
     @State private var animating = false
     @State private var blinking = false
     @State private var blinkTask: Task<Void, Never>?
+    @State private var typingFrame = 0
+    @State private var typingTask: Task<Void, Never>?
 
     private var displayedResourceName: String {
-        blinking ? (mood.blinkResourceName ?? mood.resourceName) : mood.resourceName
+        if blinking { return mood.blinkResourceName ?? mood.resourceName }
+        let typingNames = mood.typingResourceNames
+        if typingFrame > 0, typingNames.indices.contains(typingFrame - 1) {
+            return typingNames[typingFrame - 1]
+        }
+        return mood.resourceName
     }
 
     private var image: NSImage {
@@ -196,7 +210,7 @@ private struct PetSprite: View {
                 .scaledToFit()
                 .frame(width: 200, height: 226)
                 // 只替换 Image 实例，并禁用默认交叉淡化；否则两种姿势会短暂叠在一起。
-                .id(mood.resourceName)
+                .id(displayedResourceName)
                 .transition(.identity)
                 .transaction { transaction in
                     transaction.disablesAnimations = true
@@ -238,17 +252,27 @@ private struct PetSprite: View {
         .frame(width: 210, height: 232)
         .onAppear {
             startAnimations()
-            restartBlinking()
+            restartBlinking(mood)
+            restartTyping(mood)
         }
         .onDisappear {
             blinkTask?.cancel()
             blinkTask = nil
+            typingTask?.cancel()
+            typingTask = nil
         }
-        .onChange(of: mood.resourceName) { _ in
+        // onChange 闭包捕获的是上一次渲染的 view 拷贝，直接读 self.mood 会拿到旧值
+        // （例如 loading→working 时仍是 loading），敲键盘任务就永远不会被创建。
+        // 必须把回传的新 mood 显式传给动画启动函数。
+        .onChange(of: mood) { newMood in
             restartAnimations()
-            restartBlinking()
+            restartBlinking(newMood)
+            restartTyping(newMood)
         }
-        .onChange(of: reduceMotion) { _ in restartBlinking() }
+        .onChange(of: reduceMotion) { _ in
+            restartBlinking(mood)
+            restartTyping(mood)
+        }
     }
 
     private func startAnimations() {
@@ -264,14 +288,13 @@ private struct PetSprite: View {
     }
 
     /// 每轮用 0...99 随机数选择短眨、慢眨或双眨；图片切换禁用动画，避免重影。
-    private func restartBlinking() {
+    private func restartBlinking(_ activeMood: PetMood) {
         blinkTask?.cancel()
         blinkTask = nil
         setBlinking(false)
-        guard !reduceMotion, let blinkName = mood.blinkResourceName else { return }
+        guard !reduceMotion, let blinkName = activeMood.blinkResourceName else { return }
 
-        PetImageCache.preload(names: [mood.resourceName, blinkName])
-        let activeMood = mood
+        PetImageCache.preload(names: [activeMood.resourceName, blinkName])
         blinkTask = Task { @MainActor in
             var firstCycle = true
             while !Task.isCancelled {
@@ -326,9 +349,47 @@ private struct PetSprite: View {
     }
 
     private func setBlinking(_ value: Bool) {
+        if value { setTypingFrame(0) }
         var transaction = Transaction(animation: nil)
         transaction.disablesAnimations = true
         withTransaction(transaction) { blinking = value }
+    }
+
+    /// 工作状态随机连敲 3～8 下，再停顿片刻；眨眼时手会自然回到中间帧。
+    private func restartTyping(_ activeMood: PetMood) {
+        typingTask?.cancel()
+        typingTask = nil
+        setTypingFrame(0)
+        let typingNames = activeMood.typingResourceNames
+        guard !reduceMotion, !typingNames.isEmpty else { return }
+
+        PetImageCache.preload(names: [activeMood.resourceName] + typingNames)
+        typingTask = Task { @MainActor in
+            guard await pause(seconds: Double.random(in: 0.30...0.70)) else { return }
+            while !Task.isCancelled {
+                let tapCount = Int.random(in: 4...8)
+                let startingFrame = Bool.random() ? 1 : 2
+                for tap in 0..<tapCount {
+                    while blinking && !Task.isCancelled {
+                        setTypingFrame(0)
+                        guard await pause(seconds: 0.045) else { return }
+                    }
+                    let frame = ((startingFrame - 1 + tap) % 2) + 1
+                    setTypingFrame(frame)
+                    guard await pause(seconds: Double.random(in: 0.135...0.220)) else {
+                        return
+                    }
+                }
+                setTypingFrame(0)
+                guard await pause(seconds: Double.random(in: 0.35...1.00)) else { return }
+            }
+        }
+    }
+
+    private func setTypingFrame(_ frame: Int) {
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) { typingFrame = frame }
     }
 }
 
