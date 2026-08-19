@@ -33,6 +33,36 @@ enum PetMood: Equatable {
         }
     }
 
+    /// 睡眠姿势本身已经闭眼，其余清醒姿势都有一张同构图的闭眼帧。
+    var blinkResourceName: String? {
+        switch self {
+        case .sleeping:
+            return nil
+        default:
+            return "\(resourceName)-blink"
+        }
+    }
+
+    var blinkDelayRange: ClosedRange<Double> {
+        switch self {
+        case .celebrating: return 0.85...1.25
+        case .loading: return 2.2...4.0
+        case .working: return 2.8...4.8
+        case .idle: return 3.8...6.2
+        case .error: return 3.2...5.4
+        case .sleeping: return 10...10
+        }
+    }
+
+    var doubleBlinkChance: Double {
+        switch self {
+        case .loading: return 0.25
+        case .working, .idle: return 0.16
+        case .celebrating: return 0.22
+        case .error, .sleeping: return 0
+        }
+    }
+
     var summary: String {
         switch self {
         case .loading: return "正在观察 AI 工具…"
@@ -141,13 +171,15 @@ private struct PetSprite: View {
     let mood: PetMood
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var animating = false
+    @State private var blinking = false
+    @State private var blinkTask: Task<Void, Never>?
+
+    private var displayedResourceName: String {
+        blinking ? (mood.blinkResourceName ?? mood.resourceName) : mood.resourceName
+    }
 
     private var image: NSImage {
-        if let url = Bundle.main.url(
-            forResource: mood.resourceName,
-            withExtension: "png",
-            subdirectory: "Pet/concepts"
-        ), let image = NSImage(contentsOf: url) {
+        if let image = PetImageCache.image(named: displayedResourceName) {
             return image
         }
         return NSImage(systemSymbolName: "eye.fill", accessibilityDescription: nil) ?? NSImage()
@@ -204,8 +236,19 @@ private struct PetSprite: View {
             }
         }
         .frame(width: 210, height: 232)
-        .onAppear(perform: startAnimations)
-        .onChange(of: mood.resourceName) { _ in restartAnimations() }
+        .onAppear {
+            startAnimations()
+            restartBlinking()
+        }
+        .onDisappear {
+            blinkTask?.cancel()
+            blinkTask = nil
+        }
+        .onChange(of: mood.resourceName) { _ in
+            restartAnimations()
+            restartBlinking()
+        }
+        .onChange(of: reduceMotion) { _ in restartBlinking() }
     }
 
     private func startAnimations() {
@@ -218,6 +261,95 @@ private struct PetSprite: View {
         transaction.disablesAnimations = true
         withTransaction(transaction) { animating = false }
         startAnimations()
+    }
+
+    /// 每轮用 0...99 随机数选择短眨、慢眨或双眨；图片切换禁用动画，避免重影。
+    private func restartBlinking() {
+        blinkTask?.cancel()
+        blinkTask = nil
+        setBlinking(false)
+        guard !reduceMotion, let blinkName = mood.blinkResourceName else { return }
+
+        PetImageCache.preload(names: [mood.resourceName, blinkName])
+        let activeMood = mood
+        blinkTask = Task { @MainActor in
+            var firstCycle = true
+            while !Task.isCancelled {
+                var delay: Double
+                if firstCycle, case .celebrating = activeMood {
+                    // 庆祝仅展示 3 秒，首眨提前并保证一定能被看到。
+                    delay = Double.random(in: 0.35...0.65)
+                } else {
+                    delay = Double.random(in: activeMood.blinkDelayRange)
+                }
+                firstCycle = false
+                // 偶尔多停一会儿，避免长期落在相似的眨眼节拍上。
+                if case .celebrating = activeMood {
+                    // 短暂庆祝期间不加入长停顿。
+                } else if Int.random(in: 0..<100) < 12 {
+                    delay += Double.random(in: 1.0...2.4)
+                }
+                guard await pause(seconds: delay) else { return }
+
+                let rhythmRoll = Int.random(in: 0..<100)
+                let doubleBlink = rhythmRoll < Int(activeMood.doubleBlinkChance * 100)
+                let slowBlink = !doubleBlink && rhythmRoll >= 88
+                let firstHold = slowBlink
+                    ? Double.random(in: 0.145...0.195)
+                    : Double.random(in: 0.075...0.125)
+
+                setBlinking(true)
+                guard await pause(seconds: firstHold) else { return }
+                setBlinking(false)
+
+                if doubleBlink {
+                    guard await pause(seconds: Double.random(in: 0.115...0.205)) else {
+                        return
+                    }
+                    setBlinking(true)
+                    guard await pause(seconds: Double.random(in: 0.065...0.110)) else {
+                        return
+                    }
+                    setBlinking(false)
+                }
+            }
+        }
+    }
+
+    private func pause(seconds: Double) async -> Bool {
+        do {
+            try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            return !Task.isCancelled
+        } catch {
+            return false
+        }
+    }
+
+    private func setBlinking(_ value: Bool) {
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) { blinking = value }
+    }
+}
+
+/// NSImage(contentsOf:) 首次解码可能让短促的闭眼帧漏掉；缓存后再启动眨眼循环。
+private enum PetImageCache {
+    private static let cache = NSCache<NSString, NSImage>()
+
+    static func image(named name: String) -> NSImage? {
+        let key = name as NSString
+        if let cached = cache.object(forKey: key) { return cached }
+        guard let url = Bundle.main.url(
+            forResource: name,
+            withExtension: "png",
+            subdirectory: "Pet/concepts"
+        ), let image = NSImage(contentsOf: url) else { return nil }
+        cache.setObject(image, forKey: key)
+        return image
+    }
+
+    static func preload(names: [String]) {
+        for name in names { _ = image(named: name) }
     }
 }
 
@@ -240,14 +372,6 @@ private struct PetBackdropEffects: View {
                 )
         }
 
-        if case .idle = mood {
-            Circle()
-                .stroke(Color.cyan.opacity(active ? 0.17 : 0.09), lineWidth: 2)
-                .frame(width: 132, height: 132)
-                .scaleEffect(active ? 1.0 : 0.95)
-                .offset(x: -36, y: 6)
-                .animation(.easeInOut(duration: 2.3).repeatForever(autoreverses: true), value: active)
-        }
     }
 
     private var shadowScale: CGFloat {
