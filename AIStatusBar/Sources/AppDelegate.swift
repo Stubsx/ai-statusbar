@@ -502,7 +502,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                 }
                 if t.busyItems.isEmpty, let latest = t.latestTitle {
                     let item = NSMenuItem(title: "最近任务：\(truncate(latest, 34)) · \(t.latestAge ?? "")", action: nil, keyEquivalent: "")
-                    item.image = symbol("clock", color: .secondaryLabelColor, size: 11)
+                    item.image = symbol("clock", size: 11, template: true)
                     item.isEnabled = false
                     item.attributedTitle = NSAttributedString(string: item.title, attributes: [
                         .font: NSFont.systemFont(ofSize: 11),
@@ -515,10 +515,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         }
         let settingsItem = NSMenuItem(title: "设置…", action: #selector(openSettings), keyEquivalent: ",")
         settingsItem.target = self
-        settingsItem.image = symbol("gearshape")
+        settingsItem.image = symbol("gearshape", template: true)
         menu.addItem(settingsItem)
         let desktopItem = NSMenuItem(title: "桌面显示", action: nil, keyEquivalent: "")
-        desktopItem.image = symbol("rectangle.on.rectangle")
+        desktopItem.image = symbol("rectangle.on.rectangle", template: true)
         let desktopMenu = NSMenu()
         let mode = desktopPresentationMode
         let cardMode = NSMenuItem(title: "桌面卡片", action: #selector(selectCardMode), keyEquivalent: "")
@@ -539,17 +539,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             ? true : UserDefaults.standard.bool(forKey: "panelPinned")
         let pin = NSMenuItem(title: "置顶桌面显示", action: #selector(togglePin), keyEquivalent: "t")
         pin.target = self
-        pin.image = symbol("pin")
+        pin.image = symbol("pin", template: true)
         pin.state = pinned ? .on : .off
         menu.addItem(pin)
         let fullscreenHide = NSMenuItem(title: "全屏时自动隐藏", action: #selector(toggleAutoHideFullscreen), keyEquivalent: "")
         fullscreenHide.target = self
-        fullscreenHide.image = symbol("arrow.up.left.and.arrow.down.right")
+        fullscreenHide.image = symbol("arrow.up.left.and.arrow.down.right", template: true)
         fullscreenHide.state = autoHideInFullscreenEnabled ? .on : .off
         menu.addItem(fullscreenHide)
         let refresh = NSMenuItem(title: "刷新", action: #selector(doRefresh), keyEquivalent: "r")
         refresh.target = self
-        refresh.image = symbol("arrow.clockwise")
+        refresh.image = symbol("arrow.clockwise", template: true)
         menu.addItem(refresh)
         menu.addItem(.separator())
         let legend = NSMenuItem(title: "C=Codex App  X=Codex CLI  K=Kimi  L=Claude  H=Hermes  Z=ZCode", action: nil, keyEquivalent: "")
@@ -996,7 +996,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                 action: #selector(togglePetDetails),
                 keyEquivalent: "")
             collapseItem.target = self
-            collapseItem.image = symbol("minus.rectangle")
+            collapseItem.image = symbol("minus.rectangle", template: true)
             menu.addItem(collapseItem)
         } else {
             let petItem = NSMenuItem(
@@ -1004,7 +1004,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                 action: #selector(selectPetMode),
                 keyEquivalent: "")
             petItem.target = self
-            petItem.image = symbol("pawprint")
+            petItem.image = symbol("pawprint", template: true)
             menu.addItem(petItem)
         }
         menu.addItem(.separator())
@@ -1015,7 +1015,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             action: #selector(togglePin),
             keyEquivalent: "")
         pinItem.target = self
-        pinItem.image = symbol("pin")
+        pinItem.image = symbol("pin", template: true)
         pinItem.state = pinned ? .on : .off
         menu.addItem(pinItem)
         let autoHideItem = NSMenuItem(
@@ -1023,7 +1023,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             action: #selector(toggleAutoHideFullscreen),
             keyEquivalent: "")
         autoHideItem.target = self
-        autoHideItem.image = symbol("arrow.up.left.and.arrow.down.right")
+        autoHideItem.image = symbol("arrow.up.left.and.arrow.down.right", template: true)
         autoHideItem.state = autoHideInFullscreenEnabled ? .on : .off
         menu.addItem(autoHideItem)
         let settingsItem = NSMenuItem(
@@ -1031,7 +1031,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             action: #selector(openSettings),
             keyEquivalent: "")
         settingsItem.target = self
-        settingsItem.image = symbol("gearshape")
+        settingsItem.image = symbol("gearshape", template: true)
         menu.addItem(settingsItem)
         menu.addItem(.separator())
         let quitItem = NSMenuItem(
@@ -1051,14 +1051,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             action: #selector(togglePetDetails),
             keyEquivalent: "")
         detailsItem.target = self
-        detailsItem.image = symbol(petDetailsExpanded ? "minus.rectangle" : "plus.rectangle")
+        detailsItem.image = symbol(petDetailsExpanded ? "minus.rectangle" : "plus.rectangle", template: true)
         menu.addItem(detailsItem)
         let cardItem = NSMenuItem(
             title: "切换到桌面卡片",
             action: #selector(selectCardMode),
             keyEquivalent: "")
         cardItem.target = self
-        cardItem.image = symbol("rectangle.on.rectangle")
+        cardItem.image = symbol("rectangle.on.rectangle", template: true)
         menu.addItem(cardItem)
         menu.addItem(.separator())
 
@@ -1069,7 +1069,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             action: #selector(togglePin),
             keyEquivalent: "")
         pinItem.target = self
-        pinItem.image = symbol("pin")
+        pinItem.image = symbol("pin", template: true)
         pinItem.state = pinned ? .on : .off
         menu.addItem(pinItem)
         let autoHideItem = NSMenuItem(
@@ -1077,7 +1077,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             action: #selector(toggleAutoHideFullscreen),
             keyEquivalent: "")
         autoHideItem.target = self
-        autoHideItem.image = symbol("arrow.up.left.and.arrow.down.right")
+        autoHideItem.image = symbol("arrow.up.left.and.arrow.down.right", template: true)
         autoHideItem.state = autoHideInFullscreenEnabled ? .on : .off
         menu.addItem(autoHideItem)
         let settingsItem = NSMenuItem(
@@ -1085,14 +1085,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             action: #selector(openSettings),
             keyEquivalent: "")
         settingsItem.target = self
-        settingsItem.image = symbol("gearshape")
+        settingsItem.image = symbol("gearshape", template: true)
         menu.addItem(settingsItem)
         let hideItem = NSMenuItem(
             title: "隐藏桌面显示",
             action: #selector(selectHiddenMode),
             keyEquivalent: "")
         hideItem.target = self
-        hideItem.image = symbol("eye.slash")
+        hideItem.image = symbol("eye.slash", template: true)
         menu.addItem(hideItem)
         menu.addItem(.separator())
         let quitItem = NSMenuItem(

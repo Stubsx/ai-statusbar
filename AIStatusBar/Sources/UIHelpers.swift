@@ -24,8 +24,14 @@ extension NSColor {
 /// 先绘制符号作为 alpha 蒙版，再用 sourceAtop 着色，保持背景透明。
 /// 所有图标画在固定 16×16pt 画布上并居中：菜单的图标列按图片实际尺寸排布，
 /// 各符号画布宽窄不一会让图标左右参差、文字缩进不齐。
+/// template=true 时只保留符号 alpha（填黑色）并标记为模板图：颜色由 AppKit
+/// 按菜单实际外观动态上色（深/浅、高亮反色都自动适配）。普通单色图标必须用
+/// 模板模式——烘焙进位图的动态色按绘制时外观解析一次就不再变化，面板强制
+/// 深色而系统为浅色时，图标会是浅外观的深灰色，在深菜单上几乎看不见。
+/// 只有真正需要固定色彩（状态点、红色退出等）才用 color 烘焙。
 func symbol(_ name: String, color: NSColor = .secondaryLabelColor,
-            size: CGFloat = 13, weight: NSFont.Weight = .regular) -> NSImage? {
+            size: CGFloat = 13, weight: NSFont.Weight = .regular,
+            template: Bool = false) -> NSImage? {
     let cfg = NSImage.SymbolConfiguration(pointSize: size, weight: weight)
     guard let base = NSImage(systemSymbolName: name, accessibilityDescription: nil) else { return nil }
     let src = base.withSymbolConfiguration(cfg) ?? base
@@ -64,12 +70,13 @@ func symbol(_ name: String, color: NSColor = .secondaryLabelColor,
 
     // 先画符号建立透明蒙版，再把颜色 sourceAtop 到符号区域。
     // 若先填整张位图，透明背景也会保留下来，菜单中就会显示成色块。
+    // 模板图只需 alpha 通道，填什么颜色都可以，统一用黑。
     src.draw(in: glyphRect, from: .zero, operation: .sourceOver, fraction: 1.0)
-    color.set()
+    (template ? NSColor.black : color).set()
     NSRect(origin: .zero, size: NSSize(width: cell, height: cell)).fill(using: .sourceAtop)
 
     NSGraphicsContext.restoreGraphicsState()
-    out.isTemplate = false
+    out.isTemplate = template
     return out
 }
 
