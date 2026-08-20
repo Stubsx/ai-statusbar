@@ -509,7 +509,7 @@ struct PanelView: View {
         return "\(formatter.string(from: start)) ~ \(formatter.string(from: today))"
     }
 
-    /// 合并视图的来源摘要：N 台设备 · 最近更新时间
+    /// 合并视图的来源摘要：N 台设备 · 最近更新时间，靠右下角展示
     @ViewBuilder
     private var syncSummary: some View {
         if usageScope == "all", let s = store.data?.sync, s.enabled {
@@ -518,6 +518,7 @@ struct PanelView: View {
                 .font(.system(size: 9).monospacedDigit())
                 .foregroundColor(.secondary.opacity(0.7))
                 .padding(.top, 2)
+                .frame(maxWidth: .infinity, alignment: .trailing)
         }
     }
 
