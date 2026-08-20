@@ -197,9 +197,15 @@ private struct PetThemeCard: View {
                         .font(.system(size: 11.5, weight: .medium))
                         .foregroundColor(.primary)
                         .lineLimit(1)
-                    Text(theme.isBuiltIn ? "内置" : "自定义")
-                        .font(.system(size: 9.5))
-                        .foregroundColor(.secondary.opacity(0.75))
+                    HStack(spacing: 4) {
+                        Text(theme.isBuiltIn ? "内置" : "自定义")
+                        if theme.isNSFW {
+                            Text("NSFW")
+                                .foregroundColor(.red.opacity(0.85))
+                        }
+                    }
+                    .font(.system(size: 9.5))
+                    .foregroundColor(.secondary.opacity(0.75))
                 }
             }
             .padding(8)

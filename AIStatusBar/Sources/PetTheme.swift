@@ -98,6 +98,8 @@ struct PetTheme: Identifiable, Equatable {
     let displayName: String
     let folderURL: URL
     let isBuiltIn: Bool
+    /// pet.json 里的可选标记：NSFW 素材在选择器里打标提示。
+    let isNSFW: Bool
     /// 已提供素材的槽位名集合（不含扩展名）。
     let filledSlots: Set<String>
 
@@ -156,18 +158,20 @@ enum PetThemeStore {
         guard !filled.isEmpty else { return nil }
 
         var displayName = folder.lastPathComponent
+        var isNSFW = false
         if let jsonURL = files.first(where: { $0.lastPathComponent == "pet.json" }),
            let data = try? Data(contentsOf: jsonURL),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let name = obj["name"] as? String, !name.isEmpty
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         {
-            displayName = name
+            if let name = obj["name"] as? String, !name.isEmpty { displayName = name }
+            isNSFW = obj["nsfw"] as? Bool ?? false
         }
         return PetTheme(
             id: folder.lastPathComponent,
             displayName: displayName,
             folderURL: folder,
             isBuiltIn: isBuiltIn,
+            isNSFW: isNSFW,
             filledSlots: filled
         )
     }
@@ -238,7 +242,11 @@ final class PetCatalog: ObservableObject {
         all += PetThemeStore.scan(root: userPetsDirectory, isBuiltIn: false)
         // 空目录（比如只剩 pet.json）不会出现在列表里，但会把 id 占住；去掉重复 id 保留第一个。
         var seen = Set<String>()
-        themes = all.filter { seen.insert($0.id).inserted }
+        let deduped = all.filter { seen.insert($0.id).inserted }
+        // 默认形象固定在列表第一位（稳定排序，其余保持扫描顺序）
+        themes = deduped.sorted { lhs, rhs in
+            (lhs.id == Self.defaultThemeID) && (rhs.id != Self.defaultThemeID)
+        }
     }
 
     // MARK: 编辑草稿
@@ -308,6 +316,7 @@ final class PetCatalog: ObservableObject {
                 displayName: "",
                 folderURL: draftURL,
                 isBuiltIn: false,
+                isNSFW: false,
                 filledSlots: []
             )
     }
