@@ -1,4 +1,5 @@
 import Cocoa
+import Combine
 import SwiftUI
 import UserNotifications
 import ScreenCaptureKit
@@ -167,6 +168,8 @@ final class SettingsStore: ObservableObject {
     static let offlineOptions: [(String, Int)] = [("1 小时", 3600), ("2 小时", 7200), ("3 小时", 10800),
                                                   ("6 小时", 21600), ("12 小时", 43200), ("从不", 0)]
     static let petAppearanceOptions = PetAppearance.allCases.map { ($0.displayName, $0.rawValue) }
+    /// 桌宠显示比例范围：0.6～1.6，默认原大
+    static let petScaleRange: ClosedRange<Double> = 0.6...1.6
 
     @Published var defaultSec = 300 { didSet { save() } }
     @Published var perTool: [String: Int] = [:] { didSet { save() } }
@@ -182,6 +185,7 @@ final class SettingsStore: ObservableObject {
     @Published var notifyTools: [String: Bool] = [:] { didSet { save() } }
     @Published var showDockIcon = false { didSet { save(); applyDockIconPolicy() } }
     @Published var petAppearance = PetAppearance.rem.rawValue { didSet { save() } }
+    @Published var petScale = 1.0 { didSet { save() } }
     @Published var onlineQuota = true { didSet { save() } }
     /// 用量同步：多设备通过共享目录汇总用量/活跃；空目录 = iCloud Drive 默认目录
     @Published var usageSyncEnabled = false { didSet { save() } }
@@ -224,6 +228,10 @@ final class SettingsStore: ObservableObject {
         {
             petAppearance = value
         }
+        if let v = obj["pet_scale"] as? Double {
+            petScale = min(max(v, SettingsStore.petScaleRange.lowerBound),
+                           SettingsStore.petScaleRange.upperBound)
+        }
         if let v = obj["online_quota"] as? Bool { onlineQuota = v }
         if let s = obj["usage_sync"] as? [String: Any] {
             if let v = s["enabled"] as? Bool { usageSyncEnabled = v }
@@ -239,6 +247,7 @@ final class SettingsStore: ObservableObject {
             "notify": ["enabled": notifyEnabled, "tools": notifyTools],
             "show_dock_icon": showDockIcon,
             "pet_appearance": petAppearance,
+            "pet_scale": petScale,
             "online_quota": onlineQuota,
             "usage_sync": ["enabled": usageSyncEnabled, "dir": usageSyncDir],
         ]
@@ -1275,6 +1284,22 @@ struct SettingsView: View {
                         .frame(width: 128, alignment: .trailing)
                     }
                     divider
+                    settingRow("宠物大小", detail: "拖动调整桌宠显示比例，脚底位置保持不变") {
+                        HStack(spacing: 6) {
+                            Slider(
+                                value: $settings.petScale,
+                                in: SettingsStore.petScaleRange,
+                                step: 0.05
+                            )
+                            .controlSize(.small)
+                            .frame(width: 88)
+                            Text("\(Int(settings.petScale * 100))%")
+                                .font(.system(size: 11).monospacedDigit())
+                                .foregroundColor(.secondary)
+                                .frame(width: 34, alignment: .trailing)
+                        }
+                    }
+                    divider
                     settingRow("面板配色", detail: "背景自适应按面板下方明暗自动反差") {
                         modePicker(appearanceModeBinding, options: [
                             ("跟随系统", "system"), ("浅色", "light"),
@@ -1618,6 +1643,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     private var fullscreenAutoHidden = false  // 当前是否因检测到全屏 App 而自动隐藏（区别于用户手动隐藏）
     private var fullscreenAutoHideSuppressed = false  // 用户在全屏期间手动重新显示后，本次会话内不再自动隐藏
     private var petDetailsExpanded = false
+    private var cancellables: Set<AnyCancellable> = []  // 设置订阅（如桌宠大小）
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 通知 delegate 在启动时设置，托管横幅点击回调（跳转对应工具）
@@ -2228,14 +2254,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             }
         }
 
-        petHosting.layout()
-        petPanel.setContentSize(petHosting.fittingSize)
+        // 桌宠大小可调：窗口尺寸由这里按比例手动驱动（底边锚定，脚底位置不动），
+        // 不交给 NSHostingView 自适应——那条路径锚定方向不受控，会与底边锚定打架
+        if #available(macOS 13.0, *) {
+            petHosting.sizingOptions = []
+        }
+        petPanel.setContentSize(Self.petPanelSize(scale: CGFloat(settings.petScale)))
+        settings.$petScale
+            .dropFirst()
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] scale in
+                guard let self, let petPanel = self.petPanel else { return }
+                let size = Self.petPanelSize(scale: CGFloat(scale))
+                guard abs(petPanel.frame.height - size.height) > 0.5
+                    || abs(petPanel.frame.width - size.width) > 0.5
+                else { return }
+                // AppKit 原点即窗口底边：origin 不动，脚底天然稳定，只改尺寸
+                var f = petPanel.frame
+                f.size = size
+                petPanel.setFrame(f, display: true)
+            }
+            .store(in: &cancellables)
         restoreWindowPosition(petPanel, key: "petOrigin") { screen, size in
             NSPoint(
                 x: screen.visibleFrame.maxX - size.width - 24,
                 y: screen.visibleFrame.minY + 24
             )
         }
+    }
+
+    /// 桌宠基础尺寸（与 PetView 固定 frame 一致）按比例缩放后的窗口尺寸
+    private static func petPanelSize(scale: CGFloat) -> NSSize {
+        NSSize(width: 220 * scale, height: 270 * scale)
     }
 
     private func restoreWindowPosition(

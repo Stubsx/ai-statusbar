@@ -134,57 +134,66 @@ struct PetView: View {
         PetAppearance(settingValue: settings.petAppearance)
     }
 
+    /// 桌宠显示比例（设置里可调）。
+    /// 所有尺寸/字号/偏移直接乘比例（而不是 scaleEffect 位图放大），
+    /// 保证放大后文字、徽标等仍以最终分辨率原生渲染，保持清晰。
+    private var scale: CGFloat {
+        CGFloat(settings.petScale)
+    }
+
+    private func s(_ v: CGFloat) -> CGFloat { v * scale }
+
     var body: some View {
-        VStack(spacing: 4) {
+        VStack(spacing: s(4)) {
             if celebratingSerial > 0 {
                 Text(celebrationMessage)
-                    .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                    .font(.system(size: s(10.5), weight: .semibold, design: .rounded))
                     .foregroundColor(Color(red: 0.25, green: 0.40, blue: 0.65))
                     .lineLimit(1)
                     .truncationMode(.tail)
-                    .frame(maxWidth: 184)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
+                    .frame(maxWidth: s(184))
+                    .padding(.horizontal, s(10))
+                    .padding(.vertical, s(6))
                     .background(
                         Capsule()
                             .fill(Color(red: 0.92, green: 0.96, blue: 1.0).opacity(0.96))
-                            .overlay(Capsule().stroke(Color.white.opacity(0.96), lineWidth: 1.3))
+                            .overlay(Capsule().stroke(Color.white.opacity(0.96), lineWidth: s(1.3)))
                             .overlay(
                                 Capsule()
                                     .stroke(
                                         Color(red: 0.55, green: 0.72, blue: 0.92).opacity(0.58),
-                                        lineWidth: 0.6
+                                        lineWidth: s(0.6)
                                     )
-                                    .padding(1)
+                                    .padding(s(1))
                             )
                     )
                     .shadow(
                         color: Color(red: 0.34, green: 0.59, blue: 0.88).opacity(0.22),
-                        radius: 6,
-                        y: 2
+                        radius: s(6),
+                        y: s(2)
                     )
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
             } else if hovered {
                 Text(mood.summary)
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.system(size: s(11), weight: .medium))
                     .foregroundColor(.primary)
-                    .padding(.horizontal, 11)
-                    .padding(.vertical, 6)
+                    .padding(.horizontal, s(11))
+                    .padding(.vertical, s(6))
                     .background(
                         Capsule()
                             .fill(.ultraThinMaterial)
-                            .overlay(Capsule().stroke(Color.primary.opacity(0.12), lineWidth: 0.5))
+                            .overlay(Capsule().stroke(Color.primary.opacity(0.12), lineWidth: s(0.5)))
                     )
-                    .shadow(color: .black.opacity(0.18), radius: 7, y: 3)
+                    .shadow(color: .black.opacity(0.18), radius: s(7), y: s(3))
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
             } else {
-                Color.clear.frame(height: 30)
+                Color.clear.frame(height: s(30))
             }
 
             // 保持同一个 Sprite 实例，状态换图时沿用当前动画相位，避免动作重新起步。
-            PetSprite(mood: mood, appearance: appearance)
+            PetSprite(mood: mood, appearance: appearance, scale: scale)
         }
-        .frame(width: 220, height: 270, alignment: .bottom)
+        .frame(width: s(220), height: s(270), alignment: .bottom)
         .contentShape(Rectangle())
         .onTapGesture(perform: onOpenDetails)
         .onHover { inside in
@@ -211,12 +220,15 @@ struct PetView: View {
 private struct PetSprite: View {
     let mood: PetMood
     let appearance: PetAppearance
+    let scale: CGFloat
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var animating = false
     @State private var blinking = false
     @State private var blinkTask: Task<Void, Never>?
     @State private var typingFrame = 0
     @State private var typingTask: Task<Void, Never>?
+
+    private func s(_ v: CGFloat) -> CGFloat { v * scale }
 
     private var displayedResourceName: String {
         let baseName = mood.resourceName(for: appearance)
@@ -238,13 +250,13 @@ private struct PetSprite: View {
     var body: some View {
         let active = animating && !reduceMotion
         ZStack(alignment: .topTrailing) {
-            PetBackdropEffects(mood: mood, active: active)
+            PetBackdropEffects(mood: mood, active: active, scale: scale)
 
             Image(nsImage: image)
                 .resizable()
                 .interpolation(.high)
                 .scaledToFit()
-                .frame(width: 200, height: 226)
+                .frame(width: s(200), height: s(226))
                 // 只替换 Image 实例，并禁用默认交叉淡化；否则两种姿势会短暂叠在一起。
                 .id(displayedResourceName)
                 .transition(.identity)
@@ -252,40 +264,40 @@ private struct PetSprite: View {
                     transaction.disablesAnimations = true
                 }
 
-            PetForegroundEffects(mood: mood, active: active)
+            PetForegroundEffects(mood: mood, active: active, scale: scale)
 
             if case .working(let taskCount) = mood {
                 Text("×\(taskCount)")
-                    .font(.system(size: 11, weight: .semibold, design: .rounded).monospacedDigit())
+                    .font(.system(size: s(11), weight: .semibold, design: .rounded).monospacedDigit())
                     .foregroundColor(Color(red: 0.25, green: 0.40, blue: 0.65))
-                    .padding(.horizontal, 8)
-                    .frame(height: 23)
+                    .padding(.horizontal, s(8))
+                    .frame(height: s(23))
                     .background(
                         Capsule()
                             .fill(Color(red: 0.92, green: 0.96, blue: 1.0).opacity(0.94))
                             .overlay(
                                 Capsule()
-                                    .stroke(Color.white.opacity(0.96), lineWidth: 1.4)
+                                    .stroke(Color.white.opacity(0.96), lineWidth: s(1.4))
                             )
                             .overlay(
                                 Capsule()
                                     .stroke(
                                         Color(red: 0.55, green: 0.72, blue: 0.92).opacity(0.65),
-                                        lineWidth: 0.65
+                                        lineWidth: s(0.65)
                                     )
-                                    .padding(1)
+                                    .padding(s(1))
                             )
                     )
                     .shadow(
                         color: Color(red: 0.34, green: 0.59, blue: 0.88).opacity(0.24),
-                        radius: 5,
-                        y: 2
+                        radius: s(5),
+                        y: s(2)
                     )
-                    .padding(.top, 12)
-                    .padding(.trailing, 7)
+                    .padding(.top, s(12))
+                    .padding(.trailing, s(7))
             }
         }
-        .frame(width: 210, height: 232)
+        .frame(width: s(210), height: s(232))
         .onAppear {
             startAnimations()
             restartBlinking(mood, appearance: appearance)
@@ -461,15 +473,18 @@ private enum PetImageCache {
 private struct PetBackdropEffects: View {
     let mood: PetMood
     let active: Bool
+    let scale: CGFloat
+
+    private func s(_ v: CGFloat) -> CGFloat { v * scale }
 
     @ViewBuilder
     var body: some View {
         if mood != .error {
             Ellipse()
                 .fill(Color.black.opacity(active ? 0.055 : 0.10))
-                .frame(width: 72, height: 8)
+                .frame(width: s(72), height: s(8))
                 .scaleEffect(x: active ? shadowScale : 1, y: 1)
-                .offset(x: -69, y: 218)
+                .offset(x: s(-69), y: s(218))
                 .animation(
                     .easeInOut(duration: shadowDuration).repeatForever(autoreverses: true),
                     value: active
@@ -505,16 +520,19 @@ private struct PetBackdropEffects: View {
 private struct PetForegroundEffects: View {
     let mood: PetMood
     let active: Bool
+    let scale: CGFloat
+
+    private func s(_ v: CGFloat) -> CGFloat { v * scale }
 
     @ViewBuilder
     var body: some View {
         switch mood {
         case .loading:
-            HStack(spacing: 4) {
+            HStack(spacing: s(4)) {
                 ForEach(0..<3, id: \.self) { index in
                     Circle()
                         .fill(Color.blue.opacity(active ? 0.84 : 0.42))
-                        .frame(width: 6, height: 6)
+                        .frame(width: s(6), height: s(6))
                         .scaleEffect(active ? 1.0 : 0.75)
                         .animation(
                             .easeInOut(duration: 0.62)
@@ -524,10 +542,10 @@ private struct PetForegroundEffects: View {
                         )
                 }
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
+            .padding(.horizontal, s(8))
+            .padding(.vertical, s(6))
             .background(Capsule().fill(.ultraThinMaterial))
-            .offset(x: -4, y: 8)
+            .offset(x: s(-4), y: s(8))
 
         case .sleeping:
             driftingZ("Z", size: 18, delay: 0, x: -9)
@@ -541,16 +559,16 @@ private struct PetForegroundEffects: View {
 
         case .error:
             Image(systemName: "exclamationmark")
-                .font(.system(size: 13, weight: .black))
+                .font(.system(size: s(13), weight: .black))
                 .foregroundColor(.white)
-                .frame(width: 25, height: 25)
+                .frame(width: s(25), height: s(25))
                 .background(Circle().fill(Color.red))
-                .overlay(Circle().stroke(Color.white.opacity(0.85), lineWidth: 1.5))
-                .shadow(color: .red.opacity(0.35), radius: 5)
+                .overlay(Circle().stroke(Color.white.opacity(0.85), lineWidth: s(1.5)))
+                .shadow(color: .red.opacity(0.35), radius: s(5))
                 .scaleEffect(active ? 1.0 : 0.95)
                 .animation(.easeInOut(duration: 0.75).repeatForever(autoreverses: true), value: active)
-                .padding(.top, 10)
-                .padding(.trailing, 8)
+                .padding(.top, s(10))
+                .padding(.trailing, s(8))
 
         case .working:
             sparkle(size: 15, delay: 0, duration: 0.92, x: -137, y: 108, color: .cyan)
@@ -563,9 +581,9 @@ private struct PetForegroundEffects: View {
 
     private func driftingZ(_ text: String, size: CGFloat, delay: Double, x: CGFloat) -> some View {
         Text(text)
-            .font(.system(size: size, weight: .bold, design: .rounded))
+            .font(.system(size: s(size), weight: .bold, design: .rounded))
             .foregroundColor(Color.blue.opacity(active ? 0.25 : 0.85))
-            .offset(x: x, y: active ? -7 : 16)
+            .offset(x: s(x), y: active ? s(-7) : s(16))
             .animation(
                 .easeOut(duration: 1.45).repeatForever(autoreverses: false).delay(delay),
                 value: active
@@ -581,12 +599,12 @@ private struct PetForegroundEffects: View {
         color: Color
     ) -> some View {
         Image(systemName: "sparkle")
-            .font(.system(size: size, weight: .semibold))
+            .font(.system(size: s(size), weight: .semibold))
             .foregroundColor(color)
-            .shadow(color: color.opacity(0.30), radius: 3)
+            .shadow(color: color.opacity(0.30), radius: s(3))
             .scaleEffect(active ? 0.96 : 0.62)
             .opacity(active ? 0.88 : 0.30)
-            .offset(x: x, y: y)
+            .offset(x: s(x), y: s(y))
             .animation(
                 .easeInOut(duration: duration).repeatForever(autoreverses: true).delay(delay),
                 value: active
