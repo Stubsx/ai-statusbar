@@ -33,6 +33,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 通知 delegate 在启动时设置，托管横幅点击回调（跳转对应工具）
         UNUserNotificationCenter.current().delegate = self
+        // 历史版本只在开关从关→开时请求一次系统授权，且忽略结果；若当时授权
+        // 未完成（如签名身份变化），此后通知会被系统静默丢弃。启动时补查一次：
+        // notDetermined 才真正弹系统授权框，已允许/已拒绝都不打扰用户。
+        if settings.notifyEnabled {
+            UNUserNotificationCenter.current().getNotificationSettings { s in
+                if s.authorizationStatus == .notDetermined {
+                    UNUserNotificationCenter.current().requestAuthorization(
+                        options: [.alert, .sound]) { _, _ in }
+                }
+            }
+        }
         let collectorPath = Bundle.main.path(forResource: "lingmou-collector", ofType: nil)
         store = StatusStore(collectorPath: collectorPath, settings: settings)
 

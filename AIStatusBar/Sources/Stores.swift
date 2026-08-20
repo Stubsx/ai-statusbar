@@ -231,7 +231,11 @@ final class StatusStore: ObservableObject {
         content.sound = .default
         content.userInfo = ["tool": key]  // 点击通知时据此跳转对应 App / 宿主终端
         UNUserNotificationCenter.current().add(
-            UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+            UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        ) { error in
+            // 系统拒绝投递（未授权等）时留下日志，不再静默吞掉
+            if let error { NSLog("灵眸：通知投递失败：\(error.localizedDescription)") }
+        }
     }
 }
 

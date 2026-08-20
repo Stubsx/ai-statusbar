@@ -1,5 +1,6 @@
 import Cocoa
 import SwiftUI
+import UserNotifications
 
 // 设置窗口内容（SettingsView，macOS 26 风格：隐藏标题栏 + 卡片分组）。
 
@@ -12,6 +13,8 @@ struct SettingsView: View {
     @State private var showOnlineQuotaAlert = false
     @State private var showAdaptiveAlert = false
     @State private var perToolBusyExpanded = false
+    /// 系统级通知授权状态（设置窗口打开通知页时查询，用于提示"被系统拒绝"的情况）
+    @State private var notifyAuth: UNAuthorizationStatus = .notDetermined
     @AppStorage("desktopPresentationMode") private var desktopPresentationMode = "card"
     @AppStorage("panelAppearanceMode") private var appearanceMode = "system"
     @AppStorage("settingsTab") private var settingsTab = "general"
@@ -189,7 +192,67 @@ struct SettingsView: View {
             }
             if settings.notifyEnabled {
                 notifyToolsGrid
+                divider
+                if notifyAuth == .denied {
+                    settingRow("系统通知权限已关闭",
+                               detail: "macOS 拒绝了灵眸的通知权限，通知不会弹出，需要在系统设置中打开") {
+                        Button("打开系统设置") {
+                            NSWorkspace.shared.open(
+                                URL(string: "x-apple.systempreferences:com.apple.preference.notifications")!)
+                        }
+                    }
+                    divider
+                }
+                settingRow("测试通知",
+                           detail: notifyAuth == .authorized
+                               ? "立即发送一条测试横幅，验证通知通道"
+                               : "发送前会先向系统请求通知授权") {
+                    Button("发送") { sendTestNotification() }
+                }
             }
+        }
+        .onAppear { refreshNotifyAuth() }
+        .onChange(of: settings.notifyEnabled) { _ in refreshNotifyAuth() }
+    }
+
+    // MARK: 通知系统授权
+
+    private func refreshNotifyAuth() {
+        UNUserNotificationCenter.current().getNotificationSettings { s in
+            DispatchQueue.main.async { notifyAuth = s.authorizationStatus }
+        }
+    }
+
+    /// 测试通知：未请求过授权先请求，已允许则直接发一条横幅，被拒则只刷新状态行
+    private func sendTestNotification() {
+        UNUserNotificationCenter.current().getNotificationSettings { s in
+            switch s.authorizationStatus {
+            case .notDetermined:
+                UNUserNotificationCenter.current().requestAuthorization(
+                    options: [.alert, .sound]
+                ) { granted, _ in
+                    DispatchQueue.main.async {
+                        refreshNotifyAuth()
+                        if granted { postTestNotification() }
+                    }
+                }
+            case .authorized, .provisional, .ephemeral:
+                DispatchQueue.main.async { postTestNotification() }
+            default:
+                DispatchQueue.main.async { refreshNotifyAuth() }
+            }
+        }
+    }
+
+    private func postTestNotification() {
+        let content = UNMutableNotificationContent()
+        content.title = "灵眸测试通知"
+        content.body = "通知通道正常，任务完成时会这样提醒你。"
+        content.sound = .default
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        ) { error in
+            if let error { NSLog("灵眸：测试通知投递失败：\(error.localizedDescription)") }
         }
     }
 
