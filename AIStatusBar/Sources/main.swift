@@ -1643,6 +1643,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     private var fullscreenAutoHidden = false  // 当前是否因检测到全屏 App 而自动隐藏（区别于用户手动隐藏）
     private var fullscreenAutoHideSuppressed = false  // 用户在全屏期间手动重新显示后，本次会话内不再自动隐藏
     private var petDetailsExpanded = false
+    private var lastDesktopMode: String?  // 上次 applyDesktopPresentationMode 处理过的桌面模式
     private var cancellables: Set<AnyCancellable> = []  // 设置订阅（如桌宠大小）
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -2394,6 +2395,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     private func applyDesktopPresentationMode() {
         guard panel != nil, petPanel != nil else { return }
         let mode = desktopPresentationMode
+        // 页签/用量范围等 @AppStorage 写入也会触发本方法（UserDefaults.didChange），
+        // 此时窗口尺寸正随内容自适应（顶边锚定）；若每次都恢复记忆位置或重摆详情卡，
+        // 会把窗口拽回旧 origin，顶边来回跳。只在模式真正切换时才动位置。
+        let modeChanged = lastDesktopMode != mode
+        lastDesktopMode = mode
         let visible = mode != "hidden"
         if (UserDefaults.standard.object(forKey: "panelVisible") as? Bool) != visible {
             UserDefaults.standard.set(visible, forKey: "panelVisible")
@@ -2406,7 +2412,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         case "pet":
             petPanel.orderFront(nil)
             if petDetailsExpanded {
-                positionDetailsPanelNextToPet()
+                if modeChanged { positionDetailsPanelNextToPet() }
                 panel.orderFront(nil)
             } else {
                 panel.orderOut(nil)
@@ -2417,7 +2423,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         default:
             petDetailsExpanded = false
             petPanel.orderOut(nil)
-            restoreCardPanelPosition()
+            if modeChanged { restoreCardPanelPosition() }
             panel.orderFront(nil)
         }
     }
