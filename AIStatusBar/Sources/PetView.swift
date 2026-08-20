@@ -273,6 +273,19 @@ struct PetSprite: View {
             restartBlinking(mood, theme: theme)
             restartTyping(mood, theme: theme)
         }
+        // 窗口被 orderOut（如全屏自动隐藏）时，repeatForever 的层动画会被系统丢弃；
+        // 恢复显示时 animating 值没变，.animation(value:) 不会重新提交，特效永久冻结。
+        // 遮挡状态恢复可见时主动重启一轮动画，眨眼/打字任务也一并兜底重启。
+        .onReceive(
+            NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)
+        ) { note in
+            guard let window = note.object as? NSWindow,
+                  window.occlusionState.contains(.visible)
+            else { return }
+            restartAnimations()
+            restartBlinking(mood, theme: theme)
+            restartTyping(mood, theme: theme)
+        }
     }
 
     private func startAnimations() {
