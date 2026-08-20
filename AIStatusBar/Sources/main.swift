@@ -24,6 +24,8 @@ extension NSColor {
 
 /// 生成带颜色的 SF Symbol 图标（用于菜单行 NSMenuItem.image）。
 /// 先绘制符号作为 alpha 蒙版，再用 sourceAtop 着色，保持背景透明。
+/// 所有图标画在固定 16×16pt 画布上并居中：菜单的图标列按图片实际尺寸排布，
+/// 各符号画布宽窄不一会让图标左右参差、文字缩进不齐。
 func symbol(_ name: String, color: NSColor = .secondaryLabelColor,
             size: CGFloat = 13, weight: NSFont.Weight = .regular) -> NSImage? {
     let cfg = NSImage.SymbolConfiguration(pointSize: size, weight: weight)
@@ -32,30 +34,41 @@ func symbol(_ name: String, color: NSColor = .secondaryLabelColor,
 
     // 创建位图，固定 2x retina 尺寸保证菜单渲染稳定
     let scale: CGFloat = 2
-    let canvasSize = NSSize(width: ceil(src.size.width), height: ceil(src.size.height))
-    let pxW = Int(canvasSize.width * scale)
-    let pxH = Int(canvasSize.height * scale)
+    let cell: CGFloat = 16
+    let px = Int(cell * scale)
     guard let bmp = NSBitmapImageRep(
-        bitmapDataPlanes: nil, pixelsWide: pxW, pixelsHigh: pxH,
+        bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px,
         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
         isPlanar: false, colorSpaceName: .deviceRGB,
         bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
     // NSBitmapImageRep 默认以像素作为逻辑尺寸；显式设为 point 尺寸，
     // 否则 2x Retina 位图会把 SF Symbol 显示成正常大小的一半。
-    bmp.size = canvasSize
-    let out = NSImage(size: canvasSize)
+    bmp.size = NSSize(width: cell, height: cell)
+    let out = NSImage(size: NSSize(width: cell, height: cell))
     out.addRepresentation(bmp)
 
     NSGraphicsContext.saveGraphicsState()
     NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bmp)
 
+    // 宽符号（如 rectangle.on.rectangle）按比例缩小到画布内，再居中绘制。
+    var glyph = src.size
+    let maxGlyph: CGFloat = 15
+    if glyph.width > maxGlyph || glyph.height > maxGlyph {
+        let ratio = min(maxGlyph / glyph.width, maxGlyph / glyph.height)
+        glyph.width = floor(glyph.width * ratio)
+        glyph.height = floor(glyph.height * ratio)
+    }
+    let glyphRect = NSRect(
+        x: floor((cell - glyph.width) / 2),
+        y: floor((cell - glyph.height) / 2),
+        width: glyph.width,
+        height: glyph.height)
+
     // 先画符号建立透明蒙版，再把颜色 sourceAtop 到符号区域。
     // 若先填整张位图，透明背景也会保留下来，菜单中就会显示成色块。
-    let bounds = NSRect(origin: .zero, size: canvasSize)
-    src.draw(in: bounds,
-             from: .zero, operation: .sourceOver, fraction: 1.0)
+    src.draw(in: glyphRect, from: .zero, operation: .sourceOver, fraction: 1.0)
     color.set()
-    bounds.fill(using: .sourceAtop)
+    NSRect(origin: .zero, size: NSSize(width: cell, height: cell)).fill(using: .sourceAtop)
 
     NSGraphicsContext.restoreGraphicsState()
     out.isTemplate = false
@@ -167,7 +180,6 @@ final class SettingsStore: ObservableObject {
     static let busyOptions = [60, 180, 300, 600, 900, 1800]
     static let offlineOptions: [(String, Int)] = [("1 小时", 3600), ("2 小时", 7200), ("3 小时", 10800),
                                                   ("6 小时", 21600), ("12 小时", 43200), ("从不", 0)]
-    static let petAppearanceOptions = PetAppearance.allCases.map { ($0.displayName, $0.rawValue) }
     /// 桌宠显示比例范围：0.6～1.6，默认原大
     static let petScaleRange: ClosedRange<Double> = 0.6...1.6
 
@@ -184,7 +196,7 @@ final class SettingsStore: ObservableObject {
     }
     @Published var notifyTools: [String: Bool] = [:] { didSet { save() } }
     @Published var showDockIcon = false { didSet { save(); applyDockIconPolicy() } }
-    @Published var petAppearance = PetAppearance.rem.rawValue { didSet { save() } }
+    @Published var petAppearance = PetCatalog.defaultThemeID { didSet { save() } }
     @Published var petScale = 1.0 { didSet { save() } }
     @Published var onlineQuota = true { didSet { save() } }
     /// 用量同步：多设备通过共享目录汇总用量/活跃；空目录 = iCloud Drive 默认目录
@@ -223,11 +235,9 @@ final class SettingsStore: ObservableObject {
             if let t = n["tools"] as? [String: Bool] { notifyTools = t }
         }
         if let v = obj["show_dock_icon"] as? Bool { showDockIcon = v }
-        if let value = obj["pet_appearance"] as? String,
-           PetAppearance(rawValue: value) != nil
-        {
-            petAppearance = value
-        }
+        // 形象 id 是开放的（内置 + 用户自定义），这里不做白名单校验；
+        // 形象缺失时由 PetCatalog.currentTheme 回退到默认形象。
+        if let value = obj["pet_appearance"] as? String { petAppearance = value }
         if let v = obj["pet_scale"] as? Double {
             petScale = min(max(v, SettingsStore.petScaleRange.lowerBound),
                            SettingsStore.petScaleRange.upperBound)
@@ -1212,11 +1222,13 @@ struct PanelView: View {
 struct SettingsView: View {
     @ObservedObject var store: StatusStore  // 同步来源状态来自最新一次采集
     @ObservedObject var settings: SettingsStore
+    @ObservedObject var catalog: PetCatalog
     @State private var showOnlineQuotaAlert = false
     @State private var showAdaptiveAlert = false
     @State private var perToolBusyExpanded = false
     @AppStorage("desktopPresentationMode") private var desktopPresentationMode = "card"
     @AppStorage("panelAppearanceMode") private var appearanceMode = "system"
+    @AppStorage("settingsTab") private var settingsTab = "general"
 
     private func chooseSyncDirectory() {
         let panel = NSOpenPanel()
@@ -1246,117 +1258,147 @@ struct SettingsView: View {
     }
 
     var body: some View {
+        VStack(spacing: 0) {
+            header
+            tabBar
+            Divider().opacity(0.4)
+            switch settingsTab {
+            case "pet":
+                PetSettingsTab(settings: settings, catalog: catalog)
+            case "data":
+                settingsScroll { dataSection }
+            case "notify":
+                settingsScroll { notifySection }
+            default:
+                settingsScroll {
+                    statusSection
+                    appearanceSection
+                }
+            }
+        }
+        .frame(width: 470)
+    }
+
+    /// 顶部标签栏：与设置行（12.5pt 标题）同比例，避免照搬状态面板的紧凑样式后显得过小。
+    private var tabBar: some View {
+        HStack(spacing: 6) {
+            tabButton("通用", "general")
+            tabButton("桌宠", "pet")
+            tabButton("数据", "data")
+            tabButton("通知", "notify")
+            Spacer()
+        }
+        .padding(.horizontal, 24)
+        .padding(.bottom, 12)
+    }
+
+    private func tabButton(_ title: String, _ id: String) -> some View {
+        Button(action: { settingsTab = id }) {
+            Text(title)
+                .font(.system(size: 12.5, weight: settingsTab == id ? .semibold : .regular))
+                .foregroundColor(settingsTab == id ? Color.primary : Color.secondary)
+                .padding(.horizontal, 13)
+                .padding(.vertical, 6)
+                .background(
+                    Capsule().fill(
+                        settingsTab == id ? Color.primary.opacity(0.16) : Color.primary.opacity(0.06)
+                    )
+                )
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func settingsScroll<Content: View>(@ViewBuilder content: () -> Content) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                header
-
-                section("状态判定") {
-                    settingRow("进入空闲前无活动时长",
-                               detail: "任务结束后超过该时长仍无新活动，则显示空闲") {
-                        valuePicker($settings.defaultSec,
-                                    options: SettingsStore.busyOptions.map { (SettingsStore.labelSec($0), $0) })
-                    }
-                    divider
-                    perToolBusyDisclosure
-                    divider
-                    settingRow("长时间无活动视为离线",
-                               detail: "进程仍在但持续无活动，超过该时长按未运行显示") {
-                        valuePicker($settings.offlineAfterSec, options: SettingsStore.offlineOptions)
-                    }
-                }
-
-                section("外观") {
-                    settingRow("桌面显示", detail: "桌宠会根据 AI 工具状态切换动作") {
-                        modePicker($desktopPresentationMode, options: [
-                            ("桌面卡片", "card"), ("桌面宠物", "pet"), ("隐藏", "hidden"),
-                        ])
-                    }
-                    divider
-                    settingRow("桌宠形象", detail: "切换后各状态动作会立即更新") {
-                        Picker("", selection: $settings.petAppearance) {
-                            ForEach(SettingsStore.petAppearanceOptions, id: \.1) { label, value in
-                                Text(label).tag(value)
-                            }
-                        }
-                        .labelsHidden()
-                        .pickerStyle(.segmented)
-                        .controlSize(.regular)
-                        .frame(width: 128, alignment: .trailing)
-                    }
-                    divider
-                    settingRow("宠物大小", detail: "拖动调整桌宠显示比例，脚底位置保持不变") {
-                        HStack(spacing: 6) {
-                            Slider(
-                                value: $settings.petScale,
-                                in: SettingsStore.petScaleRange,
-                                step: 0.05
-                            )
-                            .controlSize(.small)
-                            .frame(width: 88)
-                            Text("\(Int(settings.petScale * 100))%")
-                                .font(.system(size: 11).monospacedDigit())
-                                .foregroundColor(.secondary)
-                                .frame(width: 34, alignment: .trailing)
-                        }
-                    }
-                    divider
-                    settingRow("面板配色", detail: "背景自适应按面板下方明暗自动反差") {
-                        modePicker(appearanceModeBinding, options: [
-                            ("跟随系统", "system"), ("浅色", "light"),
-                            ("深色", "dark"), ("背景自适应", "adaptive"),
-                        ])
-                    }
-                    .alert("需要录屏权限", isPresented: $showAdaptiveAlert) {
-                        Button("取消", role: .cancel) {}
-                        Button("同意并授权") {
-                            appearanceMode = "adaptive"
-                            (NSApp.delegate as? AppDelegate)?.requestScreenCaptureAccessIfNeeded()
-                        }
-                    } message: {
-                        Text("背景自适应需要截取面板正下方一小块屏幕区域来判断明暗，因此需要录屏权限。截图只在内存中计算，不会保存或上传。")
-                    }
-                    divider
-                    settingRow("在 Dock 中显示图标", detail: "默认仅驻留菜单栏") {
-                        toggle($settings.showDockIcon)
-                    }
-                }
-
-                section("数据") {
-                    // 联网配额默认开启，只向各工具自己的厂商接口发送对应令牌。
-                    settingRow("查询账号配额",
-                               detail: "读取本地登录令牌，仅发送到对应厂商的配额接口") {
-                        toggle(onlineQuotaBinding)
-                    }
-                    .alert("启用联网配额？", isPresented: $showOnlineQuotaAlert) {
-                        Button("取消", role: .cancel) {}
-                        Button("启用") { settings.onlineQuota = true }
-                    } message: {
-                        Text("灵眸会读取各工具的本地登录令牌，并仅发送到对应厂商的 HTTPS 配额接口。令牌不会写入灵眸日志或缓存。")
-                    }
-                    divider
-                    settingRow("用量同步", detail: "多台设备共用一个目录（默认 iCloud Drive）汇总用量与活跃") {
-                        toggle($settings.usageSyncEnabled)
-                    }
-                    if settings.usageSyncEnabled {
-                        syncDetail
-                    }
-                }
-
-                section("通知") {
-                    settingRow("任务完成时提醒", detail: "工具从工作中转为空闲时推送") {
-                        toggle($settings.notifyEnabled)
-                    }
-                    if settings.notifyEnabled {
-                        notifyToolsGrid
-                    }
-                }
-
+                content()
                 Spacer(minLength: 2)
             }
             .padding(.horizontal, 24)
+            .padding(.top, 16)
             .padding(.bottom, 20)
         }
-        .frame(width: 470)
+    }
+
+    private var statusSection: some View {
+        section("状态判定") {
+            settingRow("进入空闲前无活动时长",
+                       detail: "任务结束后超过该时长仍无新活动，则显示空闲") {
+                valuePicker($settings.defaultSec,
+                            options: SettingsStore.busyOptions.map { (SettingsStore.labelSec($0), $0) })
+            }
+            divider
+            perToolBusyDisclosure
+            divider
+            settingRow("长时间无活动视为离线",
+                       detail: "进程仍在但持续无活动，超过该时长按未运行显示") {
+                valuePicker($settings.offlineAfterSec, options: SettingsStore.offlineOptions)
+            }
+        }
+    }
+
+    private var appearanceSection: some View {
+        section("外观") {
+            settingRow("桌面显示", detail: "桌宠会根据 AI 工具状态切换动作") {
+                modePicker($desktopPresentationMode, options: [
+                    ("桌面卡片", "card"), ("桌面宠物", "pet"), ("隐藏", "hidden"),
+                ])
+            }
+            divider
+            settingRow("面板配色", detail: "背景自适应按面板下方明暗自动反差") {
+                modePicker(appearanceModeBinding, options: [
+                    ("跟随系统", "system"), ("浅色", "light"),
+                    ("深色", "dark"), ("背景自适应", "adaptive"),
+                ])
+            }
+            .alert("需要录屏权限", isPresented: $showAdaptiveAlert) {
+                Button("取消", role: .cancel) {}
+                Button("同意并授权") {
+                    appearanceMode = "adaptive"
+                    (NSApp.delegate as? AppDelegate)?.requestScreenCaptureAccessIfNeeded()
+                }
+            } message: {
+                Text("背景自适应需要截取面板正下方一小块屏幕区域来判断明暗，因此需要录屏权限。截图只在内存中计算，不会保存或上传。")
+            }
+            divider
+            settingRow("在 Dock 中显示图标", detail: "默认仅驻留菜单栏") {
+                toggle($settings.showDockIcon)
+            }
+        }
+    }
+
+    private var dataSection: some View {
+        section("数据") {
+            // 联网配额默认开启，只向各工具自己的厂商接口发送对应令牌。
+            settingRow("查询账号配额",
+                       detail: "读取本地登录令牌，仅发送到对应厂商的配额接口") {
+                toggle(onlineQuotaBinding)
+            }
+            .alert("启用联网配额？", isPresented: $showOnlineQuotaAlert) {
+                Button("取消", role: .cancel) {}
+                Button("启用") { settings.onlineQuota = true }
+            } message: {
+                Text("灵眸会读取各工具的本地登录令牌，并仅发送到对应厂商的 HTTPS 配额接口。令牌不会写入灵眸日志或缓存。")
+            }
+            divider
+            settingRow("用量同步", detail: "多台设备共用一个目录（默认 iCloud Drive）汇总用量与活跃") {
+                toggle($settings.usageSyncEnabled)
+            }
+            if settings.usageSyncEnabled {
+                syncDetail
+            }
+        }
+    }
+
+    private var notifySection: some View {
+        section("通知") {
+            settingRow("任务完成时提醒", detail: "工具从工作中转为空闲时推送") {
+                toggle($settings.notifyEnabled)
+            }
+            if settings.notifyEnabled {
+                notifyToolsGrid
+            }
+        }
     }
 
     // MARK: 布局组件
@@ -1380,6 +1422,8 @@ struct SettingsView: View {
             Spacer()
         }
         .padding(.top, 34)  // 给红绿灯按钮留位
+        .padding(.bottom, 12)
+        .padding(.horizontal, 24)
     }
 
     /// 分区：小节标签 + 统一的圆角分组容器（替代旧的一事一卡，消解卡片标题噪音）
@@ -1638,6 +1682,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     private var glassView: NSView?  // macOS 26+ 的 NSGlassEffectView（用 NSView 声明避开可用性注解）
     private var store: StatusStore!
     private let settings = SettingsStore()
+    private let petCatalog = PetCatalog()
     private var settingsWindow: NSWindow?
     private var activityToken: NSObjectProtocol?  // App Nap 防护 token，app 生命周期内持有
     private var fullscreenAutoHidden = false  // 当前是否因检测到全屏 App 而自动隐藏（区别于用户手动隐藏）
@@ -2215,7 +2260,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// 这样展开卡片时不会让宠物本身突然缩放或跳位。
     private func buildPetPanel() {
         petHosting = DraggableHostingView(
-            rootView: PetView(store: store, settings: settings) { [weak self] in
+            rootView: PetView(store: store, settings: settings, catalog: petCatalog) { [weak self] in
                 self?.togglePetDetails()
             }
         )
@@ -2453,7 +2498,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             w.titlebarAppearsTransparent = true
             w.titleVisibility = .hidden
             w.isMovableByWindowBackground = true
-            w.contentView = NSHostingView(rootView: SettingsView(store: store, settings: settings))
+            w.contentView = NSHostingView(rootView: SettingsView(store: store, settings: settings, catalog: petCatalog))
             w.isReleasedWhenClosed = false
             w.center()
             settingsWindow = w
@@ -2541,7 +2586,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
     /// 构建桌面浮窗右键菜单（置顶切换 + 设置 + 退出）。复用 togglePin()/openSettings() 动作，
-    /// 与菜单栏下拉的"置顶桌面卡片"、"设置…"项保持同一套逻辑。
+    /// 与菜单栏下拉的"置顶桌面卡片"、"设置…"项保持同一套逻辑与图标。
     private func buildPanelContextMenu() -> NSMenu {
         let menu = NSMenu()
         if desktopPresentationMode == "pet" {
@@ -2550,6 +2595,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                 action: #selector(togglePetDetails),
                 keyEquivalent: "")
             collapseItem.target = self
+            collapseItem.image = symbol("minus.rectangle")
             menu.addItem(collapseItem)
         } else {
             let petItem = NSMenuItem(
@@ -2557,6 +2603,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                 action: #selector(selectPetMode),
                 keyEquivalent: "")
             petItem.target = self
+            petItem.image = symbol("pawprint")
             menu.addItem(petItem)
         }
         menu.addItem(.separator())
@@ -2567,12 +2614,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             action: #selector(togglePin),
             keyEquivalent: "")
         pinItem.target = self
+        pinItem.image = symbol("pin")
+        pinItem.state = pinned ? .on : .off
         menu.addItem(pinItem)
         let autoHideItem = NSMenuItem(
             title: "全屏时自动隐藏",
             action: #selector(toggleAutoHideFullscreen),
             keyEquivalent: "")
         autoHideItem.target = self
+        autoHideItem.image = symbol("arrow.up.left.and.arrow.down.right")
         autoHideItem.state = autoHideInFullscreenEnabled ? .on : .off
         menu.addItem(autoHideItem)
         let settingsItem = NSMenuItem(
@@ -2580,6 +2630,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             action: #selector(openSettings),
             keyEquivalent: "")
         settingsItem.target = self
+        settingsItem.image = symbol("gearshape")
         menu.addItem(settingsItem)
         menu.addItem(.separator())
         let quitItem = NSMenuItem(
@@ -2587,6 +2638,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             action: #selector(NSApplication.terminate(_:)),
             keyEquivalent: "")
         quitItem.target = NSApp
+        quitItem.image = symbol("power", color: .systemRed)
         menu.addItem(quitItem)
         return menu
     }
@@ -2598,12 +2650,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             action: #selector(togglePetDetails),
             keyEquivalent: "")
         detailsItem.target = self
+        detailsItem.image = symbol(petDetailsExpanded ? "minus.rectangle" : "plus.rectangle")
         menu.addItem(detailsItem)
         let cardItem = NSMenuItem(
             title: "切换到桌面卡片",
             action: #selector(selectCardMode),
             keyEquivalent: "")
         cardItem.target = self
+        cardItem.image = symbol("rectangle.on.rectangle")
         menu.addItem(cardItem)
         menu.addItem(.separator())
 
@@ -2614,12 +2668,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             action: #selector(togglePin),
             keyEquivalent: "")
         pinItem.target = self
+        pinItem.image = symbol("pin")
+        pinItem.state = pinned ? .on : .off
         menu.addItem(pinItem)
         let autoHideItem = NSMenuItem(
             title: "全屏时自动隐藏",
             action: #selector(toggleAutoHideFullscreen),
             keyEquivalent: "")
         autoHideItem.target = self
+        autoHideItem.image = symbol("arrow.up.left.and.arrow.down.right")
         autoHideItem.state = autoHideInFullscreenEnabled ? .on : .off
         menu.addItem(autoHideItem)
         let settingsItem = NSMenuItem(
@@ -2627,12 +2684,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             action: #selector(openSettings),
             keyEquivalent: "")
         settingsItem.target = self
+        settingsItem.image = symbol("gearshape")
         menu.addItem(settingsItem)
         let hideItem = NSMenuItem(
             title: "隐藏桌面显示",
             action: #selector(selectHiddenMode),
             keyEquivalent: "")
         hideItem.target = self
+        hideItem.image = symbol("eye.slash")
         menu.addItem(hideItem)
         menu.addItem(.separator())
         let quitItem = NSMenuItem(
@@ -2640,6 +2699,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             action: #selector(NSApplication.terminate(_:)),
             keyEquivalent: "")
         quitItem.target = NSApp
+        quitItem.image = symbol("power", color: .systemRed)
         menu.addItem(quitItem)
         return menu
     }

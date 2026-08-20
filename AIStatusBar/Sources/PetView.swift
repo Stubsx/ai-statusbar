@@ -1,22 +1,6 @@
 import Cocoa
 import SwiftUI
 
-enum PetAppearance: String, CaseIterable, Equatable {
-    case rem
-    case blueStarBunny = "blue-star-bunny"
-
-    init(settingValue: String) {
-        self = Self(rawValue: settingValue) ?? .rem
-    }
-
-    var displayName: String {
-        switch self {
-        case .rem: return "蕾姆"
-        case .blueStarBunny: return "蓝星兔"
-        }
-    }
-}
-
 // MARK: - 桌面宠物状态
 
 enum PetMood: Equatable {
@@ -36,47 +20,6 @@ enum PetMood: Equatable {
         if busyCount > 0 { return .working(taskCount: busyCount) }
         if data.tools.contains(where: { $0.state == "idle" }) { return .idle }
         return .sleeping
-    }
-
-    func resourceName(for appearance: PetAppearance) -> String {
-        switch appearance {
-        case .rem:
-            switch self {
-            case .loading: return "rem-loading-concept-v2"
-            case .working: return "rem-working-concept-v1"
-            case .idle: return "rem-idle-concept-v1"
-            case .sleeping: return "rem-sleeping-concept-v1"
-            case .celebrating: return "rem-celebrating-concept-v2"
-            case .error: return "rem-error-concept-v1"
-            }
-        case .blueStarBunny:
-            switch self {
-            case .loading: return "blue-star-bunny-loading"
-            case .working: return "blue-star-bunny-working"
-            case .idle: return "blue-star-bunny-idle"
-            case .sleeping: return "blue-star-bunny-sleeping"
-            case .celebrating: return "blue-star-bunny-celebrating"
-            case .error: return "blue-star-bunny-error"
-            }
-        }
-    }
-
-    /// 睡眠姿势本身已经闭眼，其余清醒姿势都有一张同构图的闭眼帧。
-    func blinkResourceName(for appearance: PetAppearance) -> String? {
-        switch self {
-        case .sleeping:
-            return nil
-        default:
-            return "\(resourceName(for: appearance))-blink"
-        }
-    }
-
-    func typingResourceNames(for appearance: PetAppearance) -> [String] {
-        if case .working = self {
-            let base = resourceName(for: appearance)
-            return ["\(base)-type-left", "\(base)-type-right"]
-        }
-        return []
     }
 
     var blinkDelayRange: ClosedRange<Double> {
@@ -116,6 +59,7 @@ enum PetMood: Equatable {
 struct PetView: View {
     @ObservedObject var store: StatusStore
     @ObservedObject var settings: SettingsStore
+    @ObservedObject var catalog: PetCatalog
     let onOpenDetails: () -> Void
 
     @State private var hovered = false
@@ -130,8 +74,9 @@ struct PetView: View {
         celebratingSerial > 0 ? .celebrating : liveMood
     }
 
-    private var appearance: PetAppearance {
-        PetAppearance(settingValue: settings.petAppearance)
+    /// 形象完全由目录数据驱动：内置 + ~/.ai-statusbar/Pets 下的自定义形象。
+    private var theme: PetTheme? {
+        catalog.currentTheme(id: settings.petAppearance)
     }
 
     /// 桌宠显示比例（设置里可调）。
@@ -191,7 +136,7 @@ struct PetView: View {
             }
 
             // 保持同一个 Sprite 实例，状态换图时沿用当前动画相位，避免动作重新起步。
-            PetSprite(mood: mood, appearance: appearance, scale: scale)
+            PetSprite(mood: mood, theme: theme, scale: scale)
         }
         .frame(width: s(220), height: s(270), alignment: .bottom)
         .contentShape(Rectangle())
@@ -217,9 +162,11 @@ struct PetView: View {
     }
 }
 
-private struct PetSprite: View {
+/// 设置里的形象编辑器也复用这个 Sprite 做实时预览，因此不能是 private。
+struct PetSprite: View {
     let mood: PetMood
-    let appearance: PetAppearance
+    /// nil（一个素材都没有）时显示占位图标。
+    let theme: PetTheme?
     let scale: CGFloat
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var animating = false
@@ -230,18 +177,18 @@ private struct PetSprite: View {
 
     private func s(_ v: CGFloat) -> CGFloat { v * scale }
 
-    private var displayedResourceName: String {
-        let baseName = mood.resourceName(for: appearance)
-        if blinking { return mood.blinkResourceName(for: appearance) ?? baseName }
-        let typingNames = mood.typingResourceNames(for: appearance)
-        if typingFrame > 0, typingNames.indices.contains(typingFrame - 1) {
-            return typingNames[typingFrame - 1]
+    private var displayedImageURL: URL? {
+        guard let theme else { return nil }
+        if blinking, let blinkURL = theme.blinkURL(for: mood) { return blinkURL }
+        let typingURLs = theme.typingURLs(for: mood)
+        if typingFrame > 0, typingURLs.indices.contains(typingFrame - 1) {
+            return typingURLs[typingFrame - 1]
         }
-        return baseName
+        return theme.imageURL(for: mood)
     }
 
     private var image: NSImage {
-        if let image = PetImageCache.image(named: displayedResourceName) {
+        if let url = displayedImageURL, let image = PetImageCache.image(at: url) {
             return image
         }
         return NSImage(systemSymbolName: "eye.fill", accessibilityDescription: nil) ?? NSImage()
@@ -258,7 +205,7 @@ private struct PetSprite: View {
                 .scaledToFit()
                 .frame(width: s(200), height: s(226))
                 // 只替换 Image 实例，并禁用默认交叉淡化；否则两种姿势会短暂叠在一起。
-                .id(displayedResourceName)
+                .id(displayedImageURL)
                 .transition(.identity)
                 .transaction { transaction in
                     transaction.disablesAnimations = true
@@ -300,8 +247,8 @@ private struct PetSprite: View {
         .frame(width: s(210), height: s(232))
         .onAppear {
             startAnimations()
-            restartBlinking(mood, appearance: appearance)
-            restartTyping(mood, appearance: appearance)
+            restartBlinking(mood, theme: theme)
+            restartTyping(mood, theme: theme)
         }
         .onDisappear {
             blinkTask?.cancel()
@@ -314,17 +261,17 @@ private struct PetSprite: View {
         // 必须把回传的新 mood 显式传给动画启动函数。
         .onChange(of: mood) { newMood in
             restartAnimations()
-            restartBlinking(newMood, appearance: appearance)
-            restartTyping(newMood, appearance: appearance)
+            restartBlinking(newMood, theme: theme)
+            restartTyping(newMood, theme: theme)
         }
-        .onChange(of: appearance) { newAppearance in
+        .onChange(of: theme) { newTheme in
             restartAnimations()
-            restartBlinking(mood, appearance: newAppearance)
-            restartTyping(mood, appearance: newAppearance)
+            restartBlinking(mood, theme: newTheme)
+            restartTyping(mood, theme: newTheme)
         }
         .onChange(of: reduceMotion) { _ in
-            restartBlinking(mood, appearance: appearance)
-            restartTyping(mood, appearance: appearance)
+            restartBlinking(mood, theme: theme)
+            restartTyping(mood, theme: theme)
         }
     }
 
@@ -341,15 +288,17 @@ private struct PetSprite: View {
     }
 
     /// 每轮用 0...99 随机数选择短眨、慢眨或双眨；图片切换禁用动画，避免重影。
-    private func restartBlinking(_ activeMood: PetMood, appearance: PetAppearance) {
+    private func restartBlinking(_ activeMood: PetMood, theme: PetTheme?) {
         blinkTask?.cancel()
         blinkTask = nil
         setBlinking(false)
         guard !reduceMotion,
-              let blinkName = activeMood.blinkResourceName(for: appearance)
+              let theme,
+              let blinkURL = theme.blinkURL(for: activeMood),
+              let baseURL = theme.imageURL(for: activeMood)
         else { return }
 
-        PetImageCache.preload(names: [activeMood.resourceName(for: appearance), blinkName])
+        PetImageCache.preload(urls: [baseURL, blinkURL])
         blinkTask = Task { @MainActor in
             var firstCycle = true
             while !Task.isCancelled {
@@ -411,14 +360,15 @@ private struct PetSprite: View {
     }
 
     /// 工作状态随机连敲 3～8 下，再停顿片刻；眨眼时手会自然回到中间帧。
-    private func restartTyping(_ activeMood: PetMood, appearance: PetAppearance) {
+    private func restartTyping(_ activeMood: PetMood, theme: PetTheme?) {
         typingTask?.cancel()
         typingTask = nil
         setTypingFrame(0)
-        let typingNames = activeMood.typingResourceNames(for: appearance)
-        guard !reduceMotion, !typingNames.isEmpty else { return }
+        guard !reduceMotion, let theme else { return }
+        let typingURLs = theme.typingURLs(for: activeMood)
+        guard !typingURLs.isEmpty else { return }
 
-        PetImageCache.preload(names: [activeMood.resourceName(for: appearance)] + typingNames)
+        PetImageCache.preload(urls: [theme.imageURL(for: activeMood)].compactMap { $0 } + typingURLs)
         typingTask = Task { @MainActor in
             guard await pause(seconds: Double.random(in: 0.30...0.70)) else { return }
             while !Task.isCancelled {
@@ -449,23 +399,24 @@ private struct PetSprite: View {
 }
 
 /// NSImage(contentsOf:) 首次解码可能让短促的闭眼帧漏掉；缓存后再启动眨眼循环。
-private enum PetImageCache {
-    private static let cache = NSCache<NSString, NSImage>()
+/// 画廊/编辑器也用它读缩略图，因此不能是 private。
+enum PetImageCache {
+    private static let cache = NSCache<NSURL, NSImage>()
 
-    static func image(named name: String) -> NSImage? {
-        let key = name as NSString
-        if let cached = cache.object(forKey: key) { return cached }
-        guard let url = Bundle.main.url(
-            forResource: name,
-            withExtension: "png",
-            subdirectory: "Pet/concepts"
-        ), let image = NSImage(contentsOf: url) else { return nil }
-        cache.setObject(image, forKey: key)
+    static func image(at url: URL) -> NSImage? {
+        if let cached = cache.object(forKey: url as NSURL) { return cached }
+        guard let image = NSImage(contentsOf: url) else { return nil }
+        cache.setObject(image, forKey: url as NSURL)
         return image
     }
 
-    static func preload(names: [String]) {
-        for name in names { _ = image(named: name) }
+    /// 编辑器覆盖/清空槽位后按路径失效缓存，否则预览会继续显示旧图。
+    static func remove(at url: URL) {
+        cache.removeObject(forKey: url as NSURL)
+    }
+
+    static func preload(urls: [URL]) {
+        for url in urls { _ = image(at: url) }
     }
 }
 
