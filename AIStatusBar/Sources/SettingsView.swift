@@ -213,6 +213,11 @@ struct SettingsView: View {
         }
         .onAppear { refreshNotifyAuth() }
         .onChange(of: settings.notifyEnabled) { _ in refreshNotifyAuth() }
+        // 用户去系统设置改完授权后回到本窗口，App 重新激活时刷新状态行
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didBecomeActiveNotification)) { _ in
+            refreshNotifyAuth()
+        }
     }
 
     // MARK: 通知系统授权
