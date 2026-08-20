@@ -11,6 +11,7 @@ __pycache__/
 .build/
 DerivedData/
 dist/
+output/
 AIStatusBar/AIStatusBar.app/
 AIStatusBar/灵眸.app/
 .vscode/

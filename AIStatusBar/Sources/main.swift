@@ -166,6 +166,7 @@ final class SettingsStore: ObservableObject {
     static let busyOptions = [60, 180, 300, 600, 900, 1800]
     static let offlineOptions: [(String, Int)] = [("1 小时", 3600), ("2 小时", 7200), ("3 小时", 10800),
                                                   ("6 小时", 21600), ("12 小时", 43200), ("从不", 0)]
+    static let petAppearanceOptions = PetAppearance.allCases.map { ($0.displayName, $0.rawValue) }
 
     @Published var defaultSec = 300 { didSet { save() } }
     @Published var perTool: [String: Int] = [:] { didSet { save() } }
@@ -180,6 +181,7 @@ final class SettingsStore: ObservableObject {
     }
     @Published var notifyTools: [String: Bool] = [:] { didSet { save() } }
     @Published var showDockIcon = false { didSet { save(); applyDockIconPolicy() } }
+    @Published var petAppearance = PetAppearance.rem.rawValue { didSet { save() } }
     @Published var onlineQuota = true { didSet { save() } }
     /// 用量同步：多设备通过共享目录汇总用量/活跃；空目录 = iCloud Drive 默认目录
     @Published var usageSyncEnabled = false { didSet { save() } }
@@ -217,6 +219,11 @@ final class SettingsStore: ObservableObject {
             if let t = n["tools"] as? [String: Bool] { notifyTools = t }
         }
         if let v = obj["show_dock_icon"] as? Bool { showDockIcon = v }
+        if let value = obj["pet_appearance"] as? String,
+           PetAppearance(rawValue: value) != nil
+        {
+            petAppearance = value
+        }
         if let v = obj["online_quota"] as? Bool { onlineQuota = v }
         if let s = obj["usage_sync"] as? [String: Any] {
             if let v = s["enabled"] as? Bool { usageSyncEnabled = v }
@@ -231,6 +238,7 @@ final class SettingsStore: ObservableObject {
             "offline_after_sec": offlineAfterSec,
             "notify": ["enabled": notifyEnabled, "tools": notifyTools],
             "show_dock_icon": showDockIcon,
+            "pet_appearance": petAppearance,
             "online_quota": onlineQuota,
             "usage_sync": ["enabled": usageSyncEnabled, "dir": usageSyncDir],
         ]
@@ -1113,6 +1121,18 @@ struct SettingsView: View {
                         modePicker($desktopPresentationMode, options: [
                             ("桌面卡片", "card"), ("桌面宠物", "pet"), ("隐藏", "hidden"),
                         ])
+                    }
+                    divider
+                    settingRow("桌宠形象", detail: "切换后各状态动作会立即更新") {
+                        Picker("", selection: $settings.petAppearance) {
+                            ForEach(SettingsStore.petAppearanceOptions, id: \.1) { label, value in
+                                Text(label).tag(value)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                        .controlSize(.regular)
+                        .frame(width: 128, alignment: .trailing)
                     }
                     divider
                     settingRow("面板配色", detail: "背景自适应按面板下方明暗自动反差") {
@@ -1998,7 +2018,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 这样展开卡片时不会让宠物本身突然缩放或跳位。
     private func buildPetPanel() {
         petHosting = DraggableHostingView(
-            rootView: PetView(store: store) { [weak self] in
+            rootView: PetView(store: store, settings: settings) { [weak self] in
                 self?.togglePetDetails()
             }
         )

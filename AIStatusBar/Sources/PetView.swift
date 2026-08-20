@@ -1,6 +1,22 @@
 import Cocoa
 import SwiftUI
 
+enum PetAppearance: String, CaseIterable, Equatable {
+    case rem
+    case blueStarBunny = "blue-star-bunny"
+
+    init(settingValue: String) {
+        self = Self(rawValue: settingValue) ?? .rem
+    }
+
+    var displayName: String {
+        switch self {
+        case .rem: return "蕾姆"
+        case .blueStarBunny: return "蓝星兔"
+        }
+    }
+}
+
 // MARK: - 桌面宠物状态
 
 enum PetMood: Equatable {
@@ -22,30 +38,43 @@ enum PetMood: Equatable {
         return .sleeping
     }
 
-    var resourceName: String {
-        switch self {
-        case .loading: return "rem-loading-concept-v2"
-        case .working: return "rem-working-concept-v1"
-        case .idle: return "rem-idle-concept-v1"
-        case .sleeping: return "rem-sleeping-concept-v1"
-        case .celebrating: return "rem-celebrating-concept-v2"
-        case .error: return "rem-error-concept-v1"
+    func resourceName(for appearance: PetAppearance) -> String {
+        switch appearance {
+        case .rem:
+            switch self {
+            case .loading: return "rem-loading-concept-v2"
+            case .working: return "rem-working-concept-v1"
+            case .idle: return "rem-idle-concept-v1"
+            case .sleeping: return "rem-sleeping-concept-v1"
+            case .celebrating: return "rem-celebrating-concept-v2"
+            case .error: return "rem-error-concept-v1"
+            }
+        case .blueStarBunny:
+            switch self {
+            case .loading: return "blue-star-bunny-loading"
+            case .working: return "blue-star-bunny-working"
+            case .idle: return "blue-star-bunny-idle"
+            case .sleeping: return "blue-star-bunny-sleeping"
+            case .celebrating: return "blue-star-bunny-celebrating"
+            case .error: return "blue-star-bunny-error"
+            }
         }
     }
 
     /// 睡眠姿势本身已经闭眼，其余清醒姿势都有一张同构图的闭眼帧。
-    var blinkResourceName: String? {
+    func blinkResourceName(for appearance: PetAppearance) -> String? {
         switch self {
         case .sleeping:
             return nil
         default:
-            return "\(resourceName)-blink"
+            return "\(resourceName(for: appearance))-blink"
         }
     }
 
-    var typingResourceNames: [String] {
+    func typingResourceNames(for appearance: PetAppearance) -> [String] {
         if case .working = self {
-            return ["\(resourceName)-type-left", "\(resourceName)-type-right"]
+            let base = resourceName(for: appearance)
+            return ["\(base)-type-left", "\(base)-type-right"]
         }
         return []
     }
@@ -86,6 +115,7 @@ enum PetMood: Equatable {
 
 struct PetView: View {
     @ObservedObject var store: StatusStore
+    @ObservedObject var settings: SettingsStore
     let onOpenDetails: () -> Void
 
     @State private var hovered = false
@@ -98,6 +128,10 @@ struct PetView: View {
 
     private var mood: PetMood {
         celebratingSerial > 0 ? .celebrating : liveMood
+    }
+
+    private var appearance: PetAppearance {
+        PetAppearance(settingValue: settings.petAppearance)
     }
 
     var body: some View {
@@ -148,7 +182,7 @@ struct PetView: View {
             }
 
             // 保持同一个 Sprite 实例，状态换图时沿用当前动画相位，避免动作重新起步。
-            PetSprite(mood: mood)
+            PetSprite(mood: mood, appearance: appearance)
         }
         .frame(width: 220, height: 270, alignment: .bottom)
         .contentShape(Rectangle())
@@ -176,6 +210,7 @@ struct PetView: View {
 
 private struct PetSprite: View {
     let mood: PetMood
+    let appearance: PetAppearance
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var animating = false
     @State private var blinking = false
@@ -184,12 +219,13 @@ private struct PetSprite: View {
     @State private var typingTask: Task<Void, Never>?
 
     private var displayedResourceName: String {
-        if blinking { return mood.blinkResourceName ?? mood.resourceName }
-        let typingNames = mood.typingResourceNames
+        let baseName = mood.resourceName(for: appearance)
+        if blinking { return mood.blinkResourceName(for: appearance) ?? baseName }
+        let typingNames = mood.typingResourceNames(for: appearance)
         if typingFrame > 0, typingNames.indices.contains(typingFrame - 1) {
             return typingNames[typingFrame - 1]
         }
-        return mood.resourceName
+        return baseName
     }
 
     private var image: NSImage {
@@ -252,8 +288,8 @@ private struct PetSprite: View {
         .frame(width: 210, height: 232)
         .onAppear {
             startAnimations()
-            restartBlinking(mood)
-            restartTyping(mood)
+            restartBlinking(mood, appearance: appearance)
+            restartTyping(mood, appearance: appearance)
         }
         .onDisappear {
             blinkTask?.cancel()
@@ -266,12 +302,17 @@ private struct PetSprite: View {
         // 必须把回传的新 mood 显式传给动画启动函数。
         .onChange(of: mood) { newMood in
             restartAnimations()
-            restartBlinking(newMood)
-            restartTyping(newMood)
+            restartBlinking(newMood, appearance: appearance)
+            restartTyping(newMood, appearance: appearance)
+        }
+        .onChange(of: appearance) { newAppearance in
+            restartAnimations()
+            restartBlinking(mood, appearance: newAppearance)
+            restartTyping(mood, appearance: newAppearance)
         }
         .onChange(of: reduceMotion) { _ in
-            restartBlinking(mood)
-            restartTyping(mood)
+            restartBlinking(mood, appearance: appearance)
+            restartTyping(mood, appearance: appearance)
         }
     }
 
@@ -288,13 +329,15 @@ private struct PetSprite: View {
     }
 
     /// 每轮用 0...99 随机数选择短眨、慢眨或双眨；图片切换禁用动画，避免重影。
-    private func restartBlinking(_ activeMood: PetMood) {
+    private func restartBlinking(_ activeMood: PetMood, appearance: PetAppearance) {
         blinkTask?.cancel()
         blinkTask = nil
         setBlinking(false)
-        guard !reduceMotion, let blinkName = activeMood.blinkResourceName else { return }
+        guard !reduceMotion,
+              let blinkName = activeMood.blinkResourceName(for: appearance)
+        else { return }
 
-        PetImageCache.preload(names: [activeMood.resourceName, blinkName])
+        PetImageCache.preload(names: [activeMood.resourceName(for: appearance), blinkName])
         blinkTask = Task { @MainActor in
             var firstCycle = true
             while !Task.isCancelled {
@@ -356,14 +399,14 @@ private struct PetSprite: View {
     }
 
     /// 工作状态随机连敲 3～8 下，再停顿片刻；眨眼时手会自然回到中间帧。
-    private func restartTyping(_ activeMood: PetMood) {
+    private func restartTyping(_ activeMood: PetMood, appearance: PetAppearance) {
         typingTask?.cancel()
         typingTask = nil
         setTypingFrame(0)
-        let typingNames = activeMood.typingResourceNames
+        let typingNames = activeMood.typingResourceNames(for: appearance)
         guard !reduceMotion, !typingNames.isEmpty else { return }
 
-        PetImageCache.preload(names: [activeMood.resourceName] + typingNames)
+        PetImageCache.preload(names: [activeMood.resourceName(for: appearance)] + typingNames)
         typingTask = Task { @MainActor in
             guard await pause(seconds: Double.random(in: 0.30...0.70)) else { return }
             while !Task.isCancelled {
