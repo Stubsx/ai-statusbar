@@ -1,5 +1,6 @@
 import Cocoa
 import Combine
+import QuartzCore
 import SwiftUI
 import UserNotifications
 import ScreenCaptureKit
@@ -1814,6 +1815,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
     private var appearanceCaptureGeneration: UInt = 0  // 丢弃异步返回的过期截图
     private var adaptiveAppearanceName: NSAppearance.Name?  // 滞回区内保持上次自适应判定
+    private var appearanceTransitionToken = 0  // 外观过渡进行中又来了新切换时，作废旧的淡入回调
 
     /// 调试日志：往 ~/.ai-statusbar/adapt-debug.log 追加一行（ISO 时间戳 + 消息），异常静默
     private func adaptLog(_ msg: String) {
@@ -1863,11 +1865,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
 
     /// 同步设置 SwiftUI、窗口和玻璃容器。macOS 26 的玻璃只改 appearance 不保证底色有足够反差，
     /// 因此深/浅外观同时给玻璃加方向一致的 tint；system 模式仍保留系统原生无 tint 行为。
+    ///
+    /// 过渡策略：内容透明度做一次"下潜再浮起"的关键帧动画（1 → 谷底 → 1），
+    /// 外观切换安排在接近谷底时执行——此刻文字几乎不可见，避免新旧配色重影。
+    /// 关键点：CA 动画提交后由 render server 独立驱动，主线程在切换外观时的
+    /// 整帧 SwiftUI 重绘不会打断它；之前用 NSAnimationContext completion 链分两段，
+    /// 接缝恰好落在重绘上，动画会卡一拍（掉帧感的来源）。
     private func setPanelAppearance(_ name: NSAppearance.Name?) {
         let appearance = name.flatMap { NSAppearance(named: $0) }
-        if hosting.appearance?.name != name { hosting.appearance = appearance }
-        if panel.appearance?.name != name { panel.appearance = appearance }
-        if glassView?.appearance?.name != name { glassView?.appearance = appearance }
+        let unchanged = hosting.appearance?.name == name
+            && panel.appearance?.name == name
+            && glassView?.appearance?.name == name
+        guard !unchanged else { return }
+
+        appearanceTransitionToken &+= 1
+        let token = appearanceTransitionToken
+        guard let host = hosting, let layer = host.layer else {
+            writePanelAppearance(name, appearance: appearance)
+            return
+        }
+
+        let dip = CAKeyframeAnimation(keyPath: "opacity")
+        // 0.45s：下潜 0.13s + 谷底停留 0.05s + 浮起 0.26s。
+        // 谷底短暂停留让外观切换更从容，整体读感是柔和的呼吸而不是快速眨眼。
+        dip.values = [1.0, 0.06, 0.06, 1.0]
+        dip.keyTimes = [0, 0.30, 0.42, 1]
+        dip.duration = 0.45
+        dip.timingFunctions = [
+            CAMediaTimingFunction(name: .easeIn),
+            CAMediaTimingFunction(name: .linear),
+            CAMediaTimingFunction(name: .easeOut),
+        ]
+        layer.add(dip, forKey: "panelAppearanceDip")
+
+        // 0.16s 时透明度正处谷底平台（动画仍在 render server 上连续推进），
+        // 此刻切外观并让底色做一次短插值，回升段与底色渐变重叠。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) { [weak self] in
+            guard let self, token == self.appearanceTransitionToken else { return }
+            let oldBackground = layer.backgroundColor
+            self.writePanelAppearance(name, appearance: appearance)
+            if let newBackground = layer.backgroundColor, newBackground != oldBackground {
+                let anim = CABasicAnimation(keyPath: "backgroundColor")
+                anim.fromValue = oldBackground
+                anim.toValue = newBackground
+                anim.duration = 0.28
+                anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                // 模型值已是终值，动画只负责呈现层从旧色到新色的插值
+                layer.add(anim, forKey: "panelBackgroundFade")
+            }
+        }
+    }
+
+    private func writePanelAppearance(_ name: NSAppearance.Name?, appearance: NSAppearance?) {
+        hosting.appearance = appearance
+        panel.appearance = appearance
+        glassView?.appearance = appearance
         #if compiler(>=6.2)
         if #available(macOS 26.0, *), let glass = glassView as? NSGlassEffectView {
             switch name {
