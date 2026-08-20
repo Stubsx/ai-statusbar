@@ -357,7 +357,7 @@ final class StatusStore: ObservableObject {
                 completedEventMessage = "\(t.name) 完成了任务"
                 completedEventSerial &+= 1
                 if settings.notifyEnabled(for: skey) {
-                    notify(tool: t.name, finished: titles.map { $0.isEmpty ? "(任务)" : $0 })
+                    notify(tool: t.name, key: t.key, finished: titles.map { $0.isEmpty ? "(任务)" : $0 })
                 }
             }
             missingRounds[t.key] = missing
@@ -367,15 +367,155 @@ final class StatusStore: ObservableObject {
         }
     }
 
-    private func notify(tool: String, finished: [String]) {
+    private func notify(tool: String, key: String, finished: [String]) {
         let content = UNMutableNotificationContent()
         content.title = "\(tool) 进入空闲"
         var body = "已完成：" + finished.joined(separator: "、")
         if body.count > 120 { body = String(body.prefix(119)) + "…" }
         content.body = body
         content.sound = .default
+        content.userInfo = ["tool": key]  // 点击通知时据此跳转对应 App / 宿主终端
         UNUserNotificationCenter.current().add(
             UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+    }
+}
+
+// MARK: - 通知点击路由：跳到对应工具的 App 或宿主终端
+
+/// "任务完成"通知被点击后的跳转规则：
+/// - App 型工具（ZCode / Codex App / Kimi Work）激活对应应用，未运行则从 /Applications 拉起；
+/// - CLI 型工具（Codex CLI / Kimi Code）回到跑着该进程的宿主终端——沿进程父链向上
+///   找最近的 regular GUI 应用，编辑器内置终端（VS Code/Cursor）里的会话也能回到正确窗口。
+/// 找不到宿主（CLI 已退出，或跑在 tmux 等脱离终端的服务端下）时不动作，保持默认行为。
+enum NotificationRouter {
+    /// 与 collector 的 Codex CLI 判定同一套排除串：ChatGPT/Codex App 与编辑器
+    /// 扩展托管的 codex app-server / mcp-server 不算终端会话。
+    private static let hostedCodexMarks = ["ChatGPT.app/", "Codex.app/", "app-server", "mcp-server"]
+
+    static func openDestination(forToolKey key: String) {
+        DispatchQueue.main.async {
+            switch key {
+            case "zcode":
+                if activateRunningApp(named: ["ZCode"]) { return }
+                if let terminal = hostTerminal(of: "zcode-cli") { activate(terminal); return }
+                openApplication(bundleID: "dev.zcode.app", path: "/Applications/ZCode.app")
+            case "codex-ide":
+                // Codex 桌面体验可能跑在 Codex.app 或 ChatGPT.app 里，激活正在运行的那个
+                if activateRunningApp(named: ["Codex", "ChatGPT"]) { return }
+                openApplication(bundleID: "com.openai.codex", path: "/Applications/Codex.app")
+            case "kimi-work":
+                if activateRunningApp(named: ["Kimi"]) { return }
+                openApplication(bundleID: nil, path: "/Applications/Kimi.app")
+            case "codex-cli":
+                if let terminal = hostTerminal(of: "codex", excluding: hostedCodexMarks) {
+                    activate(terminal)
+                }
+            case "kimi":
+                if let terminal = hostTerminal(of: "kimi") { activate(terminal) }
+            default:
+                break
+            }
+        }
+    }
+
+    private static func activateRunningApp(named names: [String]) -> Bool {
+        let running = NSWorkspace.shared.runningApplications
+        for name in names {
+            if let app = running.first(where: {
+                $0.activationPolicy == .regular && $0.localizedName == name
+            }) {
+                activate(app)
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func activate(_ app: NSRunningApplication) {
+        if #available(macOS 14, *) {
+            app.activate()
+        } else {
+            app.activate(options: [])
+        }
+    }
+
+    /// 未运行时拉起。Codex.app 与 ChatGPT.app 的 bundle id 同为 com.openai.codex，
+    /// 按 bundle id 解析可能命中另一个，所以优先固定路径，找不到再交给 LaunchServices。
+    private static func openApplication(bundleID: String?, path: String) {
+        if FileManager.default.fileExists(atPath: path) {
+            NSWorkspace.shared.openApplication(
+                at: URL(fileURLWithPath: path), configuration: NSWorkspace.OpenConfiguration())
+            return
+        }
+        if let bundleID,
+            let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
+        {
+            NSWorkspace.shared.openApplication(
+                at: url, configuration: NSWorkspace.OpenConfiguration())
+        }
+    }
+
+    /// 跑着指定 CLI 进程的宿主 GUI 应用：按可执行名筛出目标进程，再沿父进程链
+    /// 向上找最近的 regular App（终端或编辑器）。进程匹配语义与 collector 的
+    /// CLI 判定一致，避免误把 App/无头服务托管的进程当作终端会话。
+    private static func hostTerminal(
+        of processName: String, excluding: [String] = []
+    ) -> NSRunningApplication? {
+        guard let lines = psLines() else { return nil }
+        let appByPid = Dictionary(
+            NSWorkspace.shared.runningApplications
+                .filter { $0.activationPolicy == .regular }
+                .map { ($0.processIdentifier, $0) },
+            uniquingKeysWith: { first, _ in first })
+        let parents = Dictionary(
+            lines.map { ($0.pid, $0.ppid) }, uniquingKeysWith: { first, _ in first })
+        for line in lines where isCLI(line.args, named: processName, excluding: excluding) {
+            var cursor = line.ppid
+            while cursor > 1 {
+                if let app = appByPid[cursor] { return app }
+                cursor = parents[cursor] ?? 0
+            }
+        }
+        return nil
+    }
+
+    /// 与 collector ProcessSupport.count 同语义：剥掉前导环境变量赋值后按可执行
+    /// 文件名匹配；整行含排除串（如 app-server 托管进程）则跳过。
+    private static func isCLI(_ args: String, named name: String, excluding: [String]) -> Bool {
+        var tokens = args.split(separator: " ").map(String.init)
+        while let first = tokens.first, first.contains("=") && !first.hasPrefix("/") {
+            tokens.removeFirst()
+        }
+        guard let executable = tokens.first,
+            URL(fileURLWithPath: executable).lastPathComponent == name,
+            !excluding.contains(where: args.contains)
+        else { return false }
+        return true
+    }
+
+    private static func psLines() -> [(pid: pid_t, ppid: pid_t, args: String)]? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-eo", "pid=,ppid=,args="]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        var lines: [(pid: pid_t, ppid: pid_t, args: String)] = []
+        for raw in String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline) {
+            let fields = raw.split(separator: " ", maxSplits: 2).map(String.init)
+            guard fields.count == 3, let pid = Int32(fields[0]), let ppid = Int32(fields[1]) else {
+                continue
+            }
+            lines.append((pid, ppid, fields[2]))
+        }
+        return lines
     }
 }
 
@@ -1462,7 +1602,9 @@ struct SettingsView: View {
 
 // MARK: - AppDelegate
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
+    UNUserNotificationCenterDelegate
+{
     private var statusItem: NSStatusItem!
     private var panel: NSPanel!
     private var hosting: DraggableHostingView<PanelView>!
@@ -1478,6 +1620,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var petDetailsExpanded = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 通知 delegate 在启动时设置，托管横幅点击回调（跳转对应工具）
+        UNUserNotificationCenter.current().delegate = self
         let collectorPath = Bundle.main.path(forResource: "lingmou-collector", ofType: nil)
         store = StatusStore(collectorPath: collectorPath, settings: settings)
 
@@ -1497,6 +1641,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         activityToken = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiated, .suddenTerminationDisabled, .automaticTerminationDisabled],
             reason: "面板背景采样定时器")
+    }
+
+    // MARK: 通知点击路由
+
+    /// 点击"任务完成"通知时跳到对应工具：App 型激活对应应用，
+    /// CLI 型（Codex CLI / Kimi Code）回到跑着该进程的终端/编辑器窗口。
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        if response.actionIdentifier == UNNotificationDefaultActionIdentifier,
+            let key = response.notification.request.content.userInfo["tool"] as? String
+        {
+            NotificationRouter.openDestination(forToolKey: key)
+        }
+        completionHandler()
+    }
+
+    /// 灵眸面板/设置恰好在前台时也照常弹横幅，避免操作面板时错过完成通知
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .list, .sound])
     }
 
     // MARK: 菜单栏标题
