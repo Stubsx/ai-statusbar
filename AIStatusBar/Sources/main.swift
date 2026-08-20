@@ -828,10 +828,14 @@ struct PanelView: View {
                     .padding(.bottom, 5)
                 usageRow("总计", entries.total, bold: true)
                 Divider().background(Color.primary.opacity(0.1))
-                ForEach(["codex", "kimi", "kimi-work", "claude", "zcode", "hermes"], id: \.self) { key in
-                    if let e = entries.tools[key] {
-                        usageRow(usageName(key), e, bold: false)
-                    }
+                // 按工具总用量（输入+缓存+输出）从高到低排序
+                let sortedTools = entries.tools.sorted { lhs, rhs in
+                    let l = lhs.value.input + lhs.value.output + lhs.value.cache
+                    let r = rhs.value.input + rhs.value.output + rhs.value.cache
+                    return l > r
+                }
+                ForEach(sortedTools, id: \.key) { key, e in
+                    usageRow(usageName(key), e, bold: false)
                 }
                 syncSummary
             } else {
