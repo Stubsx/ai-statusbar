@@ -30,6 +30,9 @@ final class SettingsStore: ObservableObject {
     @Published var showDockIcon = false { didSet { save(); applyDockIconPolicy() } }
     @Published var petAppearance = PetCatalog.defaultThemeID { didSet { save() } }
     @Published var petScale = 1.0 { didSet { save() } }
+    /// 自定义形象素材库目录；空 = 默认本地目录 ~/.ai-statusbar/Pets。
+    /// 指到 iCloud Drive 下的文件夹即可在多台 Mac 间同步形象（由系统 iCloud Drive 负责同步）。
+    @Published var petLibraryDir = "" { didSet { save() } }
     @Published var onlineQuota = true { didSet { save() } }
     /// 用量同步：多设备通过共享目录汇总用量/活跃；空目录 = iCloud Drive 默认目录
     @Published var usageSyncEnabled = false { didSet { save() } }
@@ -72,6 +75,7 @@ final class SettingsStore: ObservableObject {
         // 形象 id 是开放的（内置 + 用户自定义），这里不做白名单校验；
         // 形象缺失时由 PetCatalog.currentTheme 回退到默认形象。
         if let value = obj["pet_appearance"] as? String { petAppearance = value }
+        if let v = obj["pet_library_dir"] as? String { petLibraryDir = v }
         if let v = obj["pet_scale"] as? Double {
             petScale = min(max(v, SettingsStore.petScaleRange.lowerBound),
                            SettingsStore.petScaleRange.upperBound)
@@ -92,6 +96,7 @@ final class SettingsStore: ObservableObject {
             "notify": ["enabled": notifyEnabled, "tools": notifyTools],
             "show_dock_icon": showDockIcon,
             "pet_appearance": petAppearance,
+            "pet_library_dir": petLibraryDir,
             "pet_scale": petScale,
             "online_quota": onlineQuota,
             "usage_sync": ["enabled": usageSyncEnabled, "dir": usageSyncDir],

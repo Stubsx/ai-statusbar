@@ -21,7 +21,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     private var glassView: NSView?  // macOS 26+ 的 NSGlassEffectView（用 NSView 声明避开可用性注解）
     private var store: StatusStore!
     private let settings = SettingsStore()
-    private let petCatalog = PetCatalog()
+    /// 素材库目录跟随设置（默认本机 ~/.ai-statusbar/Pets，可指到 iCloud Drive 文件夹）。
+    private lazy var petCatalog = PetCatalog(
+        userPetsDirectory: PetCatalog.effectiveUserPetsDirectory(configuredPath: settings.petLibraryDir)
+    )
     private var settingsWindow: NSWindow?
     private var activityToken: NSObjectProtocol?  // App Nap 防护 token，app 生命周期内持有
     private var fullscreenAutoHidden = false  // 当前是否因检测到全屏 App 而自动隐藏（区别于用户手动隐藏）

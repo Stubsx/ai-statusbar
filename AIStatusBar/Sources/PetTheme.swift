@@ -188,6 +188,22 @@ enum PetThemeStore {
             .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
             .compactMap { loadTheme(folder: $0, isBuiltIn: isBuiltIn) }
     }
+
+    /// 在解压根目录里定位装着槽位素材的文件夹：优先根目录本身，其次一层子目录
+    /// （Finder 打包通常套一层同名文件夹；跳过 __MACOSX 与隐藏目录）。找不到返回 nil。
+    static func locateAssetFolder(root: URL) -> URL? {
+        let fm = FileManager.default
+        if loadTheme(folder: root, isBuiltIn: false) != nil { return root }
+        guard let dirs = try? fm.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return nil }
+        return dirs
+            .filter { $0.lastPathComponent != "__MACOSX" }
+            .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+            .first { loadTheme(folder: $0, isBuiltIn: false) != nil }
+    }
 }
 
 // MARK: - 形象目录管理（内置 + 用户自定义）
@@ -202,15 +218,41 @@ struct PetEditorContext: Identifiable {
 
 final class PetCatalog: ObservableObject {
     static let defaultThemeID = "rem"
-    /// 用户自定义形象目录：与 settings.json 同级，app 更新不丢失，也不影响代码签名。
+    /// 用户自定义形象目录（默认）：与 settings.json 同级，app 更新不丢失，也不影响代码签名。
     static let defaultUserPetsDirectory = URL(
         fileURLWithPath: NSHomeDirectory() + "/.ai-statusbar/Pets", isDirectory: true
     )
 
+    /// iCloud Drive 根目录。App 未沙盒、也未启用 iCloud 容器，走普通文件夹：
+    /// 把素材库放进 CloudDocs 下的文件夹，由系统 iCloud Drive 完成多设备同步。
+    static var iCloudDriveRoot: URL? {
+        let url = URL(
+            fileURLWithPath: NSHomeDirectory() + "/Library/Mobile Documents/com~apple~CloudDocs",
+            isDirectory: true
+        )
+        var isDir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) && isDir.boolValue
+            ? url : nil
+    }
+
+    /// 建议的 iCloud 形象库目录：与用量同步共用「灵眸」根目录
+    /// （用量数据 usage-*.json 平铺在 灵眸/ 下，桌宠形象放 灵眸/Pets/），
+    /// 避免在 iCloud Drive 里出现两个平级的灵眸文件夹。
+    static var suggestedICloudLibrary: URL? {
+        iCloudDriveRoot?.appendingPathComponent("灵眸/Pets", isDirectory: true)
+    }
+
+    /// 设置里配置的目录字符串 → 实际目录；空串或全空白回退默认本地目录。
+    static func effectiveUserPetsDirectory(configuredPath: String) -> URL {
+        let trimmed = configuredPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return defaultUserPetsDirectory }
+        return URL(fileURLWithPath: (trimmed as NSString).expandingTildeInPath, isDirectory: true)
+    }
+
     @Published private(set) var themes: [PetTheme] = []
 
-    /// 可注入用户目录，便于测试自定义形象的完整生命周期。
-    let userPetsDirectory: URL
+    /// 可注入用户目录，便于测试自定义形象的完整生命周期；运行期可被 switchLibrary 替换。
+    private(set) var userPetsDirectory: URL
 
     private let fm = FileManager.default
 
@@ -348,6 +390,102 @@ final class PetCatalog: ObservableObject {
         guard !theme.isBuiltIn else { return }
         try? fm.removeItem(at: theme.folderURL)
         reload()
+    }
+
+    // MARK: 素材库位置切换
+
+    /// 切换自定义形象目录：已有自定义形象逐个迁移（复制成功后删源，失败的原地保留），
+    /// 草稿直接丢弃。返回 false 表示新目录不可用（无法创建，如所选卷只读）。
+    @discardableResult
+    func switchLibrary(to newURL: URL) -> Bool {
+        guard newURL != userPetsDirectory else { return true }
+        removeStaleDrafts()
+        do {
+            try fm.createDirectory(at: newURL, withIntermediateDirectories: true)
+        } catch {
+            return false
+        }
+        for theme in themes where !theme.isBuiltIn {
+            let dest = newURL.appendingPathComponent(theme.id, isDirectory: true)
+            try? fm.removeItem(at: dest)
+            if (try? fm.copyItem(at: theme.folderURL, to: dest)) != nil {
+                try? fm.removeItem(at: theme.folderURL)
+            }
+        }
+        userPetsDirectory = newURL
+        reload()
+        return true
+    }
+
+    // MARK: ZIP 导入
+
+    enum ImportError: Error {
+        case unzipFailed
+        case noAssets
+        case installFailed
+    }
+
+    /// 从 zip 安装自定义形象。兼容两种打包：槽位图直接在 zip 根目录，或外面
+    /// 套一层文件夹（Finder「压缩」的产物）；自动跳过 __MACOSX／隐藏文件。
+    /// 形象名优先 zip 内 pet.json 的 name，缺省用 zip 文件名。返回安装后的形象。
+    func installZIP(at zipURL: URL) throws -> PetTheme {
+        let extractURL = fm.temporaryDirectory
+            .appendingPathComponent("lingmou-pet-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fm.removeItem(at: extractURL) }
+
+        do {
+            try fm.createDirectory(at: extractURL, withIntermediateDirectories: true)
+            let unzip = Process()
+            unzip.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            unzip.arguments = ["-x", "-k", zipURL.path, extractURL.path]
+            unzip.standardOutput = FileHandle.nullDevice
+            unzip.standardError = FileHandle.nullDevice
+            try unzip.run()
+            unzip.waitUntilExit()
+            guard unzip.terminationStatus == 0 else { throw ImportError.unzipFailed }
+        } catch let error as ImportError {
+            throw error
+        } catch {
+            throw ImportError.unzipFailed
+        }
+
+        guard let source = PetThemeStore.locateAssetFolder(root: extractURL) else {
+            throw ImportError.noAssets
+        }
+
+        var name = zipURL.deletingPathExtension().lastPathComponent
+        var isNSFW = false
+        if let data = try? Data(contentsOf: source.appendingPathComponent("pet.json")),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let jsonName = obj["name"] as? String, !jsonName.isEmpty
+        {
+            name = jsonName
+            isNSFW = obj["nsfw"] as? Bool ?? false
+        }
+
+        let id = UUID().uuidString
+        let dest = userPetsDirectory.appendingPathComponent(id, isDirectory: true)
+        do {
+            try fm.createDirectory(at: dest, withIntermediateDirectories: true)
+            for slot in PetSlot.allCases {
+                let src = source.appendingPathComponent(slot.rawValue + ".png")
+                guard fm.fileExists(atPath: src.path) else { continue }
+                try fm.copyItem(at: src, to: dest.appendingPathComponent(slot.rawValue + ".png"))
+            }
+            let manifest: [String: Any] = ["id": id, "name": name, "nsfw": isNSFW]
+            let data = try JSONSerialization.data(
+                withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys]
+            )
+            try data.write(to: dest.appendingPathComponent("pet.json"), options: .atomic)
+            reload()
+            guard let installed = themes.first(where: { $0.id == id }) else {
+                throw ImportError.installFailed
+            }
+            return installed
+        } catch {
+            try? fm.removeItem(at: dest)
+            throw ImportError.installFailed
+        }
     }
 
     /// 上次异常退出留下的草稿目录在启动时清理。

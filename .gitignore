@@ -15,3 +15,6 @@ output/
 AIStatusBar/AIStatusBar.app/
 AIStatusBar/灵眸.app/
 .vscode/
+
+# 桌宠素材包 zip（本地生成，分发用；源图在 PetPacks/ 下保留）
+AIStatusBar/PetPacks/*.zip
