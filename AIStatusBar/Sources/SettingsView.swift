@@ -147,6 +147,12 @@ struct SettingsView: View {
                 Text("背景自适应需要截取面板正下方一小块屏幕区域来判断明暗，因此需要录屏权限。截图只在内存中计算，不会保存或上传。")
             }
             divider
+            settingRow("数量单位", detail: "用量数字按 K/M/B 或 万/亿 显示") {
+                modePicker($settings.numberUnit, options: [
+                    ("K / M / B", "metric"), ("万 / 亿", "wan"),
+                ])
+            }
+            divider
             settingRow("在 Dock 中显示图标", detail: "默认仅驻留菜单栏") {
                 toggle($settings.showDockIcon)
             }

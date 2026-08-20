@@ -34,6 +34,8 @@ final class SettingsStore: ObservableObject {
     /// 用量同步：多设备通过共享目录汇总用量/活跃；空目录 = iCloud Drive 默认目录
     @Published var usageSyncEnabled = false { didSet { save() } }
     @Published var usageSyncDir = "" { didSet { save() } }
+    /// 用量数字单位：metric=K/M/B，wan=万/亿
+    @Published var numberUnit = "metric" { didSet { save() } }
 
     /// Dock 图标开关即时生效：regular 显示 Dock 图标，accessory 纯菜单栏
     func applyDockIconPolicy() {
@@ -79,6 +81,7 @@ final class SettingsStore: ObservableObject {
             if let v = s["enabled"] as? Bool { usageSyncEnabled = v }
             if let v = s["dir"] as? String { usageSyncDir = v }
         }
+        if let v = obj["number_unit"] as? String, ["metric", "wan"].contains(v) { numberUnit = v }
     }
 
     private func save() {
@@ -92,6 +95,7 @@ final class SettingsStore: ObservableObject {
             "pet_scale": petScale,
             "online_quota": onlineQuota,
             "usage_sync": ["enabled": usageSyncEnabled, "dir": usageSyncDir],
+            "number_unit": numberUnit,
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: .prettyPrinted) else { return }
         let directory = NSHomeDirectory() + "/.ai-statusbar"
