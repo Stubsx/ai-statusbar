@@ -191,7 +191,7 @@ struct UsageCollector {
             }
     }
 
-    /// 由 date → tool → 计数 构建 UsageData：今日分工具视图 + 热力图。
+    /// 由 date → tool → 计数 构建 UsageData：今日分工具视图 + 滚动窗口聚合 + 热力图。
     /// 本机 sqlite 与多设备合并共用这一入口，保证两套视图的口径一致。
     static func usageData(
         from daily: [String: [String: UsageEntry]], now: TimeInterval
@@ -212,8 +212,30 @@ struct UsageCollector {
             tools: tools,
             total: total,
             heatmap: heat.days,
-            heatmax: heat.maximum
+            heatmax: heat.maximum,
+            weekly: rollingRange(days: 7, from: daily, now: now),
+            monthly: rollingRange(days: 30, from: daily, now: now)
         )
+    }
+
+    /// 近 N 日（含今日）分工具聚合；窗口外的天数不参与。
+    static func rollingRange(
+        days: Int, from daily: [String: [String: UsageEntry]], now: TimeInterval
+    ) -> UsageRange {
+        let calendar = Calendar.current
+        let todayDate = calendar.startOfDay(for: Date(timeIntervalSince1970: now))
+        var tools: [String: UsageEntry] = [:]
+        var total = UsageEntry()
+        for offset in 0..<max(1, days) {
+            guard let date = calendar.date(byAdding: .day, value: -offset, to: todayDate) else {
+                continue
+            }
+            for (tool, entry) in daily[DateSupport.localDay(date.timeIntervalSince1970)] ?? [:] {
+                tools[tool, default: UsageEntry()].add(entry)
+                total.add(entry)
+            }
+        }
+        return UsageRange(tools: tools, total: total)
     }
 
     private func kimiWorkUsageFiles() -> [String] {

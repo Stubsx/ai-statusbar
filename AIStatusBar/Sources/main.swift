@@ -115,12 +115,19 @@ struct HeatDay: Codable {
     let future: Bool
 }
 
+struct UsageRange: Codable {
+    let tools: [String: UsageEntry]
+    let total: UsageEntry
+}
+
 struct UsageData: Codable {
     let date: String
     let tools: [String: UsageEntry]
     let total: UsageEntry
     let heatmap: [HeatDay]?
     let heatmax: Int?
+    let weekly: UsageRange?   // 近七日（含今日）；旧版 JSON 无此字段时为 nil
+    let monthly: UsageRange?  // 近30日（含今日）
 }
 
 struct UsageSyncSource: Codable {
@@ -417,6 +424,8 @@ struct PanelView: View {
     @AppStorage("panelTab") private var tab = "status"
     /// 用量/活跃的统计范围：all=全部同步设备（默认） local=仅本机
     @AppStorage("usageScope") private var usageScope = "all"
+    /// 用量时间范围：today=今日（默认） 7d=近七日 30d=近30日
+    @AppStorage("usageRange") private var usageRange = "today"
 
     /// 当前展示的用量数据：开启同步且选择"全部"时用合并视图，否则本机
     private var usageForDisplay: UsageData? {
@@ -440,16 +449,64 @@ struct PanelView: View {
     }
 
     private func scopeButton(_ title: String, tag: String) -> some View {
-        Button(action: { usageScope = tag }) {
+        segmentButton(title, tag: tag, selection: $usageScope)
+    }
+
+    /// 用量时间范围切换：今日 / 近七日 / 近30日（近七日、近30日窗口均含今日）
+    private var rangeSwitch: some View {
+        HStack(spacing: 0) {
+            rangeButton("今日", tag: "today")
+            rangeButton("近七日", tag: "7d")
+            rangeButton("近30日", tag: "30d")
+        }
+        .background(Capsule().fill(Color.primary.opacity(0.08)))
+        .clipShape(Capsule())
+    }
+
+    private func rangeButton(_ title: String, tag: String) -> some View {
+        segmentButton(title, tag: tag, selection: $usageRange)
+    }
+
+    /// 分段切换按钮的统一样式，scopeSwitch 与 rangeSwitch 共用
+    private func segmentButton(
+        _ title: String, tag: String, selection: Binding<String>
+    ) -> some View {
+        Button(action: { selection.wrappedValue = tag }) {
             Text(title)
-                .font(.system(size: 9, weight: usageScope == tag ? .semibold : .regular))
-                .foregroundColor(usageScope == tag ? Color.primary : Color.secondary)
+                .font(.system(size: 9, weight: selection.wrappedValue == tag ? .semibold : .regular))
+                .foregroundColor(selection.wrappedValue == tag ? Color.primary : Color.secondary)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 2)
                 .background(
-                    Capsule().fill(usageScope == tag ? Color.primary.opacity(0.12) : .clear))
+                    Capsule().fill(selection.wrappedValue == tag ? Color.primary.opacity(0.12) : .clear))
         }
         .buttonStyle(.plain)
+    }
+
+    /// 当前所选时间范围的分工具用量；旧版 JSON 无聚合字段时返回 nil 走"统计中"分支
+    private var rangeEntries: (tools: [String: UsageEntry], total: UsageEntry)? {
+        guard let u = usageForDisplay else { return nil }
+        switch usageRange {
+        case "7d": return u.weekly.map { ($0.tools, $0.total) }
+        case "30d": return u.monthly.map { ($0.tools, $0.total) }
+        default: return (u.tools, u.total)
+        }
+    }
+
+    /// 时间范围的日期说明：今日显示当天，近七日/近30日显示起止区间
+    private var rangeSubtitle: String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "M月d日"
+        let today = Date()
+        guard usageRange != "today" else {
+            return usageForDisplay?.date ?? formatter.string(from: today)
+        }
+        let span = usageRange == "7d" ? 6 : 29
+        guard let start = Calendar.current.date(byAdding: .day, value: -span, to: today) else {
+            return formatter.string(from: today)
+        }
+        return "\(formatter.string(from: start)) ~ \(formatter.string(from: today))"
     }
 
     /// 合并视图的来源摘要：N 台设备 · 最近更新时间
@@ -583,10 +640,9 @@ struct PanelView: View {
 
     private var usageView: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if let u = usageForDisplay {
+            if let entries = rangeEntries {
                 HStack {
-                    Text("今日用量 · \(u.date)")
-                        .font(.system(size: 11, weight: .semibold))
+                    rangeSwitch
                     Spacer()
                     if syncAvailable {
                         scopeSwitch
@@ -596,12 +652,15 @@ struct PanelView: View {
                             .foregroundColor(.secondary.opacity(0.7))
                     }
                 }
-                .foregroundColor(.secondary)
-                .padding(.bottom, 8)
-                usageRow("总计", u.total, bold: true)
+                Text(rangeSubtitle)
+                    .font(.system(size: 9).monospacedDigit())
+                    .foregroundColor(.secondary.opacity(0.7))
+                    .padding(.top, 3)
+                    .padding(.bottom, 5)
+                usageRow("总计", entries.total, bold: true)
                 Divider().background(Color.primary.opacity(0.1))
                 ForEach(["codex", "kimi", "kimi-work", "claude", "zcode", "hermes"], id: \.self) { key in
-                    if let e = u.tools[key] {
+                    if let e = entries.tools[key] {
                         usageRow(usageName(key), e, bold: false)
                     }
                 }

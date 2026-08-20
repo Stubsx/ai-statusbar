@@ -160,6 +160,35 @@ final class UsageSyncTests: XCTestCase {
         XCTAssertEqual(usage.heatmax ?? 0, 100)
     }
 
+    func testUsageDataBuildsWeeklyAndMonthlyRanges() {
+        let now = Date().timeIntervalSince1970
+        let calendar = Calendar.current
+        let todayDate = calendar.startOfDay(for: Date(timeIntervalSince1970: now))
+        func dayKey(_ offset: Int) -> String {
+            let date = calendar.date(byAdding: .day, value: -offset, to: todayDate) ?? todayDate
+            return DateSupport.localDay(date.timeIntervalSince1970)
+        }
+        let usage = UsageCollector.usageData(
+            from: UsageSync.mergedDaily([[
+                day(dayKey(0), "kimi", input: 10, output: 0, cache: 0),
+                day(dayKey(6), "kimi", input: 100, output: 0, cache: 0),
+                day(dayKey(7), "zcode", input: 1000, output: 0, cache: 0),
+                day(dayKey(29), "claude", input: 5, output: 0, cache: 0),
+                day(dayKey(30), "hermes", input: 7, output: 0, cache: 0),
+            ]]),
+            now: now)
+        // 近七日窗口 = 今日 + 前 6 天：同工具跨天累加，第 7 天以前不参与
+        XCTAssertEqual(usage.weekly?.tools["kimi"]?.input, 110)
+        XCTAssertNil(usage.weekly?.tools["zcode"])
+        XCTAssertEqual(usage.weekly?.total.input, 110)
+        // 近30日窗口 = 今日 + 前 29 天：纳入第 7/29 天，排除第 30 天
+        XCTAssertEqual(usage.monthly?.tools["kimi"]?.input, 110)
+        XCTAssertEqual(usage.monthly?.tools["zcode"]?.input, 1000)
+        XCTAssertEqual(usage.monthly?.tools["claude"]?.input, 5)
+        XCTAssertNil(usage.monthly?.tools["hermes"])
+        XCTAssertEqual(usage.monthly?.total.input, 1115)
+    }
+
     func testStatusDataEncodesSyncFieldsWithSnakeCase() throws {
         let usage = UsageCollector.usageData(
             from: [:], now: Date().timeIntervalSince1970)

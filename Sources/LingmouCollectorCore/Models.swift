@@ -127,25 +127,44 @@ public struct HeatDay: Codable, Hashable, Sendable {
     }
 }
 
+/// 滚动窗口的分工具用量聚合（窗口含今日）。
+public struct UsageRange: Codable, Hashable, Sendable {
+    public let tools: [String: UsageEntry]
+    public let total: UsageEntry
+
+    public init(tools: [String: UsageEntry], total: UsageEntry) {
+        self.tools = tools
+        self.total = total
+    }
+}
+
 public struct UsageData: Codable, Hashable, Sendable {
     public let date: String
     public let tools: [String: UsageEntry]
     public let total: UsageEntry
     public let heatmap: [HeatDay]?
     public let heatmax: Int?
+    /// 近七日（含今日）聚合
+    public let weekly: UsageRange?
+    /// 近30日（含今日）聚合
+    public let monthly: UsageRange?
 
     public init(
         date: String,
         tools: [String: UsageEntry],
         total: UsageEntry,
         heatmap: [HeatDay]?,
-        heatmax: Int?
+        heatmax: Int?,
+        weekly: UsageRange? = nil,
+        monthly: UsageRange? = nil
     ) {
         self.date = date
         self.tools = tools
         self.total = total
         self.heatmap = heatmap
         self.heatmax = heatmax
+        self.weekly = weekly
+        self.monthly = monthly
     }
 }
 
