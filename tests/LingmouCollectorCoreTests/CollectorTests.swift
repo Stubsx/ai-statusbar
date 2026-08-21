@@ -92,39 +92,62 @@ final class CollectorTests: XCTestCase {
     }
 
     func testUsageParsersMatchExistingTokenRules() throws {
-        let codex = try XCTUnwrap(
+        let codexState = UsageParseState()
+        // turn_context 行本身不产出用量，只更新状态里的"当前模型"
+        XCTAssertNil(
+            UsageParsers.codex(
+                """
+                {"timestamp":"2026-08-13T01:02:03Z","type":"turn_context","payload":{"turn_id":"t1","model":"gpt-5.6-sol"}}
+                """, codexState))
+        let codexCounted = try XCTUnwrap(
             UsageParsers.codex(
                 """
                 {"timestamp":"2026-08-13T01:02:03Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":30,"cached_input_tokens":12,"output_tokens":7}}}}
-                """))
-        XCTAssertEqual(codex.input, 18)
-        XCTAssertEqual(codex.output, 7)
-        XCTAssertEqual(codex.cache, 12)
+                """, codexState))
+        XCTAssertEqual(codexCounted.input, 18)
+        XCTAssertEqual(codexCounted.output, 7)
+        XCTAssertEqual(codexCounted.cache, 12)
+        XCTAssertEqual(codexCounted.model, "gpt-5.6-sol")
 
         let kimi = try XCTUnwrap(
             UsageParsers.kimi(
                 """
-                {"type":"usage.record","time":10000,"usage":{"inputOther":3,"output":4,"inputCacheRead":5}}
-                """))
-        XCTAssertEqual(kimi, ParsedUsage(timestamp: 10, input: 3, output: 4, cache: 5))
+                {"type":"usage.record","time":10000,"model":"kimi-code/k3","usage":{"inputOther":3,"output":4,"inputCacheRead":5}}
+                """, UsageParseState()))
+        XCTAssertEqual(kimi, ParsedUsage(timestamp: 10, input: 3, output: 4, cache: 5, model: "kimi-code/k3"))
 
         let claude = try XCTUnwrap(
             UsageParsers.claude(
                 """
-                {"timestamp":"2026-08-13T01:02:03Z","message":{"usage":{"input_tokens":8,"output_tokens":9,"cache_read_input_tokens":10}}}
-                """))
+                {"timestamp":"2026-08-13T01:02:03Z","message":{"model":"glm-5.2","usage":{"input_tokens":8,"output_tokens":9,"cache_read_input_tokens":10}}}
+                """, UsageParseState()))
         XCTAssertEqual(claude.input, 8)
         XCTAssertEqual(claude.output, 9)
         XCTAssertEqual(claude.cache, 10)
+        XCTAssertEqual(claude.model, "glm-5.2")
 
         let zcode = try XCTUnwrap(
             UsageParsers.zcode(
                 """
-                {"completedAt":"2026-08-13T01:02:03Z","response":{"usage":{"inputTokens":20,"outputTokens":6,"cacheReadTokens":11}}}
-                """))
+                {"completedAt":"2026-08-13T01:02:03Z","model":{"modelId":"GLM-5.3","providerId":"builtin"},"response":{"usage":{"inputTokens":20,"outputTokens":6,"cacheReadTokens":11}}}
+                """, UsageParseState()))
         XCTAssertEqual(zcode.input, 9)
         XCTAssertEqual(zcode.output, 6)
         XCTAssertEqual(zcode.cache, 11)
+        XCTAssertEqual(zcode.model, "GLM-5.3")
+
+        // Codex 会话中途切换模型：turn_context 更新状态后，后续计数归属新模型
+        let switchState = UsageParseState()
+        _ = UsageParsers.codex(
+            """
+            {"timestamp":"2026-08-13T01:02:04Z","type":"turn_context","payload":{"model":"gpt-5.1"}}
+            """, switchState)
+        let switched = try XCTUnwrap(
+            UsageParsers.codex(
+                """
+                {"timestamp":"2026-08-13T01:02:05Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":1,"cached_input_tokens":0}}}}
+                """, switchState))
+        XCTAssertEqual(switched.model, "gpt-5.1")
     }
 
     func testExactDepthDoesNotIncludeNestedSubagentLogs() throws {
@@ -943,6 +966,7 @@ final class CollectorTests: XCTestCase {
         )
         try write(
             """
+            {"timestamp":"2033-05-18T03:33:19Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}
             {"timestamp":"2033-05-18T03:33:20Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":30,"cached_input_tokens":12,"output_tokens":7}}}}
             """ + "\n", to: log)
         try touch(log, at: timestamp)
@@ -955,5 +979,92 @@ final class CollectorTests: XCTestCase {
         XCTAssertEqual(first.tools["codex"], UsageEntry(input: 18, output: 7, cache: 12))
         XCTAssertEqual(second.tools["codex"], first.tools["codex"])
         XCTAssertEqual(second.total, first.total)
+        XCTAssertEqual(
+            second.models?["gpt-5.6-sol"], UsageEntry(input: 18, output: 7, cache: 12))
+    }
+
+    /// 断点恰好落在 turn_context 之后：恢复扫描时没有新的 turn_context，
+    /// Codex 计数必须归属到 offsets 里持久化的"当前模型"，而不是丢失归属
+    func testCodexIncrementalResumeKeepsModelAttribution() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let timestamp = try XCTUnwrap(DateSupport.timestamp("2033-05-18T03:33:20Z"))
+        let log = home.appendingPathComponent(
+            ".codex/sessions/2033/05/18/rollout-2033-05-18T03-33-20-12345678-1234-1234-1234-123456789abc.jsonl"
+        )
+        try write(
+            """
+            {"timestamp":"2033-05-18T03:33:19Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}
+            {"timestamp":"2033-05-18T03:33:20Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":30,"cached_input_tokens":12,"output_tokens":7}}}}
+            """ + "\n", to: log)
+        try touch(log, at: timestamp)
+        var collector = UsageCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: timestamp),
+            files: FileSupport()
+        )
+        _ = try collector.collect()
+
+        let later = try XCTUnwrap(DateSupport.timestamp("2033-05-18T03:34:20Z"))
+        let handle = try FileHandle(forWritingTo: log)
+        try handle.seekToEnd()
+        try handle.write(
+            contentsOf: Data(
+                """
+                {"timestamp":"2033-05-18T03:34:20Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":40,"cached_input_tokens":2,"output_tokens":9}}}}
+                """.utf8 + [0x0A]))
+        try handle.closeFile()
+        try touch(log, at: later)
+        collector = UsageCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: later),
+            files: FileSupport()
+        )
+        let resumed = try XCTUnwrap(collector.collect())
+        XCTAssertEqual(
+            resumed.tools["codex"], UsageEntry(input: 18 + 38, output: 7 + 9, cache: 12 + 2))
+        XCTAssertEqual(
+            resumed.models?["gpt-5.6-sol"],
+            UsageEntry(input: 18 + 38, output: 7 + 9, cache: 12 + 2))
+        XCTAssertNil(resumed.models?["未知模型"])
+    }
+
+    /// 旧版 daily 表没有 model 列：迁移应丢弃旧聚合并重扫日志，重建出带模型的计数
+    func testLegacyDailySchemaRebuildsWithModelDimension() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let timestamp = try XCTUnwrap(DateSupport.timestamp("2033-05-18T03:33:20Z"))
+        let log = home.appendingPathComponent(
+            ".codex/sessions/2033/05/18/rollout-2033-05-18T03-33-20-12345678-1234-1234-1234-123456789abc.jsonl"
+        )
+        try write(
+            """
+            {"timestamp":"2033-05-18T03:33:19Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}
+            {"timestamp":"2033-05-18T03:33:20Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":30,"cached_input_tokens":12,"output_tokens":7}}}}
+            """ + "\n", to: log)
+        try touch(log, at: timestamp)
+
+        let databasePath = home.appendingPathComponent(".ai-statusbar/usage.sqlite")
+        try FileManager.default.createDirectory(
+            at: databasePath.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let legacy = try SQLiteDatabase(path: databasePath.path)
+        try legacy.execute(
+            """
+            CREATE TABLE daily(date TEXT, tool TEXT, input INT, output INT, cache INT,
+                PRIMARY KEY(date, tool))
+            """)
+        try legacy.execute(
+            "INSERT INTO daily VALUES('2033-05-18','codex',999,999,999)")
+        try legacy.execute(
+            "CREATE TABLE offsets(path TEXT PRIMARY KEY, offset INT, mtime REAL, last_key TEXT)")
+        try legacy.execute(
+            "INSERT INTO offsets VALUES(?, 0, 0, NULL)", binds: [.text(log.path)])
+
+        let collector = UsageCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: timestamp),
+            files: FileSupport()
+        )
+        let data = try XCTUnwrap(collector.collect())
+        // 旧聚合（999）被丢弃，重扫后只有日志里的真实计数，且带模型维度
+        XCTAssertEqual(data.tools["codex"], UsageEntry(input: 18, output: 7, cache: 12))
+        XCTAssertEqual(data.models?["gpt-5.6-sol"], UsageEntry(input: 18, output: 7, cache: 12))
     }
 }

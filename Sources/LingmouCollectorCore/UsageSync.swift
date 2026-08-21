@@ -155,18 +155,39 @@ enum UsageSync {
         return Array(byDevice.values)
     }
 
-    /// 多组按天计数合并（date → tool → 求和）。token 由各机统计各自本地日志，求和即真实总量
-    static func mergedDaily(_ groups: [[UsageSyncDay]]) -> [String: [String: UsageEntry]] {
-        var out: [String: [String: UsageEntry]] = [:]
+    /// 多组按天计数合并结果：byTool 供工具视图，byModel 供模型视图。
+    /// 两个视图来自同一批行，保证口径一致。
+    static func mergedDaily(_ groups: [[UsageSyncDay]]) -> MergedDaily {
+        var out = MergedDaily()
         for group in groups {
             for row in group {
-                var entry = out[row.date]?[row.tool] ?? UsageEntry()
+                var entry = out.byTool[row.date]?[row.tool] ?? UsageEntry()
                 entry.input += row.input
                 entry.output += row.output
                 entry.cache += row.cache
-                out[row.date, default: [:]][row.tool] = entry
+                out.byTool[row.date, default: [:]][row.tool] = entry
+                let key = normalizedModelKey(row.model)
+                var modelEntry = out.byModel[row.date]?[key] ?? UsageEntry()
+                modelEntry.input += row.input
+                modelEntry.output += row.output
+                modelEntry.cache += row.cache
+                out.byModel[row.date, default: [:]][key] = modelEntry
             }
         }
         return out
     }
+
+    /// 模型名归一：去空白、取路径最后一段（kimi-code/k3 → k3）、统一小写，
+    /// 让不同工具记录的同名模型（如 GLM-5.3 / glm-5.3）合并为一个键；空名归入未知桶。
+    static func normalizedModelKey(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = trimmed.split(separator: "/").last.map(String.init) ?? trimmed
+        return base.isEmpty ? "未知模型" : base.lowercased()
+    }
+}
+
+/// 按 date → 键 → 计数 的合并结果：工具视图与模型视图共用一套行数据。
+struct MergedDaily {
+    var byTool: [String: [String: UsageEntry]] = [:]
+    var byModel: [String: [String: UsageEntry]] = [:]
 }

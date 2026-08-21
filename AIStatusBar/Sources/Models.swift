@@ -58,12 +58,14 @@ struct HeatDay: Codable {
 
 struct UsageRange: Codable {
     let tools: [String: UsageEntry]
+    let models: [String: UsageEntry]?  // 分模型聚合（同名模型跨工具求和）；旧版 JSON 无此字段时为 nil
     let total: UsageEntry
 }
 
 struct UsageData: Codable {
     let date: String
     let tools: [String: UsageEntry]
+    let models: [String: UsageEntry]?  // 今日分模型聚合；旧版 JSON 无此字段时为 nil
     let total: UsageEntry
     let heatmap: [HeatDay]?
     let heatmax: Int?

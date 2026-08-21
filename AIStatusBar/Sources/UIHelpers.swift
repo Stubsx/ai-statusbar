@@ -122,3 +122,21 @@ final class DraggableHostingView<Content: View>: NSHostingView<Content> {
         contextMenuBuilder?()
     }
 }
+
+// MARK: - 用量数字格式化（面板与设置窗口共用，保证两处缩写口径一致）
+
+enum NumberFormat {
+    /// token 数缩写：unit=metric 时 1.2K/3.4M/5.6B，unit=wan 时 1.2万/3.4亿。
+    static func tokens(_ n: Int, unit: String) -> String {
+        if unit == "wan" {
+            if n >= 100_000_000 { return String(format: "%.1f亿", Double(n) / 100_000_000) }
+            if n >= 10_000 { return String(format: "%.1f万", Double(n) / 10_000) }
+            return "\(n)"
+        }
+        if n >= 1_000_000_000 { return String(format: "%.1fB", Double(n) / 1_000_000_000) }
+        if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000) }
+        if n >= 10_000 { return String(format: "%.0fK", Double(n) / 1_000) }
+        if n >= 1_000 { return String(format: "%.1fK", Double(n) / 1_000) }
+        return "\(n)"
+    }
+}

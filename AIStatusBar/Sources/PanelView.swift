@@ -616,16 +616,7 @@ struct PanelView: View {
     }
 
     private func fmt(_ n: Int) -> String {
-        if store.settings.numberUnit == "wan" {
-            if n >= 100_000_000 { return String(format: "%.1f亿", Double(n) / 100_000_000) }
-            if n >= 10_000 { return String(format: "%.1f万", Double(n) / 10_000) }
-            return "\(n)"
-        }
-        if n >= 1_000_000_000 { return String(format: "%.1fB", Double(n) / 1_000_000_000) }
-        if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000) }
-        if n >= 10_000 { return String(format: "%.0fK", Double(n) / 1_000) }
-        if n >= 1_000 { return String(format: "%.1fK", Double(n) / 1_000) }
-        return "\(n)"
+        NumberFormat.tokens(n, unit: store.settings.numberUnit)
     }
 
     private func applyLevel() {

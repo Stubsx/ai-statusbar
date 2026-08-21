@@ -130,10 +130,15 @@ public struct HeatDay: Codable, Hashable, Sendable {
 /// 滚动窗口的分工具用量聚合（窗口含今日）。
 public struct UsageRange: Codable, Hashable, Sendable {
     public let tools: [String: UsageEntry]
+    /// 分模型聚合：与 tools 同窗口，同名模型跨工具求和；旧版 JSON 无此字段时为 nil
+    public let models: [String: UsageEntry]?
     public let total: UsageEntry
 
-    public init(tools: [String: UsageEntry], total: UsageEntry) {
+    public init(
+        tools: [String: UsageEntry], total: UsageEntry, models: [String: UsageEntry]? = nil
+    ) {
         self.tools = tools
+        self.models = models
         self.total = total
     }
 }
@@ -141,6 +146,8 @@ public struct UsageRange: Codable, Hashable, Sendable {
 public struct UsageData: Codable, Hashable, Sendable {
     public let date: String
     public let tools: [String: UsageEntry]
+    /// 今日分模型聚合；旧版 JSON 无此字段时为 nil
+    public let models: [String: UsageEntry]?
     public let total: UsageEntry
     public let heatmap: [HeatDay]?
     public let heatmax: Int?
@@ -155,11 +162,13 @@ public struct UsageData: Codable, Hashable, Sendable {
         total: UsageEntry,
         heatmap: [HeatDay]?,
         heatmax: Int?,
+        models: [String: UsageEntry]? = nil,
         weekly: UsageRange? = nil,
         monthly: UsageRange? = nil
     ) {
         self.date = date
         self.tools = tools
+        self.models = models
         self.total = total
         self.heatmap = heatmap
         self.heatmax = heatmax
@@ -168,20 +177,39 @@ public struct UsageData: Codable, Hashable, Sendable {
     }
 }
 
-/// 用量同步文件中的一行：某设备某天某工具的 token 计数。
+/// 用量同步文件中的一行：某设备某天某工具某模型的 token 计数。
 public struct UsageSyncDay: Codable, Hashable, Sendable {
     public let date: String
     public let tool: String
+    /// 旧版同步文件无此字段，解码时回退为空串（归入"未知模型"桶）
+    public let model: String
     public let input: Int
     public let output: Int
     public let cache: Int
 
-    public init(date: String, tool: String, input: Int, output: Int, cache: Int) {
+    public init(
+        date: String, tool: String, model: String = "", input: Int, output: Int, cache: Int
+    ) {
         self.date = date
         self.tool = tool
+        self.model = model
         self.input = input
         self.output = output
         self.cache = cache
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case date, tool, model, input, output, cache
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        date = try container.decode(String.self, forKey: .date)
+        tool = try container.decode(String.self, forKey: .tool)
+        model = try container.decodeIfPresent(String.self, forKey: .model) ?? ""
+        input = try container.decode(Int.self, forKey: .input)
+        output = try container.decode(Int.self, forKey: .output)
+        cache = try container.decode(Int.self, forKey: .cache)
     }
 }
 

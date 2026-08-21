@@ -17,10 +17,12 @@ final class UsageSyncTests: XCTestCase {
         try data.write(to: url)
     }
 
-    private func day(_ date: String, _ tool: String, input: Int = 1, output: Int = 2, cache: Int = 3)
-        -> UsageSyncDay
-    {
-        UsageSyncDay(date: date, tool: tool, input: input, output: output, cache: cache)
+    private func day(
+        _ date: String, _ tool: String, model: String = "", input: Int = 1, output: Int = 2,
+        cache: Int = 3
+    ) -> UsageSyncDay {
+        UsageSyncDay(
+            date: date, tool: tool, model: model, input: input, output: output, cache: cache)
     }
 
     private func syncFile(device: String, name: String, updatedAt: TimeInterval, daily: [UsageSyncDay])
@@ -32,19 +34,51 @@ final class UsageSyncTests: XCTestCase {
 
     func testMergedDailySumsAcrossDevices() {
         let merged = UsageSync.mergedDaily([
-            [day("2026-08-15", "kimi", input: 10, output: 20, cache: 30)],
+            [day("2026-08-15", "kimi", model: "kimi-code/k3", input: 10, output: 20, cache: 30)],
             [
-                day("2026-08-15", "kimi", input: 1, output: 2, cache: 3),
-                day("2026-08-15", "zcode", input: 5, output: 5, cache: 5),
-                day("2026-08-14", "kimi", input: 7, output: 0, cache: 0),
+                day("2026-08-15", "kimi", model: "kimi-code/k3", input: 1, output: 2, cache: 3),
+                day("2026-08-15", "zcode", model: "GLM-5.3", input: 5, output: 5, cache: 5),
+                day("2026-08-14", "kimi", model: "kimi-code/k3", input: 7, output: 0, cache: 0),
             ],
         ])
-        XCTAssertEqual(merged["2026-08-15"]?["kimi"]?.input, 11)
-        XCTAssertEqual(merged["2026-08-15"]?["kimi"]?.output, 22)
-        XCTAssertEqual(merged["2026-08-15"]?["kimi"]?.cache, 33)
-        XCTAssertEqual(merged["2026-08-15"]?["zcode"]?.input, 5)
-        XCTAssertEqual(merged["2026-08-14"]?["kimi"]?.input, 7)
-        XCTAssertNil(merged["2026-08-13"])
+        XCTAssertEqual(merged.byTool["2026-08-15"]?["kimi"]?.input, 11)
+        XCTAssertEqual(merged.byTool["2026-08-15"]?["kimi"]?.output, 22)
+        XCTAssertEqual(merged.byTool["2026-08-15"]?["kimi"]?.cache, 33)
+        XCTAssertEqual(merged.byTool["2026-08-15"]?["zcode"]?.input, 5)
+        XCTAssertEqual(merged.byTool["2026-08-14"]?["kimi"]?.input, 7)
+        XCTAssertNil(merged.byTool["2026-08-13"])
+        // 模型视图：kimi-code/k3 归一为 k3，跨设备同键求和
+        XCTAssertEqual(merged.byModel["2026-08-15"]?["k3"]?.input, 11)
+        XCTAssertEqual(merged.byModel["2026-08-15"]?["k3"]?.cache, 33)
+        XCTAssertEqual(merged.byModel["2026-08-14"]?["k3"]?.input, 7)
+    }
+
+    /// 模型名归一：大小写与路径前缀合并为同一键，空名归入未知桶
+    func testMergedDailyNormalizesModelKeys() {
+        let merged = UsageSync.mergedDaily([
+            [
+                day("2026-08-15", "zcode", model: "GLM-5.3", input: 10, output: 0, cache: 0),
+                day("2026-08-15", "hermes", model: "glm-5.3", input: 1, output: 2, cache: 3),
+                day("2026-08-15", "claude", model: "glm-5.2", input: 4, output: 5, cache: 6),
+                day("2026-08-15", "codex", model: "", input: 7, output: 0, cache: 0),
+            ]
+        ])
+        XCTAssertEqual(merged.byModel["2026-08-15"]?["glm-5.3"]?.input, 11)
+        XCTAssertEqual(merged.byModel["2026-08-15"]?["glm-5.2"]?.output, 5)
+        XCTAssertEqual(merged.byModel["2026-08-15"]?["未知模型"]?.input, 7)
+        XCTAssertNil(merged.byModel["2026-08-15"]?["kimi-code/k3"])
+    }
+
+    /// 旧版同步文件没有 model 字段：解码回退空串；新编码始终写出 model，旧版 App 忽略未知键
+    func testOldSyncFileWithoutModelFieldDecodes() throws {
+        let json = """
+            {"device":"A","name":"mac-a","updated_at":100,
+             "daily":[{"date":"2026-08-15","tool":"kimi","input":1,"output":2,"cache":3}]}
+            """
+        let file = try XCTUnwrap(UsageSync.decode(Data(json.utf8)))
+        XCTAssertEqual(file.daily, [day("2026-08-15", "kimi")])
+        let encoded = String(decoding: try UsageSync.encode(file), as: UTF8.self)
+        XCTAssertTrue(encoded.contains("\"model\""))
     }
 
     func testLoadRemotesDedupesSameDeviceAndSkipsInvalid() throws {
@@ -191,7 +225,7 @@ final class UsageSyncTests: XCTestCase {
 
     func testStatusDataEncodesSyncFieldsWithSnakeCase() throws {
         let usage = UsageCollector.usageData(
-            from: [:], now: Date().timeIntervalSince1970)
+            from: MergedDaily(), now: Date().timeIntervalSince1970)
         let status = UsageSyncStatus(
             enabled: true, dir: "/tmp/lingmou-sync", device: "A", name: "mac-a",
             sources: [UsageSyncSource(device: "A", name: "mac-a", updatedAt: 1_000, days: 42)])

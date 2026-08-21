@@ -54,6 +54,8 @@ struct SettingsView: View {
             switch settingsTab {
             case "pet":
                 PetSettingsTab(settings: settings, catalog: catalog)
+            case "models":
+                settingsScroll { modelsSection }
             case "data":
                 settingsScroll { dataSection }
             case "notify":
@@ -74,6 +76,7 @@ struct SettingsView: View {
             tabButton("通用", "general")
             tabButton("桌宠", "pet")
             tabButton("数据", "data")
+            tabButton("模型", "models")
             tabButton("通知", "notify")
             Spacer()
         }
@@ -183,6 +186,148 @@ struct SettingsView: View {
                 syncDetail
             }
         }
+    }
+
+    // MARK: 模型用量（按模型汇总今日 / 近七日 / 近30日）
+
+    /// 模型用量页数据行：同一模型在三个时间窗口的用量，缺数据以 nil 显示"—"
+    private struct ModelUsageRow: Identifiable {
+        let name: String
+        let today: UsageEntry?
+        let weekly: UsageEntry?
+        let monthly: UsageEntry?
+
+        var id: String { name }
+
+        /// 排序键：三个窗口中的最大用量，避免只看 30 日时压低今天刚切换的模型
+        var rank: Int {
+            max(modelUsageTotal(today), max(modelUsageTotal(weekly), modelUsageTotal(monthly)))
+        }
+    }
+
+    /// 与状态面板口径一致：开启同步时优先展示多设备合并视图
+    private var modelUsageData: UsageData? {
+        store.data?.usageMerged ?? store.data?.usage
+    }
+
+    /// 三个窗口出现过的模型全集，按最大窗口用量从高到低排列
+    private var modelUsageRows: [ModelUsageRow] {
+        guard let usage = modelUsageData else { return [] }
+        var names = Set<String>()
+        if let keys = usage.models?.keys { names.formUnion(keys) }
+        if let keys = usage.weekly?.models?.keys { names.formUnion(keys) }
+        if let keys = usage.monthly?.models?.keys { names.formUnion(keys) }
+        return names
+            .map {
+                ModelUsageRow(
+                    name: $0, today: usage.models?[$0],
+                    weekly: usage.weekly?.models?[$0],
+                    monthly: usage.monthly?.models?[$0])
+            }
+            .sorted { $0.rank != $1.rank ? $0.rank > $1.rank : $0.name < $1.name }
+    }
+
+    private var modelsSection: some View {
+        section("模型用量") {
+            VStack(spacing: 0) {
+                modelUsageHeaderRow
+                Divider().opacity(0.4)
+                modelUsageTotalRow
+                let rows = modelUsageRows
+                if rows.isEmpty {
+                    Text(modelUsageData == nil
+                         ? "统计中…（首次全量索引约需几秒）"
+                         : "暂无模型用量数据")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary.opacity(0.8))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 14)
+                } else {
+                    ForEach(rows) { row in
+                        Divider().opacity(0.4)
+                        modelUsageRow(row)
+                    }
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("数字为 输入+缓存+输出 的 token 总量；同名模型跨工具合并")
+                        if let sync = store.data?.sync, sync.enabled,
+                            let count = sync.sources?.count, count > 1
+                        {
+                            Text("已合并 \(count) 台设备的用量")
+                        }
+                    }
+                    .font(.system(size: 9.5))
+                    .foregroundColor(.secondary.opacity(0.7))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 14)
+                    .padding(.top, 8)
+                    .padding(.bottom, 9)
+                }
+            }
+        }
+    }
+
+    /// 列头：模型 | 今日 | 近七日 | 近30日，宽度与数据行对齐
+    private var modelUsageHeaderRow: some View {
+        HStack(spacing: 8) {
+            Text("模型")
+                .frame(maxWidth: .infinity, alignment: .leading)
+            modelUsageColumn("今日")
+            modelUsageColumn("近七日")
+            modelUsageColumn("近30日")
+        }
+        .font(.system(size: 10))
+        .foregroundColor(.secondary.opacity(0.85))
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+    }
+
+    private var modelUsageTotalRow: some View {
+        HStack(spacing: 8) {
+            Text("总计")
+                .font(.system(size: 12, weight: .semibold))
+            Spacer(minLength: 8)
+            modelUsageValue(modelUsageText(modelUsageData?.total), bold: true)
+            modelUsageValue(modelUsageText(modelUsageData?.weekly?.total), bold: true)
+            modelUsageValue(modelUsageText(modelUsageData?.monthly?.total), bold: true)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7)
+    }
+
+    private func modelUsageRow(_ row: ModelUsageRow) -> some View {
+        HStack(spacing: 8) {
+            Text(row.name)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(.primary.opacity(0.85))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 8)
+            modelUsageValue(modelUsageText(row.today))
+            modelUsageValue(modelUsageText(row.weekly))
+            modelUsageValue(modelUsageText(row.monthly))
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 6)
+    }
+
+    private func modelUsageColumn(_ title: String) -> some View {
+        Text(title)
+            .frame(width: 68, alignment: .trailing)
+    }
+
+    private func modelUsageValue(_ text: String, bold: Bool = false) -> some View {
+        Text(text)
+            .font(.system(size: 11, weight: bold ? .semibold : .regular).monospacedDigit())
+            .foregroundColor(bold ? Color.primary.opacity(0.9) : .secondary)
+            .frame(width: 68, alignment: .trailing)
+    }
+
+    /// 用量条目 → 缩写数字；nil 显示"—"（该窗口内未用过该模型）
+    private func modelUsageText(_ entry: UsageEntry?) -> String {
+        guard let entry else { return "—" }
+        return NumberFormat.tokens(modelUsageTotal(entry), unit: settings.numberUnit)
     }
 
     private var notifySection: some View {
@@ -527,4 +672,10 @@ struct SettingsView: View {
             set: { self.settings.notifyTools[key] = $0 }
         )
     }
+}
+
+/// 用量条目合计（输入+缓存+输出）；nil 视为 0
+private func modelUsageTotal(_ entry: UsageEntry?) -> Int {
+    guard let entry else { return 0 }
+    return entry.input + entry.output + entry.cache
 }

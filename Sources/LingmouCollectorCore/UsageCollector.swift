@@ -5,12 +5,30 @@ struct ParsedUsage: Equatable {
     let input: Int
     let output: Int
     let cache: Int
+    var model: String = ""
 }
 
+/// 跨行解析状态：Codex 的 token_count 事件不带模型名，需记住最近一次 turn_context
+/// 声明的模型。状态随 offsets 断点持久化，增量恢复后才能继续正确归属。
+final class UsageParseState {
+    var model: String?
+}
+
+typealias UsageParser = (String, UsageParseState) -> ParsedUsage?
+
 struct UsageParsers {
-    static func codex(_ line: String) -> ParsedUsage? {
-        guard line.contains("token_count"), let object = JSONValue.object(from: line),
-            JSONValue.string(object["type"]) == "event_msg",
+    static func codex(_ line: String, _ state: UsageParseState) -> ParsedUsage? {
+        // turn_context 与 token_count 都要解析，其余行（含大体积消息行）不做 JSON 解析
+        guard line.contains("turn_context") || line.contains("token_count"),
+            let object = JSONValue.object(from: line)
+        else { return nil }
+        if JSONValue.string(object["type"]) == "turn_context",
+            let payload = object["payload"] as? JSONObject,
+            let model = JSONValue.string(payload["model"]), !model.isEmpty
+        {
+            state.model = model
+        }
+        guard JSONValue.string(object["type"]) == "event_msg",
             let payload = object["payload"] as? JSONObject,
             JSONValue.string(payload["type"]) == "token_count",
             let timestamp = DateSupport.timestamp(object["timestamp"]),
@@ -23,11 +41,12 @@ struct UsageParsers {
             timestamp: timestamp,
             input: max(0, input - cache),
             output: JSONValue.int(usage["output_tokens"]) ?? 0,
-            cache: cache
+            cache: cache,
+            model: state.model ?? ""
         )
     }
 
-    static func kimi(_ line: String) -> ParsedUsage? {
+    static func kimi(_ line: String, _ state: UsageParseState) -> ParsedUsage? {
         guard line.contains("usage.record"), let object = JSONValue.object(from: line),
             JSONValue.string(object["type"]) == "usage.record",
             let milliseconds = JSONValue.double(object["time"]), milliseconds > 0,
@@ -37,11 +56,12 @@ struct UsageParsers {
             timestamp: milliseconds / 1_000,
             input: JSONValue.int(usage["inputOther"]) ?? 0,
             output: JSONValue.int(usage["output"]) ?? 0,
-            cache: JSONValue.int(usage["inputCacheRead"]) ?? 0
+            cache: JSONValue.int(usage["inputCacheRead"]) ?? 0,
+            model: JSONValue.string(object["model"]) ?? ""
         )
     }
 
-    static func claude(_ line: String) -> ParsedUsage? {
+    static func claude(_ line: String, _ state: UsageParseState) -> ParsedUsage? {
         guard line.contains("\"usage\""), let object = JSONValue.object(from: line),
             let timestamp = DateSupport.timestamp(object["timestamp"]),
             let message = object["message"] as? JSONObject,
@@ -51,11 +71,12 @@ struct UsageParsers {
             timestamp: timestamp,
             input: JSONValue.int(usage["input_tokens"]) ?? 0,
             output: JSONValue.int(usage["output_tokens"]) ?? 0,
-            cache: JSONValue.int(usage["cache_read_input_tokens"]) ?? 0
+            cache: JSONValue.int(usage["cache_read_input_tokens"]) ?? 0,
+            model: JSONValue.string(message["model"]) ?? ""
         )
     }
 
-    static func zcode(_ line: String) -> ParsedUsage? {
+    static func zcode(_ line: String, _ state: UsageParseState) -> ParsedUsage? {
         guard line.contains("\"usage\""), let object = JSONValue.object(from: line),
             let timestamp = DateSupport.timestamp(object["completedAt"]),
             let response = object["response"] as? JSONObject,
@@ -67,7 +88,8 @@ struct UsageParsers {
             timestamp: timestamp,
             input: max(0, input - cache),
             output: JSONValue.int(usage["outputTokens"]) ?? 0,
-            cache: cache
+            cache: cache,
+            model: JSONValue.string((object["model"] as? JSONObject)?["modelId"]) ?? ""
         )
     }
 }
@@ -100,7 +122,7 @@ struct UsageCollector {
     ) {
         do {
             let database = try openDatabase()
-            let sources: [([String], String, (String) -> ParsedUsage?)] = [
+            let sources: [([String], String, UsageParser)] = [
                 (
                     files.files(
                         atDepth: 4, under: environment.path(".codex", "sessions"),
@@ -178,32 +200,34 @@ struct UsageCollector {
     }
 
     private func localDaily(database: SQLiteDatabase) throws -> [UsageSyncDay] {
-        try database.query("SELECT date, tool, input, output, cache FROM daily")
+        try database.query("SELECT date, tool, model, input, output, cache FROM daily")
             .compactMap { row in
                 guard let date = row["date"]?.string, let tool = row["tool"]?.string else {
                     return nil
                 }
                 return UsageSyncDay(
-                    date: date, tool: tool,
+                    date: date, tool: tool, model: row["model"]?.string ?? "",
                     input: row["input"]?.int ?? 0,
                     output: row["output"]?.int ?? 0,
                     cache: row["cache"]?.int ?? 0)
             }
     }
 
-    /// 由 date → tool → 计数 构建 UsageData：今日分工具视图 + 滚动窗口聚合 + 热力图。
+    /// 由 date → 工具/模型 → 计数 构建 UsageData：今日分工具与分模型视图 + 滚动窗口聚合 + 热力图。
     /// 本机 sqlite 与多设备合并共用这一入口，保证两套视图的口径一致。
-    static func usageData(
-        from daily: [String: [String: UsageEntry]], now: TimeInterval
-    ) -> UsageData {
+    static func usageData(from daily: MergedDaily, now: TimeInterval) -> UsageData {
         let today = DateSupport.localDay(now)
         var tools: [String: UsageEntry] = [:]
+        var models: [String: UsageEntry] = [:]
         var total = UsageEntry()
-        for (tool, entry) in daily[today] ?? [:] {
+        for (tool, entry) in daily.byTool[today] ?? [:] {
             tools[tool] = entry
             total.add(entry)
         }
-        let totals = daily.mapValues { day in
+        for (model, entry) in daily.byModel[today] ?? [:] {
+            models[model] = entry
+        }
+        let totals = daily.byTool.mapValues { day in
             day.values.reduce(0) { $0 + $1.input + $1.output + $1.cache }
         }
         let heat = heatmap(totals: totals, now: now)
@@ -213,29 +237,35 @@ struct UsageCollector {
             total: total,
             heatmap: heat.days,
             heatmax: heat.maximum,
+            models: models,
             weekly: rollingRange(days: 7, from: daily, now: now),
             monthly: rollingRange(days: 30, from: daily, now: now)
         )
     }
 
-    /// 近 N 日（含今日）分工具聚合；窗口外的天数不参与。
+    /// 近 N 日（含今日）分工具与分模型聚合；窗口外的天数不参与。
     static func rollingRange(
-        days: Int, from daily: [String: [String: UsageEntry]], now: TimeInterval
+        days: Int, from daily: MergedDaily, now: TimeInterval
     ) -> UsageRange {
         let calendar = Calendar.current
         let todayDate = calendar.startOfDay(for: Date(timeIntervalSince1970: now))
         var tools: [String: UsageEntry] = [:]
+        var models: [String: UsageEntry] = [:]
         var total = UsageEntry()
         for offset in 0..<max(1, days) {
             guard let date = calendar.date(byAdding: .day, value: -offset, to: todayDate) else {
                 continue
             }
-            for (tool, entry) in daily[DateSupport.localDay(date.timeIntervalSince1970)] ?? [:] {
+            let key = DateSupport.localDay(date.timeIntervalSince1970)
+            for (tool, entry) in daily.byTool[key] ?? [:] {
                 tools[tool, default: UsageEntry()].add(entry)
                 total.add(entry)
             }
+            for (model, entry) in daily.byModel[key] ?? [:] {
+                models[model, default: UsageEntry()].add(entry)
+            }
         }
-        return UsageRange(tools: tools, total: total)
+        return UsageRange(tools: tools, total: total, models: models)
     }
 
     private func kimiWorkUsageFiles() -> [String] {
@@ -259,11 +289,20 @@ struct UsageCollector {
         let path = (directory as NSString).appendingPathComponent("usage.sqlite")
         let database = try SQLiteDatabase(path: path)
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+        // 旧版按 (date, tool) 聚合的 daily 无法拆出模型维度：丢弃并清空断点，
+        // 让最近 70 天（maximumAge 窗口内）的日志重扫一遍自然带上模型；更早的数据
+        // 本就超出热力图与滚动窗口的展示范围
+        let dailyColumns = try database.columns(in: "daily")
+        if !dailyColumns.isEmpty, !dailyColumns.contains("model") {
+            try database.execute("DROP TABLE daily")
+            try database.execute("DELETE FROM offsets")
+        }
         try database.execute(
             """
             CREATE TABLE IF NOT EXISTS daily(
-                date TEXT, tool TEXT, input INT, output INT, cache INT,
-                PRIMARY KEY(date, tool))
+                date TEXT, tool TEXT, model TEXT NOT NULL DEFAULT '',
+                input INT, output INT, cache INT,
+                PRIMARY KEY(date, tool, model))
             """)
         try database.execute(
             """
@@ -273,20 +312,23 @@ struct UsageCollector {
         if !(try database.columns(in: "offsets")).contains("last_key") {
             try database.execute("ALTER TABLE offsets ADD COLUMN last_key TEXT")
         }
+        if !(try database.columns(in: "offsets")).contains("last_model") {
+            try database.execute("ALTER TABLE offsets ADD COLUMN last_model TEXT")
+        }
         return database
     }
 
     private func add(_ usage: ParsedUsage, tool: String, database: SQLiteDatabase) throws {
         try database.execute(
             """
-            INSERT INTO daily(date, tool, input, output, cache) VALUES(?,?,?,?,?)
-            ON CONFLICT(date, tool) DO UPDATE SET
+            INSERT INTO daily(date, tool, model, input, output, cache) VALUES(?,?,?,?,?,?)
+            ON CONFLICT(date, tool, model) DO UPDATE SET
                 input=input+excluded.input,
                 output=output+excluded.output,
                 cache=cache+excluded.cache
             """,
             binds: [
-                .text(DateSupport.localDay(usage.timestamp)), .text(tool),
+                .text(DateSupport.localDay(usage.timestamp)), .text(tool), .text(usage.model),
                 .integer(Int64(usage.input)), .integer(Int64(usage.output)),
                 .integer(Int64(usage.cache)),
             ])
@@ -295,30 +337,33 @@ struct UsageCollector {
     private func scan(
         path: String,
         tool: String,
-        parser: (String) -> ParsedUsage?,
+        parser: UsageParser,
         database: SQLiteDatabase
     ) throws {
         guard let size = files.fileSize(path), let modified = files.modificationTime(path),
             environment.now - modified <= maximumAge
         else { return }
         let previous = try database.query(
-            "SELECT offset, mtime, last_key FROM offsets WHERE path=?",
+            "SELECT offset, mtime, last_key, last_model FROM offsets WHERE path=?",
             binds: [.text(path)]
         ).first
         var offset = UInt64(max(0, previous?["offset"]?.int ?? 0))
         var lastKey = previous?["last_key"]?.string
+        // 恢复上次的"当前模型"状态：Codex 断点后的第一条 token_count 才能归属正确
+        let state = UsageParseState()
+        state.model = previous?["last_model"]?.string
         if offset == size, previous?["mtime"]?.double == modified { return }
         if size < offset { offset = 0 }
         guard let handle = FileHandle(forReadingAtPath: path) else { return }
-        defer { try? handle.close() }
+        defer { try? handle.closeFile() }
         try handle.seek(toOffset: offset)
         guard let raw = try handle.readToEnd(),
             let newline = raw.lastIndex(of: 0x0A)
         else { return }
         let complete = raw.prefix(upTo: newline)
         for line in String(decoding: complete, as: UTF8.self).split(whereSeparator: \.isNewline) {
-            guard let usage = parser(String(line)) else { continue }
-            let key = "\(usage.input):\(usage.output):\(usage.cache)"
+            guard let usage = parser(String(line), state) else { continue }
+            let key = "\(usage.model):\(usage.input):\(usage.output):\(usage.cache)"
             if key != lastKey {
                 try add(usage, tool: tool, database: database)
                 lastKey = key
@@ -327,13 +372,15 @@ struct UsageCollector {
         let nextOffset = offset + UInt64(raw.distance(from: raw.startIndex, to: newline)) + 1
         try database.execute(
             """
-            INSERT INTO offsets(path, offset, mtime, last_key) VALUES(?,?,?,?)
+            INSERT INTO offsets(path, offset, mtime, last_key, last_model) VALUES(?,?,?,?,?)
             ON CONFLICT(path) DO UPDATE SET
-                offset=excluded.offset, mtime=excluded.mtime, last_key=excluded.last_key
+                offset=excluded.offset, mtime=excluded.mtime,
+                last_key=excluded.last_key, last_model=excluded.last_model
             """,
             binds: [
                 .text(path), .integer(Int64(nextOffset)), .real(modified),
                 lastKey.map(SQLiteBind.text) ?? .null,
+                state.model.map(SQLiteBind.text) ?? .null,
             ])
     }
 
@@ -390,7 +437,8 @@ struct UsageCollector {
                     try add(
                         ParsedUsage(
                             timestamp: environment.now, input: delta.input, output: delta.output,
-                            cache: delta.cache), tool: "hermes", database: database)
+                            cache: delta.cache,
+                            model: row["model"]?.string ?? ""), tool: "hermes", database: database)
                 }
             }
         } catch {
