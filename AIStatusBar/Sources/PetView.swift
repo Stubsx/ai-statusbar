@@ -89,76 +89,86 @@ struct PetView: View {
     private func s(_ v: CGFloat) -> CGFloat { v * scale }
 
     var body: some View {
-        VStack(spacing: s(4)) {
-            if celebratingSerial > 0 {
-                Text(celebrationMessage)
-                    .font(.system(size: s(10.5), weight: .semibold, design: .rounded))
-                    .foregroundColor(Color(red: 0.25, green: 0.40, blue: 0.65))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .frame(maxWidth: s(184))
-                    .padding(.horizontal, s(10))
-                    .padding(.vertical, s(6))
-                    .background(
-                        Capsule()
-                            .fill(Color(red: 0.92, green: 0.96, blue: 1.0).opacity(0.96))
-                            .overlay(Capsule().stroke(Color.white.opacity(0.96), lineWidth: s(1.3)))
-                            .overlay(
-                                Capsule()
-                                    .stroke(
-                                        Color(red: 0.55, green: 0.72, blue: 0.92).opacity(0.58),
-                                        lineWidth: s(0.6)
-                                    )
-                                    .padding(s(1))
-                            )
-                    )
-                    .shadow(
-                        color: Color(red: 0.34, green: 0.59, blue: 0.88).opacity(0.22),
-                        radius: s(6),
-                        y: s(2)
-                    )
-                    .transition(.opacity.combined(with: .move(edge: .bottom)))
-            } else if hovered {
-                Text(mood.summary)
-                    .font(.system(size: s(11), weight: .medium))
-                    .foregroundColor(.primary)
-                    .padding(.horizontal, s(11))
-                    .padding(.vertical, s(6))
-                    .background(
-                        Capsule()
-                            .fill(.ultraThinMaterial)
-                            .overlay(Capsule().stroke(Color.primary.opacity(0.12), lineWidth: s(0.5)))
-                    )
-                    .shadow(color: .black.opacity(0.18), radius: s(7), y: s(3))
-                    .transition(.opacity.combined(with: .move(edge: .bottom)))
-            } else {
-                Color.clear.frame(height: s(30))
-            }
-
-            // 保持同一个 Sprite 实例，状态换图时沿用当前动画相位，避免动作重新起步。
-            PetSprite(mood: mood, theme: theme, scale: scale)
-        }
-        .frame(width: s(220), height: s(270), alignment: .bottom)
-        .contentShape(Rectangle())
-        .onTapGesture(perform: onOpenDetails)
-        .onHover { inside in
-            withAnimation(.easeOut(duration: 0.16)) { hovered = inside }
-        }
-        .onChange(of: store.completedEventSerial) { serial in
-            guard serial > 0 else { return }
-            celebrationMessage = store.completedEventMessage
-            celebratingSerial = serial
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-                if celebratingSerial == serial {
-                    celebratingSerial = 0
-                    celebrationMessage = "任务完成啦！"
+        // 提示/庆祝气泡是浮层而不是布局成员：相对形象顶部定位、随缩放自适应，
+        // 不出现时不占任何空间（原方案用 30pt 透明占位防跳动，窗口顶部常驻一段空白）。
+        PetSprite(mood: mood, theme: theme, scale: scale)
+            .frame(width: s(220), height: s(236), alignment: .bottom)
+            .overlay(alignment: .top) {
+                if celebratingSerial > 0 {
+                    celebrationBubble
+                } else if hovered {
+                    hoverBubble
                 }
             }
-        }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(
+            .contentShape(Rectangle())
+            .onTapGesture(perform: onOpenDetails)
+            .onHover { inside in
+                withAnimation(.easeOut(duration: 0.16)) { hovered = inside }
+            }
+            .onChange(of: store.completedEventSerial) { serial in
+                guard serial > 0 else { return }
+                celebrationMessage = store.completedEventMessage
+                celebratingSerial = serial
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                    if celebratingSerial == serial {
+                        celebratingSerial = 0
+                        celebrationMessage = "任务完成啦！"
+                    }
+                }
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(
             "\(celebratingSerial > 0 ? celebrationMessage : mood.summary)，单击展开详情"
         )
+    }
+
+    /// 任务完成后的庆祝气泡（浮层，3 秒自动消失）
+    private var celebrationBubble: some View {
+        Text(celebrationMessage)
+            .font(.system(size: s(10.5), weight: .semibold, design: .rounded))
+            .foregroundColor(Color(red: 0.25, green: 0.40, blue: 0.65))
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .frame(maxWidth: s(184))
+            .padding(.horizontal, s(10))
+            .padding(.vertical, s(6))
+            .background(
+                Capsule()
+                    .fill(Color(red: 0.92, green: 0.96, blue: 1.0).opacity(0.96))
+                    .overlay(Capsule().stroke(Color.white.opacity(0.96), lineWidth: s(1.3)))
+                    .overlay(
+                        Capsule()
+                            .stroke(
+                                Color(red: 0.55, green: 0.72, blue: 0.92).opacity(0.58),
+                                lineWidth: s(0.6)
+                            )
+                            .padding(s(1))
+                    )
+            )
+            .shadow(
+                color: Color(red: 0.34, green: 0.59, blue: 0.88).opacity(0.22),
+                radius: s(6),
+                y: s(2)
+            )
+            .padding(.top, s(2))
+            .transition(.opacity.combined(with: .move(edge: .bottom)))
+    }
+
+    /// hover 时的状态提示气泡（浮层，覆盖在形象上沿，不挤占布局）
+    private var hoverBubble: some View {
+        Text(mood.summary)
+            .font(.system(size: s(11), weight: .medium))
+            .foregroundColor(.primary)
+            .padding(.horizontal, s(11))
+            .padding(.vertical, s(6))
+            .background(
+                Capsule()
+                    .fill(.ultraThinMaterial)
+                    .overlay(Capsule().stroke(Color.primary.opacity(0.12), lineWidth: s(0.5)))
+            )
+            .shadow(color: .black.opacity(0.18), radius: s(7), y: s(3))
+            .padding(.top, s(2))
+            .transition(.opacity.combined(with: .move(edge: .bottom)))
     }
 }
 

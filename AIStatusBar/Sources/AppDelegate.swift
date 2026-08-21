@@ -167,6 +167,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
     private var appearanceCaptureGeneration: UInt = 0  // 丢弃异步返回的过期截图
     private var adaptiveAppearanceName: NSAppearance.Name?  // 滞回区内保持上次自适应判定
+    /// 拖动触发的外观重检去抖任务（见 scheduleAppearanceRecheck）
+    private var appearanceRecheckWorkItem: DispatchWorkItem?
     private var appearanceTransitionToken = 0  // 外观过渡进行中又来了新切换时，作废旧的淡入回调
 
     /// 调试日志：往 ~/.ai-statusbar/adapt-debug.log 追加一行（ISO 时间戳 + 消息），异常静默
@@ -294,6 +296,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// 统一入口：按模式应用面板外观。light/dark/system 直写（不发 SCK 请求，开销可忽略）；
     /// adaptive 走背景采样。定时器/拖动/切 app/切 Space/设置变更都调这里。
     /// window→glass/hosting 的 appearance 传导均不可靠，三者都要直写。
+    /// 拖动期间的 didMove 以鼠标事件频率触发；adaptive 模式的背景采样是 SCK 截图
+    ///（枚举窗口 + 截屏，单次数十毫秒），全速跟随会把截图服务打满、拖动明显掉帧。
+    /// 这里做 trailing 去抖：连续拖动只保留最后一次采样（停 250ms 后执行），
+    /// 拖动过程中的背景变化由 3 秒定时器兜底，停下后这一次即时修正观感。
+    private func scheduleAppearanceRecheck() {
+        appearanceRecheckWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in self?.applyPanelAppearanceMode() }
+        appearanceRecheckWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: item)
+    }
+
     private func applyPanelAppearanceMode() {
         appearanceCaptureGeneration &+= 1
         let generation = appearanceCaptureGeneration
@@ -621,7 +634,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             if self.desktopPresentationMode == "card" {
                 UserDefaults.standard.set(NSStringFromPoint(f.origin), forKey: "panelOrigin")
             }
-            self.applyPanelAppearanceMode()  // 拖动后即时重检（adaptive 模式下重采背景亮度）
+            self.scheduleAppearanceRecheck()  // 拖动后重采背景亮度（去抖，见该方法注释）
         }
 
         // 面板外观：每 3 秒走一次模式入口（adaptive 模式下检测面板下方亮度）
@@ -675,7 +688,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         }
 
         petPanel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 220, height: 270),
+            contentRect: NSRect(x: 0, y: 0, width: 220, height: 236),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -734,9 +747,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         }
     }
 
-    /// 桌宠基础尺寸（与 PetView 固定 frame 一致）按比例缩放后的窗口尺寸
+    /// 桌宠基础尺寸（与 PetView 固定 frame 一致）按比例缩放后的窗口尺寸。
+    /// 气泡改浮层后窗口只包形象本体（236），顶部不再为提示预留 30pt。
     private static func petPanelSize(scale: CGFloat) -> NSSize {
-        NSSize(width: 220 * scale, height: 270 * scale)
+        NSSize(width: 220 * scale, height: 236 * scale)
     }
 
     private func restoreWindowPosition(
@@ -806,7 +820,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             y: min(max(petFrame.midY - size.height / 2, visible.minY), maxY)
         )
         panel.setFrameOrigin(origin)
-        applyPanelAppearanceMode()
+        scheduleAppearanceRecheck()  // 跟随拖动会高频触发本方法，采样去抖防掉帧
     }
 
     private var desktopPresentationMode: String {
