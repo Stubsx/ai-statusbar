@@ -18,13 +18,19 @@
 
 - macOS 12 或更高版本；背景自适应截图需要 macOS 14 或更高版本。
 - 安装版不需要 Python 或其他额外运行时。
-- 从源码构建需要支持目标系统的 Xcode Command Line Tools；使用 macOS 26 液态玻璃源码构建时需要包含相关 SDK 的新版 Xcode。
+- 从源码构建需要支持目标系统的 Xcode Command Line Tools；使用 macOS 26 液态玻璃源码构建时需要包含相关 SDK 的新版 Xcode。仓库脚本会自动检查 `DEVELOPER_DIR`、`xcode-select`、系统应用目录，以及已挂载外置磁盘中的 `Applications/应用程序/Xcode*.app`。
 
 先确认环境：
 
 ```bash
 xcode-select -p
-swift --version
+./scripts/with-xcode.sh swift --version
+```
+
+如果完整 Xcode 装在外置磁盘，而 `xcode-select -p` 仍显示 `/Library/Developer/CommandLineTools`，无需修改系统全局设置；保持磁盘已挂载，使用仓库脚本即可。也可以显式覆盖：
+
+```bash
+DEVELOPER_DIR="/path/to/Xcode.app/Contents/Developer" ./scripts/with-xcode.sh swift test
 ```
 
 ## 从源码安装
@@ -57,8 +63,8 @@ open /Applications/灵眸.app
 ## 开发与验证
 
 ```bash
-swift test
-swift run lingmou-collector --json
+./scripts/with-xcode.sh swift test
+./scripts/with-xcode.sh swift run lingmou-collector --json
 ./scripts/check-open-source.sh
 ./AIStatusBar/build.sh
 ./scripts/build-dmg.sh

@@ -113,21 +113,13 @@ struct CodexCollector {
         else {
             return false
         }
-        var lastTask: String?
-        if let text = files.readText(path) {
-            for line in text.split(whereSeparator: \.isNewline) {
-                let value = String(line)
-                guard
-                    value.contains("task_started") || value.contains("task_complete")
-                        || value.contains("turn_aborted"),
-                    let object = JSONValue.object(from: value),
-                    JSONValue.string(object["type"]) == "event_msg",
-                    let payload = object["payload"] as? JSONObject,
-                    let type = JSONValue.string(payload["type"]),
-                    ["task_started", "task_complete", "turn_aborted"].contains(type)
-                else { continue }
-                lastTask = type
-            }
+        // 会话文件是 append-only JSONL，最后一次任务事件几乎总在文件末尾：
+        // 先在尾部倒序找标记（literal 反向搜索走 C 快路径，只解析候选行），
+        // 尾部找不到再对全文件倒序找。不要逐行 contains 扫全文件——
+        // 多个 MB 级会话文件每 10 秒全量扫一遍，单轮采集会拖到 20 秒以上。
+        var lastTask = lastTaskEvent(in: files.readTail(path, bytes: 1 << 20))
+        if lastTask == nil {
+            lastTask = lastTaskEvent(in: files.readText(path))
         }
         var pending = Set<String>()
         for object in files.jsonLines(files.readTail(path)) {
@@ -151,5 +143,41 @@ struct CodexCollector {
             }
         }
         return lastTask == "task_started" || !pending.isEmpty
+    }
+
+    private static let taskEventMarkers = ["task_started", "task_complete", "turn_aborted"]
+
+    /// 倒序找文本里最后一次任务事件（task_started / task_complete / turn_aborted）。
+    /// 每个候选行按事件结构校验；正文里恰好提到这些词的行会被跳过（最多回溯 32 个候选，
+    /// 再多视为没有事件，由调用方走全文件兜底或按 pending 判定）。
+    private func lastTaskEvent(in text: String?) -> String? {
+        guard let text, !text.isEmpty else { return nil }
+        var searchUpper = text.endIndex
+        for _ in 0..<32 {
+            var hit: (index: String.Index, marker: String)?
+            for marker in Self.taskEventMarkers {
+                if let range = text.range(
+                    of: marker, options: [.backwards, .literal],
+                    range: text.startIndex..<searchUpper),
+                    hit == nil || range.lowerBound > hit!.index
+                {
+                    hit = (range.lowerBound, marker)
+                }
+            }
+            guard let found = hit else { return nil }
+            let lineStart =
+                text[..<found.index].lastIndex(of: "\n").map { text.index(after: $0) }
+                ?? text.startIndex
+            let lineEnd = text[found.index...].firstIndex(of: "\n") ?? text.endIndex
+            if let object = JSONValue.object(from: String(text[lineStart..<lineEnd])),
+                JSONValue.string(object["type"]) == "event_msg",
+                let payload = object["payload"] as? JSONObject,
+                JSONValue.string(payload["type"]) == found.marker
+            {
+                return found.marker
+            }
+            searchUpper = lineStart
+        }
+        return nil
     }
 }

@@ -201,6 +201,68 @@ final class CollectorTests: XCTestCase {
         XCTAssertTrue(collector.collect().cli.busy.isEmpty)
     }
 
+    /// 正文里恰好提到任务标记词（如工具输出里出现 task_complete 字样）不能误判成任务已结束：
+    /// 倒序搜索命中候选行后必须通过事件结构校验，校验失败继续向前找真正的事件行。
+    func testCodexMarkerWordsInsideContentDoNotCloseTask() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let session = home.appendingPathComponent(
+            ".codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-12345678-1234-1234-1234-123456789abc.jsonl"
+        )
+        try write(
+            """
+            {"type":"event_msg","payload":{"type":"task_started"}}
+            {"type":"response_item","payload":{"type":"message","content":[{"text":"用户说：帮我搜一下 task_complete 是什么意思"}]}}
+            {"type":"response_item","payload":{"type":"function_call","call_id":"call-1","name":"shell"}}
+            """ + "\n", to: session)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: now)], ofItemAtPath: session.path)
+        let process = ProcessSupport { executable, arguments, _ in
+            executable == "/bin/ps" && arguments.contains("args=")
+                ? "/usr/local/bin/codex\n/Applications/ChatGPT.app/Contents/MacOS/ChatGPT\n" : ""
+        }
+        let collector = CodexCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            settings: CollectorSettings(),
+            files: FileSupport(),
+            processes: process
+        )
+        XCTAssertFalse(collector.collect().ide.busy.isEmpty)
+    }
+
+    /// 最后一次任务事件落在 1MB 尾部窗口之外（长任务后跟大量输出）时，
+    /// 尾部倒序找不到标记要回退到全文件倒序搜索，仍然判忙。
+    func testCodexLargeSessionFallsBackToFullFileSearch() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let session = home.appendingPathComponent(
+            ".codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-12345678-1234-1234-1234-123456789abc.jsonl"
+        )
+        // task_started 在文件开头，后面垫约 2MB 不含标记的普通事件行。
+        var lines = ["{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}"]
+        let filler = String(
+            repeating: "a", count: 220)  // 每行约 300 字节，8000 行 ≈ 2.4MB
+        for _ in 0..<8_000 {
+            lines.append("{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"x\":\"\(filler)\"}}")
+        }
+        try write(lines.joined(separator: "\n") + "\n", to: session)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: now)], ofItemAtPath: session.path)
+        let process = ProcessSupport { executable, arguments, _ in
+            executable == "/bin/ps" && arguments.contains("args=")
+                ? "/usr/local/bin/codex\n/Applications/ChatGPT.app/Contents/MacOS/ChatGPT\n" : ""
+        }
+        let collector = CodexCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            settings: CollectorSettings(),
+            files: FileSupport(),
+            processes: process
+        )
+        XCTAssertFalse(collector.collect().ide.busy.isEmpty)
+    }
+
     func testCodexCliCountIgnoresIdeManagedServerProcesses() throws {
         let home = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: home) }

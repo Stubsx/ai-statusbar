@@ -12,8 +12,8 @@
 ## 本地检查
 
 ```bash
-swift test
-swift run lingmou-collector --json
+./scripts/with-xcode.sh swift test
+./scripts/with-xcode.sh swift run lingmou-collector --json
 ./scripts/check-open-source.sh
 ./AIStatusBar/build.sh
 ```
