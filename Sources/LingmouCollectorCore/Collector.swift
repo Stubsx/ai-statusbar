@@ -35,6 +35,7 @@ public final class LingmouCollector {
         let claude = local.claude()
         let hermes = local.hermes()
         let zcode = local.zcode()
+        let dsh = local.dsh()
         let quota = QuotaCollector(environment: environment, settings: settings, files: files)
             .collect()
         let usage = UsageCollector(environment: environment, settings: settings, files: files)
@@ -57,6 +58,7 @@ public final class LingmouCollector {
             makeTool(key: "hermes", letter: "H", name: "Hermes", raw: hermes, quota: nil),
             makeTool(
                 key: "zcode", letter: "Z", name: "ZCode", raw: zcode, quota: quota["zcode"] ?? nil),
+            makeTool(key: "dsh", letter: "D", name: "DSH", raw: dsh, quota: nil),
         ]
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -106,7 +108,7 @@ public final class LingmouCollector {
             output.append("---")
         }
         output.append(
-            "C=Codex App  X=Codex CLI  K=Kimi Code  W=Kimi Work  L=Claude  H=Hermes  Z=ZCode | size=10 color=gray"
+            "C=Codex App  X=Codex CLI  K=Kimi Code  W=Kimi Work  L=Claude  H=Hermes  Z=ZCode  D=DSH | size=10 color=gray"
         )
         output.append("🟢工作中  🟡空闲  ⚪️未运行 | size=10 color=gray")
         output.append("刷新 | refresh=true")

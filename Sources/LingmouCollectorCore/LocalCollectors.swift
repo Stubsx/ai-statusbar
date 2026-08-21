@@ -159,6 +159,84 @@ struct LocalCollectors {
         return result
     }
 
+    func dsh() -> RawToolState {
+        let count = processes.count(matching: ".bin/dsh")
+        var result = RawToolState(processOn: count > 0, detail: count > 0 ? "Web 在线" : "无进程")
+        let window = TimeInterval(settings.busySeconds(for: "dsh"))
+        // 投影缓存：dsh web 端实时维护的会话投影（标题/进行中的 step/待回工具调用），
+        // 与 session.jsonl.zstd 事件流同步落盘，免解压即可拿到 busy 信号。
+        let cachePath = environment.path(".dsh", "storages", "session_projcache.json")
+        let cacheModified = files.modificationTime(cachePath)
+        let cacheFresh = cacheModified.map { environment.now - $0 <= window } ?? false
+        var titles: [String: String] = [:]
+        if let root = files.read(cachePath).flatMap(JSONValue.object),
+            let tables = root["tables"] as? JSONObject,
+            let sessions = tables["sessions"] as? JSONObject
+        {
+            for (id, entry) in sessions {
+                guard let entry = entry as? JSONObject else { continue }
+                let rows = entry["rows"] as? JSONObject ?? [:]
+                let identity = entry["identity"] as? JSONObject ?? [:]
+                func rowValue(_ key: String) -> Any? {
+                    (rows[key] as? JSONObject)?["val"]
+                }
+                let title =
+                    JSONValue.string(rowValue("title")).flatMap({ $0.isEmpty ? nil : $0 })
+                    ?? JSONValue.string(identity["cwd"]).flatMap {
+                        URL(fileURLWithPath: $0).lastPathComponent.nonempty
+                    } ?? "(未命名会话)"
+                titles[id] = title
+                let metadata = rowValue("sessionListMetadata") as? JSONObject ?? [:]
+                let milliseconds =
+                    JSONValue.double(metadata["lastPromptAt"])
+                    ?? JSONValue.double(identity["createdAt"])
+                if let milliseconds {
+                    updateLatest(&result, title: title, timestamp: milliseconds / 1_000)
+                }
+                let stats = rowValue("sessionStats") as? JSONObject ?? [:]
+                let openStep =
+                    stats["openStep"] != nil && !(stats["openStep"] is NSNull)
+                let pendingCalls = (stats["pendingCalls"] as? JSONObject)?.isEmpty == false
+                // 进程退出可能留下永久 openStep：仅当缓存本身在窗口期内才采信
+                if result.processOn, cacheFresh, openStep || pendingCalls {
+                    result.busy.append(BusyItem(id: id, title: title))
+                }
+            }
+        }
+        // projcache 滞后/缺失时的备份：事件流文件在 busy 窗口内有写入即视为进行中
+        let sessionFiles = files.files(atDepth: 3, under: environment.path(".dsh", "sessions")) {
+            $0.hasSuffix("/session.jsonl.zstd")
+        }
+        var knownBusy = Set(result.busy.map(\.id))
+        for path in sessionFiles {
+            guard let modified = files.modificationTime(path) else { continue }
+            result.activity = max(result.activity, modified)
+            let id = URL(fileURLWithPath: path).deletingLastPathComponent().lastPathComponent
+            if !cacheFresh, result.processOn, environment.now - modified <= window,
+                knownBusy.insert(id).inserted
+            {
+                result.busy.append(BusyItem(id: id, title: titles[id] ?? "(进行中会话)"))
+            }
+        }
+        if let cacheModified {
+            result.activity = max(result.activity, cacheModified)
+        }
+        if result.latest == nil,
+            let latestFile = sessionFiles.max(by: {
+                files.modificationTime($0) ?? 0 < files.modificationTime($1) ?? 0
+            }),
+            let modified = files.modificationTime(latestFile)
+        {
+            let slug = URL(fileURLWithPath: latestFile).deletingLastPathComponent()
+                .deletingLastPathComponent().lastPathComponent
+            let title =
+                slug.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+                .split(separator: "-").last.map(String.init) ?? "(未命名会话)"
+            updateLatest(&result, title: title, timestamp: modified)
+        }
+        return result
+    }
+
     func hermes() -> RawToolState {
         let appCount = processes.count(named: "Hermes")
         let heartbeat = environment.path(".hermes", "state", "gateway.heartbeat")

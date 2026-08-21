@@ -162,6 +162,7 @@ struct UsageCollector {
                 }
             }
             collectHermes(database: database)
+            collectDsh(database: database)
             let rows = try localDaily(database: database)
             let local = Self.usageData(
                 from: UsageSync.mergedDaily([rows]), now: environment.now)
@@ -528,6 +529,128 @@ struct UsageCollector {
         } catch {
             return
         }
+    }
+
+    /// DSH 用量：读 session_projcache.json 投影缓存里每会话的 tokenUsage.totals
+    /// （会话级累计值），快照差分入账。projcache 无 per-session 模型，
+    /// 模型 id 从会话事件流（session.jsonl.zstd）尾部的 finish 块解析，
+    /// 依赖外部 zstd 二进制；不可用时回退 settings.yaml 的 agent-default-model。
+    private func collectDsh(database: SQLiteDatabase) {
+        do {
+            try database.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dsh_snap(
+                    pk TEXT PRIMARY KEY, input INT, output INT, cache INT)
+                """)
+            let cachePath = environment.path(".dsh", "storages", "session_projcache.json")
+            guard let root = files.read(cachePath).flatMap(JSONValue.object),
+                let tables = root["tables"] as? JSONObject,
+                let sessions = tables["sessions"] as? JSONObject
+            else { return }
+            let sessionPaths = files.files(
+                atDepth: 3, under: environment.path(".dsh", "sessions"),
+                where: { $0.hasSuffix("/session.jsonl.zstd") })
+            // GUI 环境 PATH 不含 homebrew，按常见安装位置逐个探测
+            let zstd = ["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd", "/opt/anaconda3/bin/zstd"]
+                .first { files.manager.fileExists(atPath: $0) }
+            let calendar = Calendar.current
+            let todayStart = calendar.startOfDay(for: Date(timeIntervalSince1970: environment.now))
+                .timeIntervalSince1970
+            for (id, entry) in sessions {
+                guard let entry = entry as? JSONObject,
+                    let rows = entry["rows"] as? JSONObject,
+                    let usage = (rows["tokenUsage"] as? JSONObject)?["val"] as? JSONObject,
+                    let totals = usage["totals"] as? JSONObject
+                else { continue }
+                let input = JSONValue.int(totals["uncachedInputTokens"]) ?? 0
+                let output = JSONValue.int(totals["outputTokens"]) ?? 0
+                let cache = JSONValue.int(totals["cacheReadTokens"]) ?? 0
+                let previous = try database.query(
+                    "SELECT input, output, cache FROM dsh_snap WHERE pk=?", binds: [.text(id)]
+                ).first
+                try database.execute(
+                    """
+                    INSERT INTO dsh_snap(pk, input, output, cache) VALUES(?,?,?,?)
+                    ON CONFLICT(pk) DO UPDATE SET
+                        input=excluded.input, output=excluded.output, cache=excluded.cache
+                    """,
+                    binds: [
+                        .text(id), .integer(Int64(input)), .integer(Int64(output)),
+                        .integer(Int64(cache)),
+                    ])
+                let delta: UsageEntry
+                if let previous {
+                    delta = UsageEntry(
+                        input: max(0, input - (previous["input"]?.int ?? 0)),
+                        output: max(0, output - (previous["output"]?.int ?? 0)),
+                        cache: max(0, cache - (previous["cache"]?.int ?? 0)))
+                } else {
+                    let metadata = (rows["sessionListMetadata"] as? JSONObject)?["val"]
+                        as? JSONObject ?? [:]
+                    let lastPromptAt = (JSONValue.double(metadata["lastPromptAt"]) ?? 0) / 1_000
+                    guard lastPromptAt >= todayStart else { continue }
+                    delta = UsageEntry(input: input, output: output, cache: cache)
+                }
+                if delta.input > 0 || delta.output > 0 || delta.cache > 0 {
+                    let model =
+                        dshSessionModel(id: id, sessionPaths: sessionPaths, zstd: zstd)
+                        ?? dshModel()
+                    try add(
+                        ParsedUsage(
+                            timestamp: environment.now, input: delta.input, output: delta.output,
+                            cache: delta.cache, model: model), tool: "dsh", database: database)
+                }
+            }
+        } catch {
+            return
+        }
+    }
+
+    /// 会话当前模型：解压该会话事件流尾部，取最后一个 finish 块的
+    /// replayState.response.model；zstd 缺失或解析失败返回 nil。
+    private func dshSessionModel(id: String, sessionPaths: [String], zstd: String?) -> String? {
+        guard let zstd,
+            let path = sessionPaths.first(where: {
+                URL(fileURLWithPath: $0).deletingLastPathComponent().lastPathComponent == id
+            })
+        else { return nil }
+        let tail = ProcessSupport().output(
+            executable: "/bin/sh",
+            arguments: ["-c", "\"$1\" -dc \"$2\" 2>/dev/null | tail -c 262144", "sh", zstd, path])
+        var model: String?
+        for object in files.jsonLines(tail) {
+            guard JSONValue.string(object["type"]) == "assistant/chunk",
+                let data = object["data"] as? JSONObject,
+                let chunk = data["chunk"] as? JSONObject,
+                JSONValue.string(chunk["type"]) == "finish",
+                let replay = chunk["replayState"] as? JSONObject,
+                let response = replay["response"] as? JSONObject,
+                let value = JSONValue.string(response["model"])
+            else { continue }
+            model = value
+        }
+        return model
+    }
+
+    /// 从 ~/.dsh/settings.yaml 的 agent-default-model 段解析模型名（简单行匹配）。
+    private func dshModel() -> String {
+        guard let text = files.readText(environment.path(".dsh", "settings.yaml")) else {
+            return "dsh"
+        }
+        let lines = text.split(whereSeparator: \.isNewline).map(String.init)
+        guard let section = lines.firstIndex(where: {
+            $0.trimmingCharacters(in: .whitespaces).hasPrefix("agent-default-model:")
+        }) else { return "dsh" }
+        for line in lines.dropFirst(section + 1) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if !line.hasPrefix(" ") && !line.hasPrefix("\t") && !trimmed.isEmpty { break }
+            if trimmed.hasPrefix("model:") {
+                let value = trimmed.dropFirst("model:".count)
+                    .trimmingCharacters(in: .whitespaces)
+                if !value.isEmpty { return value }
+            }
+        }
+        return "dsh"
     }
 
     /// 热力图（GitHub 风格：列=周，行=周一~周日），按 date → 总量 构建。

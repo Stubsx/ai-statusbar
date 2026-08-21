@@ -612,7 +612,7 @@ struct PanelView: View {
     }
 
     private func usageName(_ key: String) -> String {
-        ["codex": "Codex", "kimi": "Kimi Code", "kimi-work": "Kimi Work", "claude": "Claude Code", "zcode": "ZCode", "hermes": "Hermes"][key] ?? key
+        ["codex": "Codex", "kimi": "Kimi Code", "kimi-work": "Kimi Work", "claude": "Claude Code", "zcode": "ZCode", "hermes": "Hermes", "dsh": "DSH"][key] ?? key
     }
 
     private func fmt(_ n: Int) -> String {

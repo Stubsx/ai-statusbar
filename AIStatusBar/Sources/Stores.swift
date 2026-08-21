@@ -8,7 +8,8 @@ import UserNotifications
 
 final class SettingsStore: ObservableObject {
     static let tools = [("codex", "Codex"), ("kimi", "Kimi Code"), ("kimi-work", "Kimi Work"),
-                        ("claude", "Claude Code"), ("hermes", "Hermes"), ("zcode", "ZCode")]
+                        ("claude", "Claude Code"), ("hermes", "Hermes"), ("zcode", "ZCode"),
+                        ("dsh", "DSH")]
     static let busyOptions = [60, 180, 300, 600, 900, 1800]
     static let offlineOptions: [(String, Int)] = [("1 小时", 3600), ("2 小时", 7200), ("3 小时", 10800),
                                                   ("6 小时", 21600), ("12 小时", 43200), ("从不", 0)]
@@ -276,6 +277,9 @@ enum NotificationRouter {
                 }
             case "kimi":
                 if let terminal = hostTerminal(of: "kimi") { activate(terminal) }
+            case "dsh":
+                // dsh 是浏览器里的 web 端，直接打开页面
+                NSWorkspace.shared.open(URL(string: "http://127.0.0.1:3080/")!)
             default:
                 break
             }

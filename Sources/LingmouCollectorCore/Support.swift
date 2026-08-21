@@ -241,6 +241,19 @@ struct ProcessSupport {
         return String(decoding: captured.get(), as: UTF8.self)
     }
 
+    /// 整行子串匹配：进程首 token 不是目标名时使用（如 node 托管的 `dsh web`）。
+    func count(matching substring: String, excluding excluded: [String] = []) -> Int {
+        output(executable: "/bin/ps", arguments: ["-eo", "args="])
+            .split(whereSeparator: \.isNewline)
+            .reduce(into: 0) { count, rawLine in
+                let line = String(rawLine)
+                guard line.contains(substring),
+                    !excluded.contains(where: line.contains)
+                else { return }
+                count += 1
+            }
+    }
+
     func count(named basename: String, excluding excluded: [String] = []) -> Int {
         output(executable: "/bin/ps", arguments: ["-eo", "args="])
             .split(whereSeparator: \.isNewline)

@@ -70,7 +70,7 @@ final class CollectorTests: XCTestCase {
             JSONSerialization.jsonObject(with: collector.jsonData()) as? [String: Any])
         XCTAssertNotNil(object["updated_at"])
         let tools = try XCTUnwrap(object["tools"] as? [[String: Any]])
-        XCTAssertEqual(tools.count, 7)
+        XCTAssertEqual(tools.count, 8)
         XCTAssertNotNil(tools[0]["busy_count"])
     }
 
@@ -689,6 +689,142 @@ final class CollectorTests: XCTestCase {
         try touch(claude, at: now)
         XCTAssertTrue(collectors.kimi().busy.isEmpty)
         XCTAssertTrue(collectors.claude().busy.isEmpty)
+    }
+
+    private func dshProjcache(openStep: String, pendingCalls: String = "{}") -> String {
+        """
+        {"tables":{"sessions":{
+            "session-busy":{"identity":{"createdAt":1999999000000,"cwd":"/tmp/proj"},"rows":{
+                "title":{"val":"DSH 忙碌会话"},
+                "sessionStats":{"val":{"openStep":\(openStep),"pendingCalls":\(pendingCalls)}},
+                "sessionListMetadata":{"val":{"lastPromptAt":2000000000000}}}},
+            "session-done":{"identity":{"createdAt":1999998000000,"cwd":"/tmp/other"},"rows":{
+                "title":{"val":"DSH 已完成会话"},
+                "sessionStats":{"val":{"openStep":null,"pendingCalls":{}}},
+                "sessionListMetadata":{"val":{"lastPromptAt":1999999900000}}}}
+        }}}
+        """
+    }
+
+    func testDshBusyIdleOff() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let cache = home.appendingPathComponent(".dsh/storages/session_projcache.json")
+        try write(dshProjcache(openStep: "2"), to: cache)
+        try touch(cache, at: now)
+        let dshProcess = processSupport([
+            "node /Users/x/.npm/_npx/abc/node_modules/.bin/dsh web"
+        ])
+        func collectors(_ processes: ProcessSupport) -> LocalCollectors {
+            LocalCollectors(
+                environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+                settings: CollectorSettings(), files: FileSupport(), processes: processes)
+        }
+        let busy = collectors(dshProcess).dsh()
+        XCTAssertTrue(busy.processOn)
+        XCTAssertEqual(busy.busy, [BusyItem(id: "session-busy", title: "DSH 忙碌会话")])
+        XCTAssertEqual(busy.latest?.title, "DSH 忙碌会话")
+        // 进程不在 → 无 busy（哪怕 openStep 残留）
+        XCTAssertTrue(collectors(processSupport([])).dsh().busy.isEmpty)
+        // projcache 陈旧（超出 busy 窗口）→ openStep 残留不判 busy
+        try touch(cache, at: now - 3_600)
+        XCTAssertTrue(collectors(dshProcess).dsh().busy.isEmpty)
+        // 备份路径：缓存陈旧但事件流文件在窗口内有写入 → 仍判 busy
+        let sessionFile = home.appendingPathComponent(
+            ".dsh/sessions/--tmp-proj--/session-busy/session.jsonl.zstd")
+        try write("placeholder\n", to: sessionFile)
+        try touch(sessionFile, at: now)
+        XCTAssertEqual(
+            collectors(dshProcess).dsh().busy,
+            [BusyItem(id: "session-busy", title: "DSH 忙碌会话")])
+    }
+
+    func testDshUsageSnapshotDiff() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let timestamp = try XCTUnwrap(DateSupport.timestamp("2033-05-18T03:33:20Z"))
+        try write(
+            """
+            agent-default-model:
+              provider: hczq
+              model: DeepSeek-V4-Flash
+            """,
+            to: home.appendingPathComponent(".dsh/settings.yaml"))
+        let cache = home.appendingPathComponent(".dsh/storages/session_projcache.json")
+        func totals(_ input: Int, _ output: Int, _ cached: Int) -> String {
+            """
+            {"tables":{"sessions":{"session-1":{
+                "identity":{"createdAt":1999999000000,"cwd":"/tmp/proj"},
+                "rows":{
+                    "tokenUsage":{"val":{"totals":{"uncachedInputTokens":\(input),"outputTokens":\(output),"cacheReadTokens":\(cached)}}},
+                    "sessionListMetadata":{"val":{"lastPromptAt":2000000000000}}}
+            }}}}
+            """
+        }
+        try write(totals(100, 20, 40), to: cache)
+        var collector = UsageCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: timestamp),
+            files: FileSupport()
+        )
+        let first = try XCTUnwrap(collector.collect())
+        XCTAssertEqual(first.tools["dsh"], UsageEntry(input: 100, output: 20, cache: 40))
+        // 模型 key 在合并聚合时统一小写归一化
+        XCTAssertEqual(
+            first.models?["deepseek-v4-flash"], UsageEntry(input: 100, output: 20, cache: 40))
+        // 重跑不双计
+        XCTAssertEqual(collector.collect()?.tools["dsh"], first.tools["dsh"])
+        // 增量入账：totals 涨到 150/30/50 后只记差值
+        try write(totals(150, 30, 50), to: cache)
+        collector = UsageCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: timestamp),
+            files: FileSupport()
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(collector.collect()).tools["dsh"],
+            UsageEntry(input: 150, output: 30, cache: 50))
+    }
+
+    /// 模型 id 从会话事件流（zstd）尾部 finish 块解析，优先于 settings.yaml 默认值。
+    /// 依赖外部 zstd 二进制，机器上没有时跳过。
+    func testDshUsageModelFromSessionStream() throws {
+        let zstd = ["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd", "/opt/anaconda3/bin/zstd"]
+            .first { FileManager.default.fileExists(atPath: $0) }
+        let zstdPath = try XCTUnwrap(zstd, "本机无 zstd 二进制，跳过")
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let timestamp = try XCTUnwrap(DateSupport.timestamp("2033-05-18T03:33:20Z"))
+        try write(
+            """
+            {"tables":{"sessions":{"session-m":{
+                "identity":{"createdAt":1999999000000,"cwd":"/tmp/proj"},
+                "rows":{
+                    "tokenUsage":{"val":{"totals":{"uncachedInputTokens":10,"outputTokens":5,"cacheReadTokens":2}}},
+                    "sessionListMetadata":{"val":{"lastPromptAt":2000000000000}}}
+            }}}}
+            """,
+            to: home.appendingPathComponent(".dsh/storages/session_projcache.json"))
+        let jsonl = home.appendingPathComponent(".dsh/tmp/events.jsonl")
+        try write(
+            """
+            {"type":"assistant/chunk","data":{"chunk":{"type":"finish","replayState":{"response":{"model":"Test-Model-X"}}}}}
+            """ + "\n", to: jsonl)
+        let sessionFile = home.appendingPathComponent(
+            ".dsh/sessions/--tmp-proj--/session-m/session.jsonl.zstd")
+        try FileManager.default.createDirectory(
+            at: sessionFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let compress = Process()
+        compress.executableURL = URL(fileURLWithPath: zstdPath)
+        compress.arguments = ["-q", "-o", sessionFile.path, jsonl.path]
+        try compress.run()
+        compress.waitUntilExit()
+        let data = try XCTUnwrap(
+            UsageCollector(
+                environment: CollectorEnvironment(homeDirectory: home.path, now: timestamp),
+                files: FileSupport()
+            ).collect())
+        XCTAssertEqual(data.tools["dsh"], UsageEntry(input: 10, output: 5, cache: 2))
+        XCTAssertEqual(data.models?["test-model-x"], UsageEntry(input: 10, output: 5, cache: 2))
     }
 
     func testKimiWorkReadsConversationStatusAndTitle() throws {
