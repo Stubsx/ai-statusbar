@@ -122,7 +122,10 @@ struct UsageCollector {
     ) {
         do {
             let database = try openDatabase()
-            let sources: [([String], String, UsageParser)] = [
+            let zcodeFromDatabase = collectZcode(database: database)
+            // zcode 优先走 db.sqlite 的 model_usage 表（rollout 文件会被 ZCode 定期清理，
+            // 30 日历史只有库里还在）；db 不可用时回退文件扫描
+            var sources: [([String], String, UsageParser)] = [
                 (
                     files.files(
                         atDepth: 4, under: environment.path(".codex", "sessions"),
@@ -141,15 +144,18 @@ struct UsageCollector {
                         atDepth: 2, under: environment.path(".claude", "projects"),
                         where: { $0.hasSuffix(".jsonl") }), "claude", UsageParsers.claude
                 ),
-                (
-                    files.files(
-                        atDepth: 1, under: environment.path(".zcode", "cli", "rollout"),
-                        where: {
-                            URL(fileURLWithPath: $0).lastPathComponent.hasPrefix("model-io-")
-                                && $0.hasSuffix(".jsonl")
-                        }), "zcode", UsageParsers.zcode
-                ),
             ]
+            if !zcodeFromDatabase {
+                sources.append(
+                    (
+                        files.files(
+                            atDepth: 1, under: environment.path(".zcode", "cli", "rollout"),
+                            where: {
+                                URL(fileURLWithPath: $0).lastPathComponent.hasPrefix("model-io-")
+                                    && $0.hasSuffix(".jsonl")
+                            }), "zcode", UsageParsers.zcode
+                    ))
+            }
             for (paths, tool, parser) in sources {
                 for path in paths {
                     try? scan(path: path, tool: tool, parser: parser, database: database)
@@ -382,6 +388,84 @@ struct UsageCollector {
                 lastKey.map(SQLiteBind.text) ?? .null,
                 state.model.map(SQLiteBind.text) ?? .null,
             ])
+    }
+
+    /// ZCode 用量：读 db.sqlite 的 model_usage 表（每次请求一行，completed 后数值不再变）。
+    /// rollout 文件会被 ZCode 定期清理、只剩最近几个会话，30 日历史只有库里还有。
+    /// 快照差分入账：新行按 started_at 归入对应日期；首次建快照时历史行全部回填
+    /// （此前文件扫描可能已给 daily 记过数，先清掉 tool=zcode 的行防止双计）。
+    /// db 不可用时返回 false，调用方回退 rollout 文件扫描。
+    private func collectZcode(database: SQLiteDatabase) -> Bool {
+        do {
+            let snapExists = !(try database.query(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='zcode_snap'"
+            ).isEmpty)
+            if !snapExists {
+                try database.execute("DELETE FROM daily WHERE tool='zcode'")
+                try database.execute(
+                    """
+                    CREATE TABLE zcode_snap(
+                        pk TEXT PRIMARY KEY, input INT, output INT, cache INT)
+                    """)
+            }
+            let zcode = try SQLiteDatabase(
+                path: environment.path(".zcode", "cli", "db", "db.sqlite"), readOnly: true)
+            let window = Int64((environment.now - maximumAge) * 1000)
+            let rows = try zcode.query(
+                """
+                SELECT id, model_id, input_tokens, output_tokens,
+                    cache_read_input_tokens, started_at
+                FROM model_usage
+                WHERE status='completed' AND started_at >= ?
+                """,
+                binds: [.integer(window)])
+            guard !rows.isEmpty else { return true }
+            // 快照整表读入内存做差分：万级行时省掉每行一次回查，常态采集只写有变化的行
+            var snapshot: [String: (input: Int, output: Int, cache: Int)] = [:]
+            for row in try database.query("SELECT pk, input, output, cache FROM zcode_snap") {
+                if let pk = row["pk"]?.string {
+                    snapshot[pk] = (
+                        row["input"]?.int ?? 0, row["output"]?.int ?? 0, row["cache"]?.int ?? 0
+                    )
+                }
+            }
+            for row in rows {
+                guard let id = row["id"]?.string, let startedMs = row["started_at"]?.double,
+                    startedMs > 0
+                else { continue }
+                let cache = row["cache_read_input_tokens"]?.int ?? 0
+                let input = max(0, (row["input_tokens"]?.int ?? 0) - cache)
+                let output = row["output_tokens"]?.int ?? 0
+                let previous = snapshot[id] ?? (input: 0, output: 0, cache: 0)
+                guard input != previous.input || output != previous.output
+                    || cache != previous.cache
+                else { continue }
+                try database.execute(
+                    """
+                    INSERT INTO zcode_snap(pk, input, output, cache) VALUES(?,?,?,?)
+                    ON CONFLICT(pk) DO UPDATE SET
+                        input=excluded.input, output=excluded.output, cache=excluded.cache
+                    """,
+                    binds: [
+                        .text(id), .integer(Int64(input)), .integer(Int64(output)),
+                        .integer(Int64(cache)),
+                    ])
+                let deltaInput = input - previous.input
+                let deltaOutput = output - previous.output
+                let deltaCache = cache - previous.cache
+                if deltaInput > 0 || deltaOutput > 0 || deltaCache > 0 {
+                    try add(
+                        ParsedUsage(
+                            timestamp: startedMs / 1000, input: deltaInput,
+                            output: deltaOutput, cache: deltaCache,
+                            model: row["model_id"]?.string ?? ""),
+                        tool: "zcode", database: database)
+                }
+            }
+            return true
+        } catch {
+            return false
+        }
     }
 
     private func collectHermes(database: SQLiteDatabase) {

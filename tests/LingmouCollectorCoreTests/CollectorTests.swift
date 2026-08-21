@@ -1067,4 +1067,127 @@ final class CollectorTests: XCTestCase {
         XCTAssertEqual(data.tools["codex"], UsageEntry(input: 18, output: 7, cache: 12))
         XCTAssertEqual(data.models?["gpt-5.6-sol"], UsageEntry(input: 18, output: 7, cache: 12))
     }
+
+    /// ZCode 用量走 db.sqlite 的 model_usage：历史行按 started_at 回填各自日期，
+    /// cancelled/error 行不计；重复采集不双计
+    func testZcodeUsageReadsModelUsageDatabaseWithHistoryBackfill() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now = try XCTUnwrap(DateSupport.timestamp("2033-05-18T03:33:20Z"))
+        let dbDirectory = home.appendingPathComponent(".zcode/cli/db")
+        try FileManager.default.createDirectory(
+            at: dbDirectory, withIntermediateDirectories: true)
+        let zcode = try SQLiteDatabase(
+            path: dbDirectory.appendingPathComponent("db.sqlite").path)
+        try zcode.execute(
+            """
+            CREATE TABLE model_usage(
+                id TEXT PRIMARY KEY, model_id TEXT, status TEXT, started_at INTEGER,
+                input_tokens INTEGER, output_tokens INTEGER, cache_read_input_tokens INTEGER)
+            """)
+        // 今天一条 + 三天前一条；cancelled/error 数值无效应被忽略
+        try zcode.execute(
+            "INSERT INTO model_usage VALUES('r1','GLM-5.3','completed',?,?,?,?)",
+            binds: [
+                .integer(Int64((now - 60) * 1000)), .integer(200), .integer(30),
+                .integer(50),
+            ])
+        try zcode.execute(
+            "INSERT INTO model_usage VALUES('r2','GLM-5.2','completed',?,?,?,?)",
+            binds: [
+                .integer(Int64((now - 3 * 86_400) * 1000)), .integer(1000), .integer(70),
+                .integer(300),
+            ])
+        try zcode.execute(
+            "INSERT INTO model_usage VALUES('r3','GLM-5.3','cancelled',?,?,?,?)",
+            binds: [.integer(Int64((now - 60) * 1000)), .integer(999), .integer(999), .integer(999)])
+        try zcode.execute(
+            "INSERT INTO model_usage VALUES('r4','GLM-5.3','error',?,?,?,?)",
+            binds: [.integer(Int64((now - 60) * 1000)), .integer(888), .integer(888), .integer(888)])
+
+        var collector = UsageCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            files: FileSupport()
+        )
+        let first = try XCTUnwrap(collector.collect())
+        // 今日视图只含今天的请求（input 已扣掉 cache 读）
+        XCTAssertEqual(first.tools["zcode"], UsageEntry(input: 150, output: 30, cache: 50))
+        XCTAssertEqual(first.models?["glm-5.3"], UsageEntry(input: 150, output: 30, cache: 50))
+        // 近七日聚合包含历史行，且落到各自日期（r2 不进今日）
+        let weeklyTotal = UsageEntry(input: 150 + 700, output: 30 + 70, cache: 50 + 300)
+        XCTAssertEqual(first.weekly?.tools["zcode"], weeklyTotal)
+        XCTAssertEqual(first.weekly?.models?["glm-5.2"], UsageEntry(input: 700, output: 70, cache: 300))
+
+        // 第二次采集：快照已建，差分为零，不双计
+        collector = UsageCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            files: FileSupport()
+        )
+        let second = try XCTUnwrap(collector.collect())
+        XCTAssertEqual(second.tools["zcode"], first.tools["zcode"])
+        XCTAssertEqual(second.weekly?.tools["zcode"], weeklyTotal)
+    }
+
+    /// 首次切换到 db 数据源时，此前 rollout 文件扫描记入的 zcode 行应被清掉重记，防双计
+    func testZcodeDatabaseReplacesFileScanRowsOnFirstRun() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now = try XCTUnwrap(DateSupport.timestamp("2033-05-18T03:33:20Z"))
+        // 预置：daily 里已有文件扫描记入的假数据（999），且尚无 zcode_snap
+        let databasePath = home.appendingPathComponent(".ai-statusbar/usage.sqlite")
+        try FileManager.default.createDirectory(
+            at: databasePath.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let preexisting = try SQLiteDatabase(path: databasePath.path)
+        try preexisting.execute(
+            """
+            CREATE TABLE daily(date TEXT, tool TEXT, model TEXT NOT NULL DEFAULT '',
+                input INT, output INT, cache INT, PRIMARY KEY(date, tool, model))
+            """)
+        try preexisting.execute(
+            "INSERT INTO daily VALUES(?, 'zcode', '', 999, 999, 999)",
+            binds: [.text(DateSupport.localDay(now))])
+
+        let dbDirectory = home.appendingPathComponent(".zcode/cli/db")
+        try FileManager.default.createDirectory(
+            at: dbDirectory, withIntermediateDirectories: true)
+        let zcode = try SQLiteDatabase(
+            path: dbDirectory.appendingPathComponent("db.sqlite").path)
+        try zcode.execute(
+            """
+            CREATE TABLE model_usage(
+                id TEXT PRIMARY KEY, model_id TEXT, status TEXT, started_at INTEGER,
+                input_tokens INTEGER, output_tokens INTEGER, cache_read_input_tokens INTEGER)
+            """)
+        try zcode.execute(
+            "INSERT INTO model_usage VALUES('r1','GLM-5.3','completed',?,?,?,?)",
+            binds: [.integer(Int64(now * 1000)), .integer(100), .integer(10), .integer(0)])
+
+        let collector = UsageCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            files: FileSupport()
+        )
+        let data = try XCTUnwrap(collector.collect())
+        XCTAssertEqual(data.tools["zcode"], UsageEntry(input: 100, output: 10, cache: 0))
+    }
+
+    /// db.sqlite 不存在（旧版 ZCode / 未安装）时回退 rollout 文件扫描
+    func testZcodeFallsBackToRolloutFilesWhenDatabaseMissing() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now = try XCTUnwrap(DateSupport.timestamp("2033-05-18T03:33:20Z"))
+        let log = home.appendingPathComponent(
+            ".zcode/cli/rollout/model-io-sess_test-1234.jsonl")
+        try write(
+            """
+            {"completedAt":"2033-05-18T03:33:19Z","model":{"modelId":"GLM-5.3"},"response":{"usage":{"inputTokens":20,"outputTokens":6,"cacheReadTokens":11}}}
+            """ + "\n", to: log)
+        try touch(log, at: now)
+        let collector = UsageCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            files: FileSupport()
+        )
+        let data = try XCTUnwrap(collector.collect())
+        XCTAssertEqual(data.tools["zcode"], UsageEntry(input: 9, output: 6, cache: 11))
+        XCTAssertEqual(data.models?["glm-5.3"], UsageEntry(input: 9, output: 6, cache: 11))
+    }
 }
