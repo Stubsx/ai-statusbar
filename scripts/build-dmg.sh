@@ -3,6 +3,7 @@
 set -euo pipefail
 ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 cd "$ROOT"
+source "$ROOT/scripts/xcode-env.sh"
 
 # 先校验发布参数，避免配置错误时已经生成 DMG 或清理历史产物。
 SIGN_IDENTITY="${SIGN_IDENTITY:-}"

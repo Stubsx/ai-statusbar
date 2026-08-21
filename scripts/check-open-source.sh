@@ -3,6 +3,7 @@
 set -euo pipefail
 ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 cd "$ROOT"
+source "$ROOT/scripts/xcode-env.sh"
 
 swift test
 swift run lingmou-collector --json \
@@ -11,7 +12,8 @@ plutil -lint AIStatusBar/Info.plist
 test -s LICENSE
 test -s PRIVACY.md
 swiftc -typecheck -target arm64-apple-macosx12.0 AIStatusBar/Sources/*.swift
-/bin/bash -n AIStatusBar/build.sh scripts/build-dmg.sh scripts/install-local.sh scripts/release.sh
+/bin/bash -n AIStatusBar/build.sh scripts/build-dmg.sh scripts/install-local.sh scripts/release.sh \
+  scripts/xcode-env.sh scripts/with-xcode.sh
 /bin/bash -n swiftbar-plugins/ai-cli-status.10s.sh
 
 if rg -n --hidden \
