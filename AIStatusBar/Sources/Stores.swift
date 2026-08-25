@@ -155,11 +155,13 @@ final class StatusStore: ObservableObject {
             collectorError = "应用资源不完整：缺少 Swift 状态采集器"
             return
         }
-        isRefreshing = true
-        DispatchQueue.global(qos: .userInitiated).async {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: path)
-            p.arguments = ["--json"]
+            isRefreshing = true
+            DispatchQueue.global(qos: .userInitiated).async {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: path)
+                // 常驻宿主强制真采集（不读结果缓存）并回写 collector-cache.json，
+                // SwiftBar / Übersicht 同一 10 秒窗口内直接共享这份结果。
+                p.arguments = ["--json", "--refresh"]
             let pipe = Pipe()
             p.standardOutput = pipe
             p.standardError = FileHandle.nullDevice

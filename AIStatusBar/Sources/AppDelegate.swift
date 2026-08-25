@@ -654,8 +654,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             self?.updateFullscreenAutoHide()
         }
         // 全屏自动隐藏：进出原生全屏伴随切 Space 事件可即时响应；网页全屏（不切 Space、
-        // 只改窗口尺寸）没有系统通知，靠 1 秒轮询兜底
-        let fullscreenTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+        // 只改窗口尺寸）没有系统通知，靠轮询兜底。5 秒粒度足够——进入只晚几秒隐藏，
+        // 又把每秒一次的 WindowServer 窗口列表往返降下来，减少常驻唤醒。
+        let fullscreenTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             self?.updateFullscreenAutoHide()
         }
         RunLoop.main.add(fullscreenTimer, forMode: .common)

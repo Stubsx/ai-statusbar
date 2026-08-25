@@ -179,7 +179,6 @@ struct PetSprite: View {
     let theme: PetTheme?
     let scale: CGFloat
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var animating = false
     @State private var blinking = false
     @State private var blinkTask: Task<Void, Never>?
     @State private var typingFrame = 0
@@ -205,9 +204,8 @@ struct PetSprite: View {
     }
 
     var body: some View {
-        let active = animating && !reduceMotion
         ZStack(alignment: .topTrailing) {
-            PetBackdropEffects(mood: mood, active: active, scale: scale)
+            PetEffectsBackdrop(mood: mood, scale: scale)
 
             Image(nsImage: image)
                 .resizable()
@@ -221,7 +219,7 @@ struct PetSprite: View {
                     transaction.disablesAnimations = true
                 }
 
-            PetForegroundEffects(mood: mood, active: active, scale: scale)
+            PetEffectsForeground(mood: mood, scale: scale)
 
             if case .working(let taskCount) = mood {
                 Text("×\(taskCount)")
@@ -256,7 +254,6 @@ struct PetSprite: View {
         }
         .frame(width: s(210), height: s(232))
         .onAppear {
-            startAnimations()
             restartBlinking(mood, theme: theme)
             restartTyping(mood, theme: theme)
         }
@@ -270,12 +267,10 @@ struct PetSprite: View {
         // （例如 loading→working 时仍是 loading），敲键盘任务就永远不会被创建。
         // 必须把回传的新 mood 显式传给动画启动函数。
         .onChange(of: mood) { newMood in
-            restartAnimations()
             restartBlinking(newMood, theme: theme)
             restartTyping(newMood, theme: theme)
         }
         .onChange(of: theme) { newTheme in
-            restartAnimations()
             restartBlinking(mood, theme: newTheme)
             restartTyping(mood, theme: newTheme)
         }
@@ -283,31 +278,17 @@ struct PetSprite: View {
             restartBlinking(mood, theme: theme)
             restartTyping(mood, theme: theme)
         }
-        // 窗口被 orderOut（如全屏自动隐藏）时，repeatForever 的层动画会被系统丢弃；
-        // 恢复显示时 animating 值没变，.animation(value:) 不会重新提交，特效永久冻结。
-        // 遮挡状态恢复可见时主动重启一轮动画，眨眼/打字任务也一并兜底重启。
+        // 窗口被 orderOut（如全屏自动隐藏）时眨眼/打字任务照常计时但切图无意义，
+        // 恢复可见时兜底重启一轮；层动效（PetEffectsView）自己监听遮挡恢复。
         .onReceive(
             NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)
         ) { note in
             guard let window = note.object as? NSWindow,
                   window.occlusionState.contains(.visible)
             else { return }
-            restartAnimations()
             restartBlinking(mood, theme: theme)
             restartTyping(mood, theme: theme)
         }
-    }
-
-    private func startAnimations() {
-        guard !reduceMotion else { return }
-        DispatchQueue.main.async { animating = true }
-    }
-
-    private func restartAnimations() {
-        var transaction = Transaction(animation: nil)
-        transaction.disablesAnimations = true
-        withTransaction(transaction) { animating = false }
-        startAnimations()
     }
 
     /// 每轮用 0...99 随机数选择短眨、慢眨或双眨；图片切换禁用动画，避免重影。
@@ -440,148 +421,5 @@ enum PetImageCache {
 
     static func preload(urls: [URL]) {
         for url in urls { _ = image(at: url) }
-    }
-}
-
-/// 放在原画后方的效果，避免改变人物 PNG 的透明边缘。
-private struct PetBackdropEffects: View {
-    let mood: PetMood
-    let active: Bool
-    let scale: CGFloat
-
-    private func s(_ v: CGFloat) -> CGFloat { v * scale }
-
-    @ViewBuilder
-    var body: some View {
-        if mood != .error {
-            Ellipse()
-                .fill(Color.black.opacity(active ? 0.055 : 0.10))
-                .frame(width: s(72), height: s(8))
-                .scaleEffect(x: active ? shadowScale : 1, y: 1)
-                .offset(x: s(-69), y: s(218))
-                .animation(
-                    .easeInOut(duration: shadowDuration).repeatForever(autoreverses: true),
-                    value: active
-                )
-        }
-
-    }
-
-    private var shadowScale: CGFloat {
-        switch mood {
-        case .celebrating: return 0.76
-        case .working: return 0.88
-        case .loading: return 0.92
-        case .idle: return 0.96
-        case .sleeping: return 0.98
-        case .error: return 1
-        }
-    }
-
-    private var shadowDuration: Double {
-        switch mood {
-        case .celebrating: return 0.46
-        case .working: return 0.92
-        case .loading: return 1.2
-        case .idle: return 2.1
-        case .sleeping: return 2.6
-        case .error: return 1
-        }
-    }
-}
-
-/// 徽标、粒子都是独立图层；增加动态感时不会让人物本身产生残影。
-private struct PetForegroundEffects: View {
-    let mood: PetMood
-    let active: Bool
-    let scale: CGFloat
-
-    private func s(_ v: CGFloat) -> CGFloat { v * scale }
-
-    @ViewBuilder
-    var body: some View {
-        switch mood {
-        case .loading:
-            HStack(spacing: s(4)) {
-                ForEach(0..<3, id: \.self) { index in
-                    Circle()
-                        .fill(Color.blue.opacity(active ? 0.84 : 0.42))
-                        .frame(width: s(6), height: s(6))
-                        .scaleEffect(active ? 1.0 : 0.75)
-                        .animation(
-                            .easeInOut(duration: 0.62)
-                                .repeatForever(autoreverses: true)
-                                .delay(Double(index) * 0.20),
-                            value: active
-                        )
-                }
-            }
-            .padding(.horizontal, s(8))
-            .padding(.vertical, s(6))
-            .background(Capsule().fill(.ultraThinMaterial))
-            .offset(x: s(-4), y: s(8))
-
-        case .sleeping:
-            driftingZ("Z", size: 18, delay: 0, x: -9)
-            driftingZ("z", size: 14, delay: 0.7, x: -25)
-            driftingZ("z", size: 11, delay: 1.4, x: -39)
-
-        case .celebrating:
-            sparkle(size: 19, delay: 0, duration: 0.52, x: -12, y: 4, color: .yellow)
-            sparkle(size: 14, delay: 0.18, duration: 0.52, x: -172, y: 35, color: .yellow)
-            sparkle(size: 12, delay: 0.36, duration: 0.52, x: -155, y: 96, color: .orange)
-
-        case .error:
-            Image(systemName: "exclamationmark")
-                .font(.system(size: s(13), weight: .black))
-                .foregroundColor(.white)
-                .frame(width: s(25), height: s(25))
-                .background(Circle().fill(Color.red))
-                .overlay(Circle().stroke(Color.white.opacity(0.85), lineWidth: s(1.5)))
-                .shadow(color: .red.opacity(0.35), radius: s(5))
-                .scaleEffect(active ? 1.0 : 0.95)
-                .animation(.easeInOut(duration: 0.75).repeatForever(autoreverses: true), value: active)
-                .padding(.top, s(10))
-                .padding(.trailing, s(8))
-
-        case .working:
-            sparkle(size: 15, delay: 0, duration: 0.92, x: -137, y: 108, color: .cyan)
-            sparkle(size: 11, delay: 0.46, duration: 0.92, x: -169, y: 132, color: .green)
-
-        case .idle:
-            EmptyView()
-        }
-    }
-
-    private func driftingZ(_ text: String, size: CGFloat, delay: Double, x: CGFloat) -> some View {
-        Text(text)
-            .font(.system(size: s(size), weight: .bold, design: .rounded))
-            .foregroundColor(Color.blue.opacity(active ? 0.25 : 0.85))
-            .offset(x: s(x), y: active ? s(-7) : s(16))
-            .animation(
-                .easeOut(duration: 1.45).repeatForever(autoreverses: false).delay(delay),
-                value: active
-            )
-    }
-
-    private func sparkle(
-        size: CGFloat,
-        delay: Double,
-        duration: Double,
-        x: CGFloat,
-        y: CGFloat,
-        color: Color
-    ) -> some View {
-        Image(systemName: "sparkle")
-            .font(.system(size: s(size), weight: .semibold))
-            .foregroundColor(color)
-            .shadow(color: color.opacity(0.30), radius: s(3))
-            .scaleEffect(active ? 0.96 : 0.62)
-            .opacity(active ? 0.88 : 0.30)
-            .offset(x: s(x), y: s(y))
-            .animation(
-                .easeInOut(duration: duration).repeatForever(autoreverses: true).delay(delay),
-                value: active
-            )
     }
 }

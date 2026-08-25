@@ -547,9 +547,17 @@ struct UsageCollector {
                 let tables = root["tables"] as? JSONObject,
                 let sessions = tables["sessions"] as? JSONObject
             else { return }
-            let sessionPaths = files.files(
-                atDepth: 3, under: environment.path(".dsh", "sessions"),
-                where: { $0.hasSuffix("/session.jsonl.zstd") })
+            // 会话路径映射只有出现用量增量的会话才用得上；全量枚举 sessions 树
+            // 每轮都做太贵，延迟到首个增量会话再扫一次（每轮最多一次）。
+            var sessionPathsCache: [String]?
+            func sessionPaths() -> [String] {
+                if let sessionPathsCache { return sessionPathsCache }
+                let paths = files.files(
+                    atDepth: 3, under: environment.path(".dsh", "sessions"),
+                    where: { $0.hasSuffix("/session.jsonl.zstd") })
+                sessionPathsCache = paths
+                return paths
+            }
             // GUI 环境 PATH 不含 homebrew，按常见安装位置逐个探测
             let zstd = ["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd", "/opt/anaconda3/bin/zstd"]
                 .first { files.manager.fileExists(atPath: $0) }
@@ -608,9 +616,12 @@ struct UsageCollector {
 
     /// 会话当前模型：解压该会话事件流尾部，取最后一个 finish 块的
     /// replayState.response.model；zstd 缺失或解析失败返回 nil。
-    private func dshSessionModel(id: String, sessionPaths: [String], zstd: String?) -> String? {
+    /// sessionPaths 是惰性闭包：仅存在用量增量的会话才需要路径映射。
+    private func dshSessionModel(
+        id: String, sessionPaths: () -> [String], zstd: String?
+    ) -> String? {
         guard let zstd,
-            let path = sessionPaths.first(where: {
+            let path = sessionPaths().first(where: {
                 URL(fileURLWithPath: $0).deletingLastPathComponent().lastPathComponent == id
             })
         else { return nil }

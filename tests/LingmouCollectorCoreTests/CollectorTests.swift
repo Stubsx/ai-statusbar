@@ -1388,4 +1388,45 @@ final class CollectorTests: XCTestCase {
         XCTAssertEqual(data.tools["zcode"], UsageEntry(input: 9, output: 6, cache: 11))
         XCTAssertEqual(data.models?["glm-5.3"], UsageEntry(input: 9, output: 6, cache: 11))
     }
+
+    /// 采集结果缓存：TTL 内命中、过期/缺失返回 nil、文件按私有权限落盘。
+    /// 新鲜度以文件 mtime 为准，now 必须用真实时钟（save 落盘的 mtime 是墙钟）。
+    func testCollectorCacheFreshnessAndPermissions() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let path = CollectorCache.path(home: home.path)
+        let payload = Data(#"{"updated_at":"09:00:00","tools":[]}"#.utf8)
+        let now = Date().timeIntervalSince1970
+
+        XCTAssertNil(CollectorCache.loadFresh(path: path, now: now), "文件缺失应返回 nil")
+
+        CollectorCache.save(payload, to: path)
+        XCTAssertEqual(CollectorCache.loadFresh(path: path, now: now + 1), payload)
+        XCTAssertNil(
+            CollectorCache.loadFresh(path: path, now: now + CollectorCache.ttl + 5),
+            "超过 TTL 即过期，改由调用方全量采集（余量覆盖 save 落盘的毫秒级延迟）")
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: path)
+        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.uint16Value, 0o600)
+    }
+
+    /// 缓存内容是一份标准 --json 输出：编码 → 落盘 → 读回 → 以 snake_case
+    /// 解码 → SwiftBar 渲染，全链路与 CLI 两个输出模式保持同一契约。
+    func testCollectorCacheRoundTripsThroughStatusData() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let path = CollectorCache.path(home: home.path)
+
+        let collector = LingmouCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: 1))
+        let data = try collector.jsonData()
+        CollectorCache.save(data, to: path)
+        let cached = try XCTUnwrap(CollectorCache.loadFresh(path: path, now: Date().timeIntervalSince1970))
+        XCTAssertEqual(cached, data)
+
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let decoded = try decoder.decode(StatusData.self, from: cached)
+        XCTAssertTrue(collector.renderSwiftBar(decoded).contains("C=Codex App"))
+    }
 }

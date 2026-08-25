@@ -201,10 +201,25 @@ struct FileSupport {
         try data.write(to: URL(fileURLWithPath: path), options: .atomic)
         try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
     }
+
+    /// 与 writePrivateJSON 同样的私有落盘语义，用于已是编码结果的 Data
+    /// （如采集器 JSON 输出），避免再过一遍 JSONSerialization。
+    func writePrivateData(_ data: Data, to path: String) throws {
+        let directory = (path as NSString).deletingLastPathComponent
+        try ensurePrivateDirectory(directory)
+        try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+        try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+    }
 }
 
-struct ProcessSupport {
+/// 进程探测。`output` 泛用于任意子进程；`count`/`pids` 走按实例缓存的
+/// ps 快照——一轮采集里每个收集器原先各自 spawn `/bin/ps`（合计约 10 次，
+/// 占单次采集耗时的大头），现在一次采集窗口内进程列表视为不变，只 spawn 一次。
+/// 实例生命周期 = 一次 `LingmouCollector.collect()`，缓存不会跨轮失效。
+final class ProcessSupport {
     var outputOverride: ((String, [String], TimeInterval) -> String)?
+    private var argumentLinesCache: [String]?
+    private var pidLinesCache: [(pid: Int32, args: String)]?
 
     init(outputOverride: ((String, [String], TimeInterval) -> String)? = nil) {
         self.outputOverride = outputOverride
@@ -241,12 +256,34 @@ struct ProcessSupport {
         return String(decoding: captured.get(), as: UTF8.self)
     }
 
+    private func cachedArgumentLines() -> [String] {
+        if let argumentLinesCache { return argumentLinesCache }
+        let lines = output(executable: "/bin/ps", arguments: ["-eo", "args="])
+            .split(whereSeparator: \.isNewline).map(String.init)
+        argumentLinesCache = lines
+        return lines
+    }
+
+    private func cachedPidLines() -> [(pid: Int32, args: String)] {
+        if let pidLinesCache { return pidLinesCache }
+        let lines = output(executable: "/bin/ps", arguments: ["-eo", "pid=,args="])
+            .split(whereSeparator: \.isNewline).map(String.init)
+        var parsed: [(pid: Int32, args: String)] = []
+        for line in lines {
+            guard let space = line.firstIndex(of: " ") else { continue }
+            guard let pid = Int32(line[..<space].trimmingCharacters(in: .whitespaces)),
+                !line[space...].trimmingCharacters(in: .whitespaces).isEmpty
+            else { continue }
+            parsed.append((pid, String(line[line.index(after: space)...])))
+        }
+        pidLinesCache = parsed
+        return parsed
+    }
+
     /// 整行子串匹配：进程首 token 不是目标名时使用（如 node 托管的 `dsh web`）。
     func count(matching substring: String, excluding excluded: [String] = []) -> Int {
-        output(executable: "/bin/ps", arguments: ["-eo", "args="])
-            .split(whereSeparator: \.isNewline)
-            .reduce(into: 0) { count, rawLine in
-                let line = String(rawLine)
+        cachedArgumentLines()
+            .reduce(into: 0) { count, line in
                 guard line.contains(substring),
                     !excluded.contains(where: line.contains)
                 else { return }
@@ -255,10 +292,9 @@ struct ProcessSupport {
     }
 
     func count(named basename: String, excluding excluded: [String] = []) -> Int {
-        output(executable: "/bin/ps", arguments: ["-eo", "args="])
-            .split(whereSeparator: \.isNewline)
+        cachedArgumentLines()
             .reduce(into: 0) { count, rawLine in
-                let line = String(rawLine).trimmingCharacters(in: .whitespaces)
+                let line = rawLine.trimmingCharacters(in: .whitespaces)
                 var tokens = line.split(whereSeparator: \.isWhitespace).map(String.init)
                 while let first = tokens.first, first.contains("=") && !first.hasPrefix("/") {
                     tokens.removeFirst()
@@ -269,6 +305,13 @@ struct ProcessSupport {
                 else { return }
                 count += 1
             }
+    }
+
+    /// 命令行含子串的进程 PID 列表（与 pgrep -f 同语义，复用 ps 快照）。
+    func pids(matching substring: String) -> [Int] {
+        cachedPidLines()
+            .filter { $0.args.contains(substring) }
+            .map { Int($0.pid) }
     }
 }
 

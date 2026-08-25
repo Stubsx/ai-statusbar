@@ -349,10 +349,7 @@ struct LocalCollectors {
             result.busy = untitledLeaseIds.map { BusyItem(id: $0, title: fallback) }
         }
         if result.busy.isEmpty, let latest = result.latest {
-            let pids = processes.output(
-                executable: "/usr/bin/pgrep", arguments: ["-f", "hermes_cli"]
-            )
-            .split(whereSeparator: \.isWhitespace).compactMap { Int($0) }
+            let pids = processes.pids(matching: "hermes_cli")
             if transientConnections(pids: pids)["python", default: 0] > 0 {
                 result.busy = [BusyItem(id: "conn-hermes", title: latest.title)]
             }
@@ -503,10 +500,23 @@ struct LocalCollectors {
         result.activity = max(result.activity, timestamp)
     }
 
+    /// lsof 全表扫描较贵（数十至数百毫秒），而它只兜底"空闲但疑似仍有
+    /// 活动连接"的判定：30 秒内直接复用缓存结果。缓存落在 conn_state.json，
+    /// App / SwiftBar / Übersicht 多个前端共享同一份节流。
+    private static let lsofThrottleSeconds: TimeInterval = 30
+
     private func transientConnections(
         processNames: [String] = [], pids: [Int] = [], minimumAge: TimeInterval = 15,
         maximumAge: TimeInterval = 300
     ) -> [String: Int] {
+        let cachePath = environment.path(".ai-statusbar", "conn_state.json")
+        let state = files.read(cachePath).flatMap(JSONValue.object) ?? [:]
+        if let computedAt = JSONValue.double(state["_lsof_at"]),
+            let cached = state["_lsof_result"] as? JSONObject,
+            environment.now - computedAt < Self.lsofThrottleSeconds
+        {
+            return cached.mapValues { JSONValue.int($0) ?? 0 }
+        }
         var arguments = ["-nP", "-iTCP", "-sTCP:ESTABLISHED", "-a"]
         processNames.forEach { arguments += ["-c", $0] }
         pids.forEach { arguments += ["-p", String($0)] }
@@ -522,8 +532,7 @@ struct LocalCollectors {
             let local = endpoint.components(separatedBy: "->")[0]
             current[parts[0], default: []].insert(local.components(separatedBy: ":").last ?? local)
         }
-        let cachePath = environment.path(".ai-statusbar", "conn_state.json")
-        let old = files.read(cachePath).flatMap(JSONValue.object) ?? [:]
+        let old = state
         var saved: JSONObject = [:]
         var result: [String: Int] = [:]
         for (name, ports) in current {
@@ -540,6 +549,10 @@ struct LocalCollectors {
             saved[name] = next
             result[name] = count
         }
+        saved["_lsof_at"] = environment.now
+        var cachedResult: JSONObject = [:]
+        for (name, count) in result { cachedResult[name] = count }
+        saved["_lsof_result"] = cachedResult
         try? files.writePrivateJSON(saved, to: cachePath)
         return result
     }
