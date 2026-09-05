@@ -279,8 +279,11 @@ struct UsageCollector {
         let root = environment.path(
             "Library", "Application Support", "kimi-desktop", "daimon-share", "daimon",
             "runtime", "kimi-code", "home", "sessions")
+        // 除 main 外，swarm 子代理（agents/agent-N）在各自的 wire.jsonl 里独立计费，
+        // 只扫 main 会大幅少算（子代理的输出常是 main 的数倍）；与 Kimi Code CLI 的
+        // 口径一致。仍按 conv- 前缀排除 ctitle- 这类内部辅助会话。
         return files.files(under: root) { path, isDirectory in
-            guard !isDirectory, path.hasSuffix("/agents/main/wire.jsonl") else { return false }
+            guard !isDirectory, path.hasSuffix("/wire.jsonl") else { return false }
             let session = URL(fileURLWithPath: path)
                 .deletingLastPathComponent()
                 .deletingLastPathComponent()

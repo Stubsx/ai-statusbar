@@ -1215,18 +1215,23 @@ final class CollectorTests: XCTestCase {
         )
         let conversation = root.appendingPathComponent("conv-main/agents/main/wire.jsonl")
         let helper = root.appendingPathComponent("ctitle-helper/agents/main/wire.jsonl")
+        // swarm 子代理在 agents/agent-N 下独立计费，必须计入
+        let swarm = root.appendingPathComponent("conv-main/agents/agent-0/wire.jsonl")
         let usage =
             "{\"type\":\"usage.record\",\"time\":2000000000000,\"usage\":{\"inputOther\":3,\"output\":4,\"inputCacheRead\":5}}\n"
         try write(usage, to: conversation)
         try write(usage, to: helper)
+        try write(usage, to: swarm)
         try touch(conversation, at: timestamp)
         try touch(helper, at: timestamp)
+        try touch(swarm, at: timestamp)
         let data = try XCTUnwrap(
             UsageCollector(
                 environment: CollectorEnvironment(homeDirectory: home.path, now: timestamp),
                 files: FileSupport()
             ).collect())
-        XCTAssertEqual(data.tools["kimi-work"], UsageEntry(input: 3, output: 4, cache: 5))
+        // main + 子代理两条计入，ctitle 辅助会话排除
+        XCTAssertEqual(data.tools["kimi-work"], UsageEntry(input: 6, output: 8, cache: 10))
     }
 
     func testHermesAndZCodeDatabaseCollectors() throws {
