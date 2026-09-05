@@ -48,23 +48,49 @@ struct LocalCollectors {
             "daimon-share/daimon/agents/main/sessions/hosted-logical/conversations.sqlite")
         guard let database = try? SQLiteDatabase(path: databasePath, readOnly: true),
             let columns = try? database.columns(in: "conversations"),
-            Set(["conversation_key", "title", "updated_at_ms"]).isSubset(of: columns),
-            let rows = try? database.query(
-                """
-                SELECT conversation_key, title, updated_at_ms / 1000.0 AS timestamp
-                FROM conversations
-                WHERE title != ''
-                ORDER BY updated_at_ms DESC
-                """)
+            Set(["conversation_key", "title", "updated_at_ms"]).isSubset(of: columns)
         else { return result }
+        // 新版 Kimi（3.2.4+ 这代）不再把 running 维护进状态文件（只在 blocked 等场景
+        // 写入）；运行态改为读会话库的 kernel_session_dir——内嵌 kimi-code 运行时的
+        // 会话目录，用与 Kimi Code 相同的 wire.jsonl 未闭合 step/tool 判定，
+        // main 与 swarm 子代理（agents/agent-N）任一在跑即算运行中。
+        let sessionColumn = columns.contains("kernel_session_dir") ? ", kernel_session_dir" : ""
+        guard let rows = try? database.query(
+            """
+            SELECT conversation_key, title, updated_at_ms / 1000.0 AS timestamp\(sessionColumn)
+            FROM conversations
+            WHERE title != ''
+            ORDER BY updated_at_ms DESC
+            """)
+        else { return result }
+        let window = TimeInterval(max(settings.busySeconds(for: "kimi-work"), 1_800))
         for row in rows {
             guard let id = row["conversation_key"]?.string,
                 let title = row["title"]?.string,
                 let timestamp = row["timestamp"]?.double
             else { continue }
             updateLatest(&result, title: title, timestamp: timestamp)
-            let statusKey = "agent:main:main:conversation:\(id)"
+            // 旧库存裸 id、新库存完整 key（agent:main:main:conversation:<uuid>），双形式兼容，
+            // 避免拼出双重前缀导致状态文件永远匹配不上。
+            let statusKey = id.hasPrefix("agent:")
+                ? id : "agent:main:main:conversation:\(id)"
             if appOn, JSONValue.string(statuses[statusKey]) == "running" {
+                result.busy.append(BusyItem(id: id, title: title))
+                continue
+            }
+            guard let sessionDir = row["kernel_session_dir"]?.string else { continue }
+            let wireFiles = files.files(
+                atDepth: 2,
+                under: (sessionDir as NSString).appendingPathComponent("agents")
+            ) { $0.hasSuffix("/wire.jsonl") }
+            if appOn,
+                wireFiles.contains(where: { path in
+                    guard let modified = files.modificationTime(path),
+                        environment.now - modified <= window
+                    else { return false }
+                    return kimiWireBusy(path)
+                })
+            {
                 result.busy.append(BusyItem(id: id, title: title))
             }
         }

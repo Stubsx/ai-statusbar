@@ -622,6 +622,147 @@ final class CollectorTests: XCTestCase {
         XCTAssertEqual(requestCount, 0)
     }
 
+    /// 建 Kimi Work 会话库夹具；kernel_session_dir 为 NULL 表示旧 schema / 无运行时目录。
+    @discardableResult
+    private func createKimiWorkConversations(
+        at url: URL, rows: [(key: String, title: String, updatedMs: Double, sessionDir: String?)]
+    ) throws {
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        var sql = """
+        CREATE TABLE conversations (
+            conversation_key TEXT NOT NULL,
+            title TEXT NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            kernel_session_dir TEXT
+        );
+        """
+        for row in rows {
+            let dir = row.sessionDir.map { "'\($0.replacingOccurrences(of: "'", with: "''"))'" }
+                ?? "NULL"
+            sql +=
+                "INSERT INTO conversations VALUES ('\(row.key)', '\(row.title)', \(Int(row.updatedMs)), \(dir));"
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        process.arguments = [url.path]
+        let input = Pipe()
+        process.standardInput = input
+        try process.run()
+        input.fileHandleForWriting.write(Data(sql.utf8))
+        input.fileHandleForWriting.closeFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw NSError(domain: "sqlite3", code: Int(process.terminationStatus))
+        }
+        return
+    }
+
+    private func kimiWorkCollectors(home: URL, now: TimeInterval, processes: ProcessSupport)
+        -> LocalCollectors
+    {
+        LocalCollectors(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            settings: CollectorSettings(), files: FileSupport(), processes: processes)
+    }
+
+    /// 新版 Kimi 的运行态：内嵌 kimi-code 运行时的 wire.jsonl 有未闭合 step 即运行中，
+    /// swarm 子代理（agents/agent-N）在跑也算。
+    func testKimiWorkBusyFromSwarmAgentWire() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let sessionDir =
+            home.appendingPathComponent(
+                "Library/Application Support/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions/wd_test/conv-test"
+            ).path
+        try createKimiWorkConversations(
+            at: home.appendingPathComponent(
+                "Library/Application Support/kimi-desktop/daimon-share/daimon/agents/main/sessions/hosted-logical/conversations.sqlite"
+            ),
+            rows: [
+                (
+                    key: "agent:main:main:conversation:abc", title: "日常问候",
+                    updatedMs: now * 1000, sessionDir: sessionDir
+                )
+            ])
+        let wire = URL(fileURLWithPath: sessionDir)
+            .appendingPathComponent("agents/agent-0/wire.jsonl")
+        try write(
+            """
+            {"type":"context.append_loop_event","event":{"type":"step.begin","turnId":"10","uuid":"step"}}
+            """ + "\n", to: wire)
+        try touch(wire, at: now)
+        let state = kimiWorkCollectors(home: home, now: now, processes: processSupport(["Kimi"]))
+            .kimiWork()
+        XCTAssertEqual(state.processOn, true)
+        XCTAssertEqual(state.busy.map(\.title), ["日常问候"])
+        XCTAssertEqual(state.latest?.title, "日常问候")
+    }
+
+    /// step 闭合或 wire 过期都不算运行中。
+    func testKimiWorkIdleWhenWireClosedOrStale() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let sessionDir =
+            home.appendingPathComponent(
+                "Library/Application Support/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions/wd_test/conv-closed"
+            ).path
+        try createKimiWorkConversations(
+            at: home.appendingPathComponent(
+                "Library/Application Support/kimi-desktop/daimon-share/daimon/agents/main/sessions/hosted-logical/conversations.sqlite"
+            ),
+            rows: [
+                (
+                    key: "agent:main:main:conversation:abc", title: "已结束",
+                    updatedMs: now * 1000, sessionDir: sessionDir
+                )
+            ])
+        let wire = URL(fileURLWithPath: sessionDir)
+            .appendingPathComponent("agents/main/wire.jsonl")
+        try write(
+            """
+            {"type":"context.append_loop_event","event":{"type":"step.begin","turnId":"10","uuid":"step"}}
+            {"type":"context.append_loop_event","event":{"type":"step.end","turnId":"10","uuid":"step"}}
+            """ + "\n", to: wire)
+        try touch(wire, at: now)
+        var state = kimiWorkCollectors(home: home, now: now, processes: processSupport(["Kimi"]))
+            .kimiWork()
+        XCTAssertTrue(state.busy.isEmpty)
+
+        // wire 超出活跃窗口（默认下限 30 分钟）也不算
+        state = kimiWorkCollectors(
+            home: home, now: now + 3_600, processes: processSupport(["Kimi"])
+        ).kimiWork()
+        XCTAssertTrue(state.busy.isEmpty)
+        XCTAssertEqual(state.latest?.title, "已结束")
+    }
+
+    /// 旧版 App 的状态文件 running 信号在无 kernel_session_dir 时仍然生效。
+    func testKimiWorkLegacyStatusFileStillMarksBusy() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        try createKimiWorkConversations(
+            at: home.appendingPathComponent(
+                "Library/Application Support/kimi-desktop/daimon-share/daimon/agents/main/sessions/hosted-logical/conversations.sqlite"
+            ),
+            rows: [
+                (
+                    key: "agent:main:main:conversation:abc", title: "旧版会话",
+                    updatedMs: now * 1000, sessionDir: nil
+                )
+            ])
+        try write(
+            "{\"agent:main:main:conversation:abc\":\"running\"}",
+            to: home.appendingPathComponent(
+                "Library/Application Support/kimi-desktop/kimi-agent/conversation-statuses.json"))
+        let state = kimiWorkCollectors(home: home, now: now, processes: processSupport(["Kimi"]))
+            .kimiWork()
+        XCTAssertEqual(state.busy.map(\.title), ["旧版会话"])
+    }
+
     /// Kimi 3.2.4+ safeStorage 加密的 token-store：未开启解密时给出中性提示，不再误报“登录已过期”。
     func testEncryptedKimiTokenStoreDegradesToNoticeWithoutDecrypt() throws {
         let home = try temporaryDirectory()
