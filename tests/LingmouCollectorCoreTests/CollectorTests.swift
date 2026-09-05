@@ -776,7 +776,7 @@ final class CollectorTests: XCTestCase {
         try write(dshProjcache(openStep: "2"), to: cache)
         try touch(cache, at: now)
         let dshProcess = processSupport([
-            "node /Users/x/.npm/_npx/abc/node_modules/.bin/dsh web"
+            "node /home/x/.npm/_npx/abc/node_modules/.bin/dsh web"
         ])
         func collectors(_ processes: ProcessSupport) -> LocalCollectors {
             LocalCollectors(
