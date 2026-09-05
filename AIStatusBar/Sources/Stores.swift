@@ -35,6 +35,8 @@ final class SettingsStore: ObservableObject {
     /// 指到 iCloud Drive 下的文件夹即可在多台 Mac 间同步形象（由系统 iCloud Drive 负责同步）。
     @Published var petLibraryDir = "" { didSet { save() } }
     @Published var onlineQuota = true { didSet { save() } }
+    /// 解密新版 Kimi（3.2.4+）safeStorage 加密的登录凭证以读取月度额度；默认关闭
+    @Published var kimiTokenDecrypt = false { didSet { save() } }
     /// 用量同步：多设备通过共享目录汇总用量/活跃；空目录 = iCloud Drive 默认目录
     @Published var usageSyncEnabled = false { didSet { save() } }
     @Published var usageSyncDir = "" { didSet { save() } }
@@ -82,6 +84,7 @@ final class SettingsStore: ObservableObject {
                            SettingsStore.petScaleRange.upperBound)
         }
         if let v = obj["online_quota"] as? Bool { onlineQuota = v }
+        if let v = obj["kimi_token_decrypt"] as? Bool { kimiTokenDecrypt = v }
         if let s = obj["usage_sync"] as? [String: Any] {
             if let v = s["enabled"] as? Bool { usageSyncEnabled = v }
             if let v = s["dir"] as? String { usageSyncDir = v }
@@ -100,6 +103,7 @@ final class SettingsStore: ObservableObject {
             "pet_library_dir": petLibraryDir,
             "pet_scale": petScale,
             "online_quota": onlineQuota,
+            "kimi_token_decrypt": kimiTokenDecrypt,
             "usage_sync": ["enabled": usageSyncEnabled, "dir": usageSyncDir],
             "number_unit": numberUnit,
         ]

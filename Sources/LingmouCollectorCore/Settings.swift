@@ -5,6 +5,9 @@ public struct CollectorSettings: Sendable {
     public var perToolBusySeconds: [String: Int]
     public var offlineAfterSeconds: Int
     public var onlineQuota: Bool
+    /// 解密新版 Kimi（3.2.4+）safeStorage 加密的 token-store 以读取月度额度。
+    /// 需要访问钥匙串 "kimi-desktop Safe Storage"，默认关闭。
+    public var kimiTokenDecrypt: Bool
     /// 用量同步（多设备汇总）。默认关闭；目录为空时用 iCloud Drive 默认目录
     public var usageSyncEnabled: Bool
     public var usageSyncDir: String?
@@ -14,6 +17,7 @@ public struct CollectorSettings: Sendable {
         perToolBusySeconds: [String: Int] = [:],
         offlineAfterSeconds: Int = 10_800,
         onlineQuota: Bool = true,
+        kimiTokenDecrypt: Bool = false,
         usageSyncEnabled: Bool = false,
         usageSyncDir: String? = nil
     ) {
@@ -21,6 +25,7 @@ public struct CollectorSettings: Sendable {
         self.perToolBusySeconds = perToolBusySeconds
         self.offlineAfterSeconds = offlineAfterSeconds
         self.onlineQuota = onlineQuota
+        self.kimiTokenDecrypt = kimiTokenDecrypt
         self.usageSyncEnabled = usageSyncEnabled
         self.usageSyncDir = usageSyncDir
     }
@@ -46,6 +51,7 @@ public struct CollectorSettings: Sendable {
             perToolBusySeconds: perTool,
             offlineAfterSeconds: JSONValue.int(object["offline_after_sec"]) ?? 10_800,
             onlineQuota: online,
+            kimiTokenDecrypt: JSONValue.bool(object["kimi_token_decrypt"]) ?? false,
             usageSyncEnabled: JSONValue.bool(sync?["enabled"]) ?? false,
             usageSyncDir: syncDir.isEmpty ? nil : syncDir
         )

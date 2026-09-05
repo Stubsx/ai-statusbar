@@ -11,6 +11,7 @@ struct SettingsView: View {
     @ObservedObject var settings: SettingsStore
     @ObservedObject var catalog: PetCatalog
     @State private var showOnlineQuotaAlert = false
+    @State private var showKimiDecryptAlert = false
     @State private var showAdaptiveAlert = false
     @State private var perToolBusyExpanded = false
     /// 系统级通知授权状态（设置窗口打开通知页时查询，用于提示"被系统拒绝"的情况）
@@ -177,6 +178,21 @@ struct SettingsView: View {
                 Button("启用") { settings.onlineQuota = true }
             } message: {
                 Text("灵眸会读取各工具的本地登录令牌，并仅发送到对应厂商的 HTTPS 配额接口。令牌不会写入灵眸日志或缓存。")
+            }
+            divider
+            if settings.onlineQuota {
+                settingRow(
+                    "解密新版 Kimi 凭证",
+                    detail: "Kimi 3.2.4+ 将登录凭证加密存储；开启后需授权钥匙串“kimi-desktop Safe Storage”读取月度额度"
+                ) {
+                    toggle(kimiTokenDecryptBinding)
+                }
+                .alert("开启 Kimi 凭证解密？", isPresented: $showKimiDecryptAlert) {
+                    Button("取消", role: .cancel) {}
+                    Button("开启") { settings.kimiTokenDecrypt = true }
+                } message: {
+                    Text("首次读取时 macOS 会询问是否允许访问钥匙串“kimi-desktop Safe Storage”，选择“始终允许”后不再弹出。口令仅用于在本机解密凭证并查询 Kimi 官方配额接口，不会外传。")
+                }
             }
             divider
             settingRow("用量同步", detail: "多台设备共用一个目录（默认 iCloud Drive）汇总用量与活跃") {
@@ -662,6 +678,17 @@ struct SettingsView: View {
             set: { enabled in
                 if enabled { showOnlineQuotaAlert = true }
                 else { settings.onlineQuota = false }
+            }
+        )
+    }
+
+    /// 首次开启需说明钥匙串授权；关闭直接生效。
+    private var kimiTokenDecryptBinding: Binding<Bool> {
+        Binding(
+            get: { settings.kimiTokenDecrypt },
+            set: { enabled in
+                if enabled { showKimiDecryptAlert = true }
+                else { settings.kimiTokenDecrypt = false }
             }
         )
     }

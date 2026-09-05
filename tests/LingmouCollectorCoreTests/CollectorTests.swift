@@ -1,3 +1,4 @@
+import CommonCrypto
 import Foundation
 import XCTest
 
@@ -619,6 +620,151 @@ final class CollectorTests: XCTestCase {
         ).collect()
         XCTAssertNil(quota["kimi-work"] ?? nil)
         XCTAssertEqual(requestCount, 0)
+    }
+
+    /// Kimi 3.2.4+ safeStorage 加密的 token-store：未开启解密时给出中性提示，不再误报“登录已过期”。
+    func testEncryptedKimiTokenStoreDegradesToNoticeWithoutDecrypt() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        try write(
+            "{\"encryption\":\"safeStorage.v1\",\"data\":\"djEwdGVzdA==\"}",
+            to: home.appendingPathComponent(
+                "Library/Application Support/kimi-desktop/bridge-store/token-store.json"))
+        var requestCount = 0
+        let quota = QuotaCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: 2_000_000_000),
+            settings: CollectorSettings(onlineQuota: true, kimiTokenDecrypt: false),
+            files: FileSupport(),
+            requestOverride: { _ in
+                requestCount += 1
+                return nil
+            }
+        ).collect()
+        let kimiWork = try XCTUnwrap(quota["kimi-work"] ?? nil)
+        XCTAssertEqual(kimiWork.notice, QuotaCollector.kimiEncryptedNotice)
+        XCTAssertTrue(kimiWork.windows.isEmpty)
+        XCTAssertEqual(requestCount, 0)
+    }
+
+    /// 加密读不到时沿用上次成功读取的月度窗口，只替换提示文案。
+    func testEncryptedKimiTokenStoreKeepsPreviousWindowsWithNotice() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        try write(
+            "{\"encryption\":\"safeStorage.v1\",\"data\":\"djEwdGVzdA==\"}",
+            to: home.appendingPathComponent(
+                "Library/Application Support/kimi-desktop/bridge-store/token-store.json"))
+        try write(
+            """
+            {"kimi-work":{"plan":"Allegro","windows":[{"kind":"month","label":"本月","used_percent":42,"resets_at":2000000600,"window_minutes":43200}],"updated_at":1},"_online_quota_enabled":true,"_kimi_quota_separated":true,"_kimi_token_mtime":100,"_kimi_coding_token_mtime":0}
+            """,
+            to: home.appendingPathComponent(".ai-statusbar/quota-cache.json"))
+        let quota = QuotaCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: 2_000_000_000),
+            settings: CollectorSettings(onlineQuota: true),
+            files: FileSupport(),
+            requestOverride: { _ in nil }
+        ).collect()
+        let kimiWork = try XCTUnwrap(quota["kimi-work"] ?? nil)
+        XCTAssertEqual(kimiWork.notice, QuotaCollector.kimiEncryptedNotice)
+        XCTAssertEqual(kimiWork.windows.map(\.kind), ["month"])
+        XCTAssertEqual(kimiWork.windows.map(\.usedPercent), [42])
+        XCTAssertEqual(kimiWork.plan, "Allegro")
+    }
+
+    /// 开启解密后走完整链路：钥匙串口令 → v10 AES 解密 → 明文凭证 → 官方接口。
+    func testEncryptedKimiTokenStoreDecryptsWithKeyProvider() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let inner = "{\"tokens\":{\"access_token\":\"desktop-token\"}}"
+        try write(
+            "{\"encryption\":\"safeStorage.v1\",\"data\":\"\(try encryptedV10Payload(inner, password: "test-key"))\"}",
+            to: home.appendingPathComponent(
+                "Library/Application Support/kimi-desktop/bridge-store/token-store.json"))
+        var authHeaders: [String] = []
+        var collector = QuotaCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: 2_000_000_000),
+            settings: CollectorSettings(onlineQuota: true, kimiTokenDecrypt: true),
+            files: FileSupport(),
+            requestOverride: { request in
+                guard request.url?.host == "www.kimi.com" else { return nil }
+                authHeaders.append(request.value(forHTTPHeaderField: "Authorization") ?? "")
+                if request.url?.path.contains("GetSubscriptionStats") == true {
+                    return [
+                        "subscriptionBalance": [
+                            "amountUsedRatio": 0.5,
+                            "kimiCodeUsedRatio": 0.1,
+                            "expireTime": "2033-05-18T03:33:20Z",
+                        ]
+                    ]
+                }
+                return ["subscription": ["goods": ["title": "Allegro"]]]
+            }
+        )
+        collector.kimiKeychainOverride = { service, account in
+            XCTAssertEqual(service, KimiSafeStorage.keychainService)
+            XCTAssertEqual(account, KimiSafeStorage.keychainAccount)
+            return Data("test-key".utf8)
+        }
+        let quota = collector.collect()
+        let kimiWork = try XCTUnwrap(quota["kimi-work"] ?? nil)
+        XCTAssertEqual(kimiWork.windows.map(\.kind), ["month"])
+        XCTAssertEqual(kimiWork.windows.map(\.usedPercent), [50])
+        XCTAssertEqual(kimiWork.plan, "Allegro")
+        XCTAssertEqual(authHeaders, ["Bearer desktop-token", "Bearer desktop-token"])
+    }
+
+    /// 解密失败（钥匙串拒绝 / 格式变化）同样沿用上次配额，不误报登录过期。
+    func testEncryptedKimiTokenStoreDecryptFailureKeepsNotice() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        try write(
+            "{\"encryption\":\"safeStorage.v1\",\"data\":\"djEwdGVzdA==\"}",
+            to: home.appendingPathComponent(
+                "Library/Application Support/kimi-desktop/bridge-store/token-store.json"))
+        var collector = QuotaCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: 2_000_000_000),
+            settings: CollectorSettings(onlineQuota: true, kimiTokenDecrypt: true),
+            files: FileSupport(),
+            requestOverride: { _ in nil }
+        )
+        collector.kimiKeychainOverride = { _, _ in nil }
+        let quota = collector.collect()
+        XCTAssertEqual(quota["kimi-work"]??.notice, QuotaCollector.kimiDecryptFailedNotice)
+    }
+
+    func testKimiSafeStorageRejectsMalformedPayloads() {
+        XCTAssertNil(KimiSafeStorage.decryptTokenStore(payload: "不是 base64！", keyProvider: { _, _ in Data() }))
+        // v9 前缀不是当前 os_crypt 格式
+        let wrongPrefix = Data("v9xxxxxxxxxxxxxxxxxxxxxx".utf8).base64EncodedString()
+        XCTAssertNil(
+            KimiSafeStorage.decryptTokenStore(payload: wrongPrefix, keyProvider: { _, _ in Data() }))
+        // 钥匙串口令缺失直接放弃
+        XCTAssertNil(KimiSafeStorage.decryptTokenStore(payload: "djEwdGVzdA==", keyProvider: { _, _ in nil }))
+    }
+
+    /// 按 Chromium os_crypt v10 约定构造密文：AES-128-CBC + PKCS7，密钥用同一套
+    /// PBKDF2 派生（与实现共用 deriveKey，保证测试口径一致），IV 为 16 个空格，
+    /// 前缀 "v10"，供解密链路测试使用。
+    private func encryptedV10Payload(_ plaintext: String, password: String) throws -> String {
+        let key = try XCTUnwrap(KimiSafeStorage.deriveKey(password: Data(password.utf8)))
+        var keyBytes = [UInt8](key)
+        var ivBytes = [UInt8](repeating: 0x20, count: 16)
+        var plainBytes = [UInt8](plaintext.utf8)
+        var outputBytes = [UInt8](repeating: 0, count: plainBytes.count + 32)
+        var moved = 0
+        let status = CCCrypt(
+            CCOperation(kCCEncrypt),
+            CCAlgorithm(kCCAlgorithmAES),
+            CCOptions(kCCOptionPKCS7Padding),
+            &keyBytes, keyBytes.count,
+            &ivBytes,
+            &plainBytes, plainBytes.count,
+            &outputBytes, outputBytes.count,
+            &moved
+        )
+        guard status == kCCSuccess else { throw NSError(domain: "CCCrypt", code: Int(status)) }
+        return (Data("v10".utf8) + Data(outputBytes.prefix(moved))).base64EncodedString()
     }
 
     func testOldMergedKimiCacheIsImmediatelySeparated() throws {

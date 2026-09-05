@@ -5,6 +5,13 @@ struct QuotaCollector {
     let settings: CollectorSettings
     let files: FileSupport
     var requestOverride: ((URLRequest) -> JSONObject?)? = nil
+    var kimiKeychainOverride: ((String, String) -> Data?)? = nil
+
+    /// token-store 被 Kimi 3.2.4+ 整包加密（safeStorage）时读不到明文凭证。这属于
+    /// 读取手段缺失而不是账号退出，不应清空面板：命中这些提示时沿用上次月度配额。
+    static let kimiEncryptedNotice = "新版 Kimi 已加密本地凭证，月度额度暂不可读（可在设置开启解密）"
+    static let kimiDecryptFailedNotice = "无法解密新版 Kimi 凭证（钥匙串未授权或格式变化），月度额度沿用上次结果"
+    static let kimiStaleableNotices: Set<String> = [kimiEncryptedNotice, kimiDecryptFailedNotice]
 
     private struct CachedQuota {
         var codex: ToolQuota?
@@ -18,6 +25,8 @@ struct QuotaCollector {
     }
 
     private struct MonthlyCache: Codable {
+        /// 缓存结构版本；旧版（无 schema，含“登录已过期”误报时代）直接作废重算。
+        var schema: Int = 2
         var checkedAt: TimeInterval
         var tokenMtime: TimeInterval
         var quota: ToolQuota?
@@ -46,7 +55,8 @@ struct QuotaCollector {
         let old = cached
         var codex: ToolQuota? = settings.onlineQuota ? codexOnline() ?? codexLocal() : codexLocal()
         var kimi: ToolQuota? = settings.onlineQuota ? kimiCodingQuota(previous: old?.kimi) : nil
-        var kimiWork: ToolQuota? = settings.onlineQuota ? kimiWorkQuota() : nil
+        var kimiWork: ToolQuota? =
+            settings.onlineQuota ? kimiWorkQuota(previous: old?.kimiWork) : nil
         var zcode: ToolQuota? = settings.onlineQuota ? zcodeQuota() : nil
         if sameMode {
             if codex == nil { codex = old?.codex }
@@ -302,6 +312,32 @@ struct QuotaCollector {
             "Library", "Application Support", "kimi-desktop", "bridge-store", "token-store.json")
     }
 
+    /// 取 token-store 里的 access_token。旧版是明文 JSON（tokens.access_token）；
+    /// Kimi 3.2.4+ 整包 safeStorage 加密（encryption/data 字段），需在设置中开启
+    /// 解密并用钥匙串口令解开，读不到时返回对应的降级提示。
+    private func kimiStoredAccessToken(_ store: JSONObject) -> (token: String?, notice: String?) {
+        if let tokens = store["tokens"] as? JSONObject,
+            let token = JSONValue.string(tokens["access_token"]), !token.isEmpty
+        {
+            return (token, nil)
+        }
+        guard JSONValue.string(store["encryption"]) != nil,
+            let payload = JSONValue.string(store["data"])
+        else { return (nil, nil) }
+        guard settings.kimiTokenDecrypt else {
+            return (nil, Self.kimiEncryptedNotice)
+        }
+        let provider = kimiKeychainOverride ?? KimiSafeStorage.readKeychainPassword
+        guard let plain = KimiSafeStorage.decryptTokenStore(payload: payload, keyProvider: provider)
+        else { return (nil, Self.kimiDecryptFailedNotice) }
+        // 兼容 {"tokens":{"access_token":…}} 与解密后直接平铺两种形态。
+        let tokens = (plain["tokens"] as? JSONObject) ?? plain
+        guard let token = JSONValue.string(tokens["access_token"]), !token.isEmpty else {
+            return (nil, Self.kimiDecryptFailedNotice)
+        }
+        return (token, nil)
+    }
+
     private var kimiTokenModificationTime: TimeInterval {
         files.modificationTime(kimiTokenPath) ?? 0
     }
@@ -314,11 +350,18 @@ struct QuotaCollector {
         FileManager.default.fileExists(atPath: kimiWorkRoot)
     }
 
-    private func kimiWorkQuota() -> ToolQuota? {
+    private func kimiWorkQuota(previous: ToolQuota?) -> ToolQuota? {
         guard kimiWorkInstalled else { return nil }
         let monthly = kimiMonthlyQuota()
         if let quota = monthly.0 { return quota }
         guard let notice = monthly.1 else { return nil }
+        // 凭证加密读不到时保留上次窗口、只更新提示，避免误报“登录已过期”清空面板。
+        if Self.kimiStaleableNotices.contains(notice), var kept = previous,
+            !kept.windows.isEmpty
+        {
+            kept.notice = notice
+            return kept
+        }
         return ToolQuota(plan: nil, windows: [], updatedAt: Int(environment.now), notice: notice)
     }
 
@@ -331,6 +374,7 @@ struct QuotaCollector {
         let tokenTime = kimiTokenModificationTime
         if let cacheData = files.read(cachePath),
             let cache = try? decoder.decode(MonthlyCache.self, from: cacheData),
+            cache.schema == 2,
             environment.now - cache.checkedAt < 3_600, cache.tokenMtime == tokenTime
         {
             return (cache.quota, cache.notice)
@@ -350,11 +394,12 @@ struct QuotaCollector {
         guard FileManager.default.fileExists(atPath: kimiTokenPath) else {
             return (nil, "Kimi Work 尚未登录，无法读取本月额度")
         }
-        guard let store = files.read(kimiTokenPath).flatMap(JSONValue.object),
-            let tokens = store["tokens"] as? JSONObject,
-            let token = JSONValue.string(tokens["access_token"]), !token.isEmpty
-        else {
+        guard let store = files.read(kimiTokenPath).flatMap(JSONValue.object) else {
             return (nil, "Kimi 登录已过期，请打开 Kimi App 重新登录")
+        }
+        let stored = kimiStoredAccessToken(store)
+        guard let token = stored.token, !token.isEmpty else {
+            return (nil, stored.notice ?? "Kimi 登录已过期，请打开 Kimi App 重新登录")
         }
         let expiration = jwtExpiration(token)
         guard expiration == 0 || environment.now < expiration - 30 else {
