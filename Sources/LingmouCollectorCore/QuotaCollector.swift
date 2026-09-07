@@ -314,28 +314,35 @@ struct QuotaCollector {
 
     /// 取 token-store 里的 access_token。旧版是明文 JSON（tokens.access_token）；
     /// Kimi 3.2.4+ 整包 safeStorage 加密（encryption/data 字段），需在设置中开启
-    /// 解密并用钥匙串口令解开，读不到时返回对应的降级提示。
-    private func kimiStoredAccessToken(_ store: JSONObject) -> (token: String?, notice: String?) {
+    /// 解密并用钥匙串口令解开，读不到时返回对应的降级提示。refreshable 表示凭证
+    /// 带 refresh_token（App 持有它即可免登录自动续期，access_token 过期≠账号退出）。
+    private func kimiStoredAccessToken(_ store: JSONObject) -> (
+        token: String?, refreshable: Bool, notice: String?
+    ) {
         if let tokens = store["tokens"] as? JSONObject,
             let token = JSONValue.string(tokens["access_token"]), !token.isEmpty
         {
-            return (token, nil)
+            return (token, kimiHasRefreshToken(tokens), nil)
         }
         guard JSONValue.string(store["encryption"]) != nil,
             let payload = JSONValue.string(store["data"])
-        else { return (nil, nil) }
+        else { return (nil, false, nil) }
         guard settings.kimiTokenDecrypt else {
-            return (nil, Self.kimiEncryptedNotice)
+            return (nil, false, Self.kimiEncryptedNotice)
         }
         let provider = kimiKeychainOverride ?? KimiSafeStorage.readKeychainPassword
         guard let plain = KimiSafeStorage.decryptTokenStore(payload: payload, keyProvider: provider)
-        else { return (nil, Self.kimiDecryptFailedNotice) }
+        else { return (nil, false, Self.kimiDecryptFailedNotice) }
         // 兼容 {"tokens":{"access_token":…}} 与解密后直接平铺两种形态。
         let tokens = (plain["tokens"] as? JSONObject) ?? plain
         guard let token = JSONValue.string(tokens["access_token"]), !token.isEmpty else {
-            return (nil, Self.kimiDecryptFailedNotice)
+            return (nil, false, Self.kimiDecryptFailedNotice)
         }
-        return (token, nil)
+        return (token, kimiHasRefreshToken(tokens), nil)
+    }
+
+    private func kimiHasRefreshToken(_ tokens: JSONObject) -> Bool {
+        !(JSONValue.string(tokens["refresh_token"]) ?? "").isEmpty
     }
 
     private var kimiTokenModificationTime: TimeInterval {
@@ -403,6 +410,11 @@ struct QuotaCollector {
         }
         let expiration = jwtExpiration(token)
         guard expiration == 0 || environment.now < expiration - 30 else {
+            // access_token 只是短期快照，App 持 refresh_token 会在使用时自动续期并
+            // 回写（重开 App 也无需重新登录）；过期只说明快照陈旧，不代表账号退出。
+            // 灵眸保持只读，沿用最近一次有效配额；仅当确实没有 refresh_token 时才
+            // 提示需要重新登录。
+            if stored.refreshable { return (nil, nil) }
             return (nil, "Kimi 登录已过期，请打开 Kimi App 重新登录")
         }
         guard

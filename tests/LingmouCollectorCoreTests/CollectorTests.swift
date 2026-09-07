@@ -884,6 +884,93 @@ final class CollectorTests: XCTestCase {
         XCTAssertNil(KimiSafeStorage.decryptTokenStore(payload: "djEwdGVzdA==", keyProvider: { _, _ in nil }))
     }
 
+    /// 构造 exp 已过期的假 JWT（测试约定 now=2_000_000_000）。
+    private func expiredJWT(_ exp: TimeInterval = 1_999_999_000) -> String {
+        let payload = Data("{\"exp\":\(Int(exp))}".utf8)
+            .base64EncodedString()
+            .replacingOccurrences(of: "=", with: "")
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+        return "h.\(payload).s"
+    }
+
+    /// access_token 过期但带 refresh_token：App 会自动续期，不算账号退出，
+    /// 沿用上次配额且不发无效请求。
+    func testExpiredKimiWorkTokenWithRefreshKeepsPreviousQuota() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        try write(
+            "{\"tokens\":{\"access_token\":\"\(expiredJWT())\",\"refresh_token\":\"refresh\"}}",
+            to: home.appendingPathComponent(
+                "Library/Application Support/kimi-desktop/bridge-store/token-store.json"))
+        try write(
+            """
+            {"kimi-work":{"plan":"Allegro","windows":[{"kind":"month","label":"本月","used_percent":42,"resets_at":2000000600,"window_minutes":43200}],"updated_at":1},"_online_quota_enabled":true,"_kimi_quota_separated":true,"_kimi_token_mtime":100,"_kimi_coding_token_mtime":0}
+            """,
+            to: home.appendingPathComponent(".ai-statusbar/quota-cache.json"))
+        var requestCount = 0
+        let quota = QuotaCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: 2_000_000_000),
+            settings: CollectorSettings(onlineQuota: true),
+            files: FileSupport(),
+            requestOverride: { _ in
+                requestCount += 1
+                return nil
+            }
+        ).collect()
+        let kimiWork = try XCTUnwrap(quota["kimi-work"] ?? nil)
+        XCTAssertNil(kimiWork.notice)
+        XCTAssertEqual(kimiWork.windows.map(\.kind), ["month"])
+        XCTAssertEqual(kimiWork.windows.map(\.usedPercent), [42])
+        XCTAssertEqual(requestCount, 0)
+    }
+
+    /// 没有 refresh_token 才是真正退出登录：提示重新登录并清空窗口。
+    func testExpiredKimiWorkTokenWithoutRefreshAsksRelogin() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        try write(
+            "{\"tokens\":{\"access_token\":\"\(expiredJWT())\"}}",
+            to: home.appendingPathComponent(
+                "Library/Application Support/kimi-desktop/bridge-store/token-store.json"))
+        let quota = QuotaCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: 2_000_000_000),
+            settings: CollectorSettings(onlineQuota: true),
+            files: FileSupport(),
+            requestOverride: { _ in nil }
+        ).collect()
+        XCTAssertEqual(quota["kimi-work"]??.notice, "Kimi 登录已过期，请打开 Kimi App 重新登录")
+        XCTAssertTrue(quota["kimi-work"]??.windows.isEmpty ?? false)
+    }
+
+    /// 加密 store（当前 Kimi 实际格式）同样适用：过期 + refresh_token → 沿用旧配额。
+    func testExpiredEncryptedKimiWorkTokenKeepsPreviousQuota() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let inner =
+            "{\"tokens\":{\"access_token\":\"\(expiredJWT())\",\"refresh_token\":\"refresh\"}}"
+        try write(
+            "{\"encryption\":\"safeStorage.v1\",\"data\":\"\(try encryptedV10Payload(inner, password: "test-key"))\"}",
+            to: home.appendingPathComponent(
+                "Library/Application Support/kimi-desktop/bridge-store/token-store.json"))
+        try write(
+            """
+            {"kimi-work":{"plan":"Allegro","windows":[{"kind":"month","label":"本月","used_percent":42,"resets_at":2000000600,"window_minutes":43200}],"updated_at":1},"_online_quota_enabled":true,"_kimi_quota_separated":true,"_kimi_token_mtime":100,"_kimi_coding_token_mtime":0}
+            """,
+            to: home.appendingPathComponent(".ai-statusbar/quota-cache.json"))
+        var collector = QuotaCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: 2_000_000_000),
+            settings: CollectorSettings(onlineQuota: true, kimiTokenDecrypt: true),
+            files: FileSupport(),
+            requestOverride: { _ in nil }
+        )
+        collector.kimiKeychainOverride = { _, _ in Data("test-key".utf8) }
+        let kimiWork = try XCTUnwrap(collector.collect()["kimi-work"] ?? nil)
+        XCTAssertNil(kimiWork.notice)
+        XCTAssertEqual(kimiWork.windows.map(\.usedPercent), [42])
+        XCTAssertEqual(kimiWork.plan, "Allegro")
+    }
+
     /// 按 Chromium os_crypt v10 约定构造密文：AES-128-CBC + PKCS7，密钥用同一套
     /// PBKDF2 派生（与实现共用 deriveKey，保证测试口径一致），IV 为 16 个空格，
     /// 前缀 "v10"，供解密链路测试使用。
