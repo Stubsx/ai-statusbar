@@ -874,6 +874,102 @@ final class CollectorTests: XCTestCase {
         XCTAssertEqual(quota["kimi-work"]??.notice, QuotaCollector.kimiDecryptFailedNotice)
     }
 
+    /// 旧月度缓存不感知解密开关：开关关闭时写入的“未开启解密”提示缓存，
+    /// 在开启解密后必须立即失效重算，而不是回放提示最长 1 小时。
+    func testMonthlyCacheInvalidatedWhenDecryptSettingChanges() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let tokenStore = home.appendingPathComponent(
+            "Library/Application Support/kimi-desktop/bridge-store/token-store.json")
+        let inner = "{\"tokens\":{\"access_token\":\"desktop-token\"}}"
+        try write(
+            "{\"encryption\":\"safeStorage.v1\",\"data\":\"\(try encryptedV10Payload(inner, password: "test-key"))\"}",
+            to: tokenStore)
+        try touch(tokenStore, at: 1_999_999_000)
+        // 模拟开关关闭时写入的月度缓存（无 decrypt_enabled 字段，值为 nil）
+        try write(
+            """
+            {"schema":2,"checked_at":2000000000,"token_mtime":1999999000,"quota":null,"notice":"\(QuotaCollector.kimiEncryptedNotice)"}
+            """,
+            to: home.appendingPathComponent(".ai-statusbar/kimi-monthly-cache.json"))
+        var collector = QuotaCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: 2_000_000_000),
+            settings: CollectorSettings(onlineQuota: true, kimiTokenDecrypt: true),
+            files: FileSupport(),
+            requestOverride: { request in
+                guard request.url?.host == "www.kimi.com" else { return nil }
+                if request.url?.path.contains("GetSubscriptionStats") == true {
+                    return [
+                        "subscriptionBalance": [
+                            "amountUsedRatio": 0.5,
+                            "kimiCodeUsedRatio": 0.1,
+                            "expireTime": "2033-05-18T03:33:20Z",
+                        ]
+                    ]
+                }
+                return ["subscription": ["goods": ["title": "Allegro"]]]
+            }
+        )
+        collector.kimiKeychainOverride = { _, _ in Data("test-key".utf8) }
+        let kimiWork = try XCTUnwrap(collector.collect()["kimi-work"] ?? nil)
+        XCTAssertEqual(kimiWork.notice, nil)
+        XCTAssertEqual(kimiWork.windows.map(\.usedPercent), [50])
+    }
+
+    /// quota-cache 300 秒快路径同样感知解密开关：关闭时写入的提示缓存，
+    /// 开启后即便缓存仍“新鲜”也不得命中，必须重新走解密链路。
+    func testQuotaCacheFastPathInvalidatedWhenDecryptSettingChanges() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let tokenStore = home.appendingPathComponent(
+            "Library/Application Support/kimi-desktop/bridge-store/token-store.json")
+        let inner = "{\"tokens\":{\"access_token\":\"desktop-token\"}}"
+        try write(
+            "{\"encryption\":\"safeStorage.v1\",\"data\":\"\(try encryptedV10Payload(inner, password: "test-key"))\"}",
+            to: tokenStore)
+        try touch(tokenStore, at: 1_999_999_000)
+        var offRequestCount = 0
+        _ = QuotaCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: 2_000_000_000),
+            settings: CollectorSettings(onlineQuota: true, kimiTokenDecrypt: false),
+            files: FileSupport(),
+            requestOverride: { _ in
+                offRequestCount += 1
+                return nil
+            }
+        ).collect()
+        XCTAssertEqual(offRequestCount, 0)
+        // 把两层缓存的 mtime 拨到“未来”，模拟快路径本可命中的窗口
+        try touch(home.appendingPathComponent(".ai-statusbar/quota-cache.json"), at: 2_000_000_000)
+        try touch(
+            home.appendingPathComponent(".ai-statusbar/kimi-monthly-cache.json"), at: 2_000_000_000)
+        var authHeaders: [String] = []
+        var collector = QuotaCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: 2_000_000_100),
+            settings: CollectorSettings(onlineQuota: true, kimiTokenDecrypt: true),
+            files: FileSupport(),
+            requestOverride: { request in
+                guard request.url?.host == "www.kimi.com" else { return nil }
+                authHeaders.append(request.value(forHTTPHeaderField: "Authorization") ?? "")
+                if request.url?.path.contains("GetSubscriptionStats") == true {
+                    return [
+                        "subscriptionBalance": [
+                            "amountUsedRatio": 0.5,
+                            "kimiCodeUsedRatio": 0.1,
+                            "expireTime": "2033-05-18T03:33:20Z",
+                        ]
+                    ]
+                }
+                return ["subscription": ["goods": ["title": "Allegro"]]]
+            }
+        )
+        collector.kimiKeychainOverride = { _, _ in Data("test-key".utf8) }
+        let kimiWork = try XCTUnwrap(collector.collect()["kimi-work"] ?? nil)
+        XCTAssertEqual(kimiWork.notice, nil)
+        XCTAssertEqual(kimiWork.windows.map(\.usedPercent), [50])
+        XCTAssertEqual(authHeaders, ["Bearer desktop-token", "Bearer desktop-token"])
+    }
+
     func testKimiSafeStorageRejectsMalformedPayloads() {
         XCTAssertNil(KimiSafeStorage.decryptTokenStore(payload: "不是 base64！", keyProvider: { _, _ in Data() }))
         // v9 前缀不是当前 os_crypt 格式

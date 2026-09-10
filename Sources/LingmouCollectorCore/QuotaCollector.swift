@@ -22,6 +22,9 @@ struct QuotaCollector {
         var kimiQuotaSeparated: Bool
         var kimiCodingTokenMtime: TimeInterval
         var kimiTokenMtime: TimeInterval
+        /// 写入缓存时的解密开关；与当前设置不一致（含旧缓存缺失该字段）则不走快路径，
+        /// 避免开关刚开启后仍回放"未开启解密"提示。
+        var kimiDecryptEnabled: Bool
     }
 
     private struct MonthlyCache: Codable {
@@ -29,6 +32,9 @@ struct QuotaCollector {
         var schema: Int = 2
         var checkedAt: TimeInterval
         var tokenMtime: TimeInterval
+        /// 写入缓存时的解密开关；开关变化后旧缓存（含 nil）立即失效，
+        /// 否则最长 1 小时内仍回放“未开启解密”提示。
+        var decryptEnabled: Bool?
         var quota: ToolQuota?
         var notice: String?
     }
@@ -44,6 +50,7 @@ struct QuotaCollector {
         if let cached, sameMode,
             cached.kimiCodingTokenMtime == codingTokenTime,
             cached.kimiTokenMtime == monthlyTokenTime,
+            cached.kimiDecryptEnabled == settings.kimiTokenDecrypt,
             environment.now - (files.modificationTime(cachePath) ?? 0) <= 300
         {
             return [
@@ -82,7 +89,8 @@ struct QuotaCollector {
             onlineQuotaEnabled: settings.onlineQuota,
             kimiQuotaSeparated: true,
             kimiCodingTokenMtime: codingTokenTime,
-            kimiTokenMtime: monthlyTokenTime
+            kimiTokenMtime: monthlyTokenTime,
+            kimiDecryptEnabled: settings.kimiTokenDecrypt
         )
         writeCache(value, path: cachePath)
         return ["codex": codex, "kimi": kimi, "kimi-work": kimiWork, "zcode": zcode]
@@ -113,7 +121,9 @@ struct QuotaCollector {
                 ?? 0,
             kimiTokenMtime: JSONValue.double(
                 object["_kimi_token_mtime"] ?? object["kimi_token_mtime"])
-                ?? 0
+                ?? 0,
+            kimiDecryptEnabled: JSONValue.bool(
+                object["_kimi_token_decrypt"] ?? object["kimi_token_decrypt"]) ?? false
         )
     }
 
@@ -134,6 +144,7 @@ struct QuotaCollector {
                 "zcode": object(cache.zcode),
                 "_online_quota_enabled": cache.onlineQuotaEnabled,
                 "_kimi_quota_separated": cache.kimiQuotaSeparated,
+                "_kimi_token_decrypt": cache.kimiDecryptEnabled,
                 "_kimi_coding_token_mtime": cache.kimiCodingTokenMtime,
                 "_kimi_token_mtime": cache.kimiTokenMtime,
             ], to: path)
@@ -382,13 +393,15 @@ struct QuotaCollector {
         if let cacheData = files.read(cachePath),
             let cache = try? decoder.decode(MonthlyCache.self, from: cacheData),
             cache.schema == 2,
-            environment.now - cache.checkedAt < 3_600, cache.tokenMtime == tokenTime
+            environment.now - cache.checkedAt < 3_600, cache.tokenMtime == tokenTime,
+            cache.decryptEnabled == settings.kimiTokenDecrypt
         {
             return (cache.quota, cache.notice)
         }
         let live = kimiMonthlyLive()
         let cache = MonthlyCache(
-            checkedAt: environment.now, tokenMtime: tokenTime, quota: live.0, notice: live.1)
+            checkedAt: environment.now, tokenMtime: tokenTime,
+            decryptEnabled: settings.kimiTokenDecrypt, quota: live.0, notice: live.1)
         if let data = try? encoder.encode(cache),
             let object = try? JSONSerialization.jsonObject(with: data)
         {
