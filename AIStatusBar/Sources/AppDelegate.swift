@@ -18,6 +18,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     private var hosting: DraggableHostingView<PanelView>!
     private var petPanel: NSPanel!
     private var petHosting: DraggableHostingView<PetView>!
+    private var ballPanel: NSPanel!
+    private var ballHosting: DraggableHostingView<FloatingBallView>!
     private var glassView: NSView?  // macOS 26+ 的 NSGlassEffectView（用 NSView 声明避开可用性注解）
     private var store: StatusStore!
     private let settings = SettingsStore()
@@ -31,6 +33,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     private var fullscreenAutoHideSuppressed = false  // 用户在全屏期间手动重新显示后，本次会话内不再自动隐藏
     private var petDetailsExpanded = false
     private var lastDesktopMode: String?  // 上次 applyDesktopPresentationMode 处理过的桌面模式
+    // 卡片模式收起态：悬浮球常驻，点击展开完整面板；鼠标离开面板 10 秒自动收回
+    private var cardExpanded = false
+    private var cardAutoCollapseTimer: Timer?
+    private var cardOutsideSince: Date?  // 鼠标首次离开面板的时刻；回到面板内即清零
+    private var panelTransitionToken = 0
+    private var panelTransitioning = false
+    private var panelSizeUpdatePending = false
+    private var deferredPanelAppearance: (() -> Void)?
+    private var restorePanelSizing: (() -> Void)?
+    private var desktopMoveTimer: Timer?
+    private var desktopAnchorMoving = false
+    private var lastDesktopMoveTime: TimeInterval = 0
+    private var pendingOriginKeys = Set<String>()
+    private var observedAppearanceMode: String?
     private var cancellables: Set<AnyCancellable> = []  // 设置订阅（如桌宠大小）
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -58,6 +74,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
 
         buildPanel()
         buildPetPanel()
+        buildBallPanel()
         applyDesktopPresentationMode()
         store.start()
         NotificationCenter.default.addObserver(self, selector: #selector(onStatusUpdated),
@@ -134,7 +151,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                                      latestTitle: nil, latestAge: nil, quota: nil)])
             : badgeTitle(visible)
 
-        // 浮窗尺寸跟随内容
+        // 过渡期间不争抢窗口尺寸；最后一次数据在动画完成后统一测量。
+        if panelTransitioning || desktopAnchorMoving {
+            panelSizeUpdatePending = true
+        } else {
+            updatePanelSize()
+        }
+    }
+
+    private func updatePanelSize() {
+        guard !desktopAnchorMoving else {
+            panelSizeUpdatePending = true
+            return
+        }
+        panelSizeUpdatePending = false
         hosting.layout()
         let size = hosting.fittingSize
         if abs(panel.frame.height - size.height) > 1 || abs(panel.frame.width - size.width) > 1 {
@@ -169,7 +199,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     private var adaptiveAppearanceName: NSAppearance.Name?  // 滞回区内保持上次自适应判定
     /// 拖动触发的外观重检去抖任务（见 scheduleAppearanceRecheck）
     private var appearanceRecheckWorkItem: DispatchWorkItem?
-    private var appearanceTransitionToken = 0  // 外观过渡进行中又来了新切换时，作废旧的淡入回调
 
     /// 调试日志：往 ~/.ai-statusbar/adapt-debug.log 追加一行（ISO 时间戳 + 消息），异常静默
     private func adaptLog(_ msg: String) {
@@ -220,53 +249,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// 同步设置 SwiftUI、窗口和玻璃容器。macOS 26 的玻璃只改 appearance 不保证底色有足够反差，
     /// 因此深/浅外观同时给玻璃加方向一致的 tint；system 模式仍保留系统原生无 tint 行为。
     ///
-    /// 过渡策略：内容透明度做一次"下潜再浮起"的关键帧动画（1 → 谷底 → 1），
-    /// 外观切换安排在接近谷底时执行——此刻文字几乎不可见，避免新旧配色重影。
-    /// 关键点：CA 动画提交后由 render server 独立驱动，主线程在切换外观时的
-    /// 整帧 SwiftUI 重绘不会打断它；之前用 NSAnimationContext completion 链分两段，
-    /// 接缝恰好落在重绘上，动画会卡一拍（掉帧感的来源）。
+    /// 文字不再先消失再出现；只插值底色。开关动画中先缓存最新外观请求。
     private func setPanelAppearance(_ name: NSAppearance.Name?) {
+        if panelTransitioning || desktopAnchorMoving {
+            deferredPanelAppearance = { [weak self] in self?.setPanelAppearance(name) }
+            return
+        }
         let appearance = name.flatMap { NSAppearance(named: $0) }
         let unchanged = hosting.appearance?.name == name
             && panel.appearance?.name == name
             && glassView?.appearance?.name == name
         guard !unchanged else { return }
 
-        appearanceTransitionToken &+= 1
-        let token = appearanceTransitionToken
-        guard let host = hosting, let layer = host.layer else {
-            writePanelAppearance(name, appearance: appearance)
-            return
-        }
-
-        let dip = CAKeyframeAnimation(keyPath: "opacity")
-        // 0.45s：下潜 0.13s + 谷底停留 0.05s + 浮起 0.26s。
-        // 谷底短暂停留让外观切换更从容，整体读感是柔和的呼吸而不是快速眨眼。
-        dip.values = [1.0, 0.06, 0.06, 1.0]
-        dip.keyTimes = [0, 0.30, 0.42, 1]
-        dip.duration = 0.45
-        dip.timingFunctions = [
-            CAMediaTimingFunction(name: .easeIn),
-            CAMediaTimingFunction(name: .linear),
-            CAMediaTimingFunction(name: .easeOut),
-        ]
-        layer.add(dip, forKey: "panelAppearanceDip")
-
-        // 0.16s 时透明度正处谷底平台（动画仍在 render server 上连续推进），
-        // 此刻切外观并让底色做一次短插值，回升段与底色渐变重叠。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) { [weak self] in
-            guard let self, token == self.appearanceTransitionToken else { return }
-            let oldBackground = layer.backgroundColor
-            self.writePanelAppearance(name, appearance: appearance)
-            if let newBackground = layer.backgroundColor, newBackground != oldBackground {
-                let anim = CABasicAnimation(keyPath: "backgroundColor")
-                anim.fromValue = oldBackground
-                anim.toValue = newBackground
-                anim.duration = 0.28
-                anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                // 模型值已是终值，动画只负责呈现层从旧色到新色的插值
-                layer.add(anim, forKey: "panelBackgroundFade")
-            }
+        let layer = hosting.layer
+        let oldBackground = layer?.presentation()?.backgroundColor ?? layer?.backgroundColor
+        writePanelAppearance(name, appearance: appearance)
+        if panel.isVisible, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+           let layer, let newBackground = layer.backgroundColor, newBackground != oldBackground {
+            let anim = CABasicAnimation(keyPath: "backgroundColor")
+            anim.fromValue = oldBackground
+            anim.toValue = newBackground
+            anim.duration = 0.20
+            anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            layer.add(anim, forKey: "panelBackgroundFade")
         }
     }
 
@@ -299,8 +304,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// 拖动期间的 didMove 以鼠标事件频率触发；adaptive 模式的背景采样是 SCK 截图
     ///（枚举窗口 + 截屏，单次数十毫秒），全速跟随会把截图服务打满、拖动明显掉帧。
     /// 这里做 trailing 去抖：连续拖动只保留最后一次采样（停 250ms 后执行），
-    /// 拖动过程中的背景变化由 3 秒定时器兜底，停下后这一次即时修正观感。
+    /// 原生窗口组拖动期间所有采样入口暂停，松手后再补采一次。
     private func scheduleAppearanceRecheck() {
+        guard !desktopAnchorMoving else { return }
         appearanceRecheckWorkItem?.cancel()
         let item = DispatchWorkItem { [weak self] in self?.applyPanelAppearanceMode() }
         appearanceRecheckWorkItem = item
@@ -308,6 +314,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
     private func applyPanelAppearanceMode() {
+        guard !desktopAnchorMoving else { return }
         appearanceCaptureGeneration &+= 1
         let generation = appearanceCaptureGeneration
         switch panelAppearanceMode() {
@@ -600,6 +607,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 320, height: 200),
                         styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.identifier = NSUserInterfaceItemIdentifier("AIStatusPanel")
+        panel.animationBehavior = .none  // 仅由下面的统一过渡驱动，避免系统开关动画叠加。
         #if compiler(>=6.2)
         if #available(macOS 26.0, *) {
             let glass = NSGlassEffectView(frame: NSRect(x: 0, y: 0, width: 320, height: 200))
@@ -613,6 +621,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         #else
         panel.contentView = hosting
         #endif
+        panel.contentView?.wantsLayer = true
         let pinned = UserDefaults.standard.object(forKey: "panelPinned") == nil
             ? true : UserDefaults.standard.bool(forKey: "panelPinned")
         panel.isFloatingPanel = pinned
@@ -625,16 +634,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         panel.isReleasedWhenClosed = false
         panel.isMovableByWindowBackground = true  // 原生拖动：系统处理，不抖不丢帧
         panel.acceptsMouseMovedEvents = true    // 保证热力图 hover 生效
-        // 拖动结束（含实时拖动过程中）持久化位置
+        // 拖动结束（含实时拖动过程中）：卡片模式下面板位置由悬浮球推导、
+        // 桌宠模式临时跟随，均不持久化；只做背景亮度重采（去抖，见该方法注释）
         NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification,
                                                object: panel, queue: .main) { [weak self] _ in
             guard let self else { return }
-            let f = self.panel.frame
-            // 桌宠模式的详情卡位置只是临时跟随，不覆盖独立卡片模式的位置记忆。
-            if self.desktopPresentationMode == "card" {
-                UserDefaults.standard.set(NSStringFromPoint(f.origin), forKey: "panelOrigin")
+            // 子窗口已由 AppKit 同步移动，不再反向触发定位与截图请求。
+            if self.panel.parent == nil { self.scheduleAppearanceRecheck() }
+        }
+        NotificationCenter.default.addObserver(forName: NSWindow.didResizeNotification,
+                                               object: panel, queue: .main) { [weak self] _ in
+            guard let self, self.panel.parent != nil else { return }
+            guard !self.desktopAnchorMoving, !self.panelTransitioning else {
+                self.panelSizeUpdatePending = true
+                return
             }
-            self.scheduleAppearanceRecheck()  // 拖动后重采背景亮度（去抖，见该方法注释）
+            if self.petDetailsExpanded { self.positionDetailsPanelNextToPet() }
+            if self.cardExpanded { self.positionCardPanelNextToBall() }
         }
 
         // 面板外观：每 3 秒走一次模式入口（adaptive 模式下检测面板下方亮度）
@@ -663,15 +679,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // 设置改动（外观模式切换）立即生效，不等下个 3 秒周期
         NotificationCenter.default.addObserver(
             forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.applyPanelAppearanceMode()
-            self?.applyDesktopPresentationMode()
+            guard let self else { return }
+            let appearance = self.panelAppearanceMode()
+            if appearance != self.observedAppearanceMode {
+                self.observedAppearanceMode = appearance
+                self.applyPanelAppearanceMode()
+            }
+            if self.desktopPresentationMode != self.lastDesktopMode {
+                self.applyDesktopPresentationMode()
+            }
         }
 
         hosting.layout()
         panel.setContentSize(hosting.fittingSize)
-
-        restoreCardPanelPosition()
-
     }
 
     /// 桌宠使用独立透明窗口，与详情卡片分别保存位置和尺寸。
@@ -711,11 +731,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             queue: .main
         ) { [weak self] _ in
             guard let self else { return }
-            let origin = self.petPanel.frame.origin
-            UserDefaults.standard.set(NSStringFromPoint(origin), forKey: "petOrigin")
-            if self.petDetailsExpanded && self.desktopPresentationMode == "pet" {
-                self.positionDetailsPanelNextToPet()
-            }
+            self.desktopAnchorDidMove(originKey: "petOrigin")
+        }
+        NotificationCenter.default.addObserver(forName: NSWindow.didResizeNotification,
+                                               object: petPanel, queue: .main) { [weak self] _ in
+            self?.desktopAnchorDidMove(originKey: "petOrigin")
         }
 
         // 桌宠大小可调：窗口尺寸由这里按比例手动驱动（底边锚定，脚底位置不动），
@@ -775,22 +795,206 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         window.setFrameOrigin(clamped)
     }
 
-    private func restoreCardPanelPosition() {
-        guard panel != nil else { return }
-        restoreWindowPosition(panel, key: "panelOrigin") { screen, size in
+    // MARK: 悬浮球（卡片模式收起态）
+
+    /// 悬浮球是卡片模式的常驻窗口：固定 64pt，独立记忆位置（默认屏幕右下角，
+    /// 与桌宠默认位一致）。完整面板只在展开期间出现，位置始终从球推导。
+    private func buildBallPanel() {
+        ballHosting = DraggableHostingView(
+            rootView: FloatingBallView(store: store) { [weak self] in
+                self?.toggleCardPanel()
+            }
+        )
+        ballHosting.wantsLayer = true
+        ballHosting.layer?.backgroundColor = NSColor.clear.cgColor
+        ballHosting.contextMenuBuilder = { [weak self] in
+            self?.buildBallContextMenu() ?? NSMenu()
+        }
+
+        ballPanel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 64, height: 64),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        ballPanel.identifier = NSUserInterfaceItemIdentifier("AIStatusBallPanel")
+        ballPanel.contentView = ballHosting
+        ballPanel.backgroundColor = .clear
+        ballPanel.isOpaque = false
+        // 阴影由 SwiftUI 球体自带（圆形轮廓），窗口阴影会按矩形画边，关掉
+        ballPanel.hasShadow = false
+        ballPanel.hidesOnDeactivate = false
+        ballPanel.isReleasedWhenClosed = false
+        ballPanel.isMovableByWindowBackground = true
+        applyWindowLevel(to: ballPanel)
+
+        // 展开期间拖动球，面板像挂件一样跟着走（与桌宠拖动跟随同一体验）
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didMoveNotification,
+            object: ballPanel,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.desktopAnchorDidMove(originKey: "ballOrigin")
+        }
+
+        // 窗口尺寸固定，不交给 NSHostingView 自适应（与桌宠窗口同一策略）
+        if #available(macOS 13.0, *) {
+            ballHosting.sizingOptions = []
+        }
+        restoreWindowPosition(ballPanel, key: "ballOrigin") { screen, size in
             NSPoint(
-                x: screen.visibleFrame.minX + 24,
-                y: screen.visibleFrame.maxY - size.height - 24
+                x: screen.visibleFrame.maxX - size.width - 24,
+                y: screen.visibleFrame.minY + 24
             )
         }
+    }
+
+    /// 悬浮球点击：展开 / 收起完整面板（右键菜单与面板内菜单共用同一动作）
+    @objc private func toggleCardPanel() {
+        guard desktopPresentationMode == "card" else { return }
+        if cardExpanded {
+            collapseCardPanel()
+            return
+        }
+        cardExpanded = true
+        if !panel.isVisible {
+            updatePanelSize()
+            positionCardPanelNextToBall()
+        }
+        transitionPanel(visible: true)
+        cardOutsideSince = nil
+        updateCardAutoCollapseTimer()
+        scheduleAppearanceRecheck()  // 面板换位后重采背景亮度
+    }
+
+    /// 收回到悬浮球：淡出后隐藏；若期间又重新展开（completion 里再校验），不打断
+    @objc private func collapseCardPanel() {
+        guard cardExpanded else { return }
+        cardExpanded = false
+        updateCardAutoCollapseTimer()
+        transitionPanel(visible: false)
+    }
+
+    /// 固定玻璃窗口位置，只在合成层淡入/淡出；反向点击从当前呈现透明度接续。
+    private func transitionPanel(visible: Bool) {
+        guard let layer = panel.contentView?.layer else {
+            if visible { panel.orderFront(nil) } else { panel.orderOut(nil) }
+            return
+        }
+        panelTransitionToken &+= 1
+        let token = panelTransitionToken
+        let from = panel.isVisible ? (layer.presentation()?.opacity ?? layer.opacity) : 0
+        let target: Float = visible ? 1 : 0
+        let duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            ? 0 : Double(abs(target - from)) * (visible ? 0.20 : 0.16)
+        panelTransitioning = true
+        freezePanelSizing()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.removeAnimation(forKey: "panelVisibility")
+        layer.opacity = target
+        if duration > 0.001 {
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = from
+            fade.toValue = target
+            fade.duration = duration
+            fade.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            layer.add(fade, forKey: "panelVisibility")
+        }
+        CATransaction.commit()
+        if visible {
+            panel.orderFront(nil)
+            syncPanelAttachment()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
+            guard let self, self.panelTransitionToken == token else { return }
+            self.panelTransitioning = false
+            if !visible {
+                self.detachPanel()
+                self.panel.orderOut(nil)
+            }
+            self.restorePanelSizingIfIdle()
+            if self.panelSizeUpdatePending { self.updatePanelSize() }
+            let appearance = self.deferredPanelAppearance
+            self.deferredPanelAppearance = nil
+            appearance?()
+        }
+    }
+
+    private func cancelPanelTransition() {
+        panelTransitionToken &+= 1
+        panelTransitioning = false
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        panel.contentView?.layer?.removeAnimation(forKey: "panelVisibility")
+        panel.contentView?.layer?.opacity = 1
+        CATransaction.commit()
+        restorePanelSizingIfIdle()
+        if panelSizeUpdatePending { updatePanelSize() }
+        let appearance = deferredPanelAppearance
+        deferredPanelAppearance = nil
+        appearance?()
+    }
+
+    /// 展开的面板优先放在球的正上方，屏幕顶不够时翻到球下方，始终收进可见区域
+    private func positionCardPanelNextToBall() {
+        guard !desktopAnchorMoving else { return }
+        guard let panel, let ballPanel else { return }
+        let ball = ballPanel.frame
+        let screen = screenContainingMost(of: ball)
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        guard let screen else { return }
+        let visible = screen.visibleFrame
+        let size = panel.frame.size
+        var origin = NSPoint(x: ball.midX - size.width / 2, y: ball.maxY + 12)
+        if origin.y + size.height > visible.maxY {
+            origin.y = ball.minY - 12 - size.height
+        }
+        origin.x = min(max(origin.x, visible.minX + 4), max(visible.minX, visible.maxX - size.width - 4))
+        origin.y = min(max(origin.y, visible.minY + 4), max(visible.minY, visible.maxY - size.height - 4))
+        if panel.frame.origin != origin { panel.setFrameOrigin(origin) }
+    }
+
+    /// 自动收回计时：鼠标离开面板连续 10 秒即收回到悬浮球；回到面板内清零重计。
+    /// 用 1Hz 取点轮询代替 tracking area——面板内容高度随状态自适应变化，
+    /// tracking 区维护复杂，而每秒一次的矩形包含判断开销可忽略。
+    private let cardAutoCollapseInterval: TimeInterval = 10
+    private func updateCardAutoCollapseTimer() {
+        cardAutoCollapseTimer?.invalidate()
+        cardAutoCollapseTimer = nil
+        guard cardExpanded, desktopPresentationMode == "card" else {
+            cardOutsideSince = nil
+            return
+        }
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self, self.cardExpanded else { return }
+            guard !self.desktopAnchorMoving else {
+                self.cardOutsideSince = nil
+                return
+            }
+            if self.panel.frame.contains(NSEvent.mouseLocation) {
+                self.cardOutsideSince = nil
+            } else {
+                let since = self.cardOutsideSince ?? Date()
+                self.cardOutsideSince = since
+                if Date().timeIntervalSince(since) >= self.cardAutoCollapseInterval {
+                    self.collapseCardPanel()
+                }
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        cardAutoCollapseTimer = timer
     }
 
     /// 桌宠模式的详情卡优先放在宠物右侧，空间不足时自动换到左侧，
     /// 并始终限制在宠物所在屏幕的可见区域内。
     private func positionDetailsPanelNextToPet() {
+        guard !desktopAnchorMoving else { return }
         guard let panel, let petPanel else { return }
         let petFrame = petPanel.frame
-        let screen = NSScreen.screens.first(where: { $0.visibleFrame.intersects(petFrame) })
+        let screen = screenContainingMost(of: petFrame)
             ?? NSScreen.main
             ?? NSScreen.screens.first
         guard let screen else { return }
@@ -820,7 +1024,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             x: min(max(requestedX, visible.minX), maxX),
             y: min(max(petFrame.midY - size.height / 2, visible.minY), maxY)
         )
-        panel.setFrameOrigin(origin)
+        if panel.frame.origin != origin { panel.setFrameOrigin(origin) }
         scheduleAppearanceRecheck()  // 跟随拖动会高频触发本方法，采样去抖防掉帧
     }
 
@@ -852,18 +1056,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
     private func hideDesktopWindows() {
+        detachPanel()
         panel?.orderOut(nil)
+        finishDesktopMovement(reposition: false)
+        cancelPanelTransition()
         petPanel?.orderOut(nil)
+        ballPanel?.orderOut(nil)
     }
 
     private func applyDesktopPresentationMode() {
-        guard panel != nil, petPanel != nil else { return }
+        guard panel != nil, petPanel != nil, ballPanel != nil else { return }
         let mode = desktopPresentationMode
         // 页签/用量范围等 @AppStorage 写入也会触发本方法（UserDefaults.didChange），
         // 此时窗口尺寸正随内容自适应（顶边锚定）；若每次都恢复记忆位置或重摆详情卡，
         // 会把窗口拽回旧 origin，顶边来回跳。只在模式真正切换时才动位置。
         let modeChanged = lastDesktopMode != mode
-        lastDesktopMode = mode
+        lastDesktopMode = mode  // 保存位置也会发 defaults 通知，先记住模式避免重入。
+        if modeChanged {
+            detachPanel()
+            finishDesktopMovement(reposition: false)
+            cancelPanelTransition()
+        }
         let visible = mode != "hidden"
         if (UserDefaults.standard.object(forKey: "panelVisible") as? Bool) != visible {
             UserDefaults.standard.set(visible, forKey: "panelVisible")
@@ -874,22 +1087,134 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         }
         switch mode {
         case "pet":
+            cardExpanded = false
+            updateCardAutoCollapseTimer()
+            ballPanel.orderOut(nil)
             petPanel.orderFront(nil)
-            if petDetailsExpanded {
+            if !panelTransitioning && petDetailsExpanded {
                 if modeChanged { positionDetailsPanelNextToPet() }
                 panel.orderFront(nil)
-            } else {
+            } else if !panelTransitioning {
                 panel.orderOut(nil)
             }
         case "hidden":
             petDetailsExpanded = false
+            cardExpanded = false
+            updateCardAutoCollapseTimer()
             hideDesktopWindows()
         default:
             petDetailsExpanded = false
             petPanel.orderOut(nil)
-            if modeChanged { restoreCardPanelPosition() }
-            panel.orderFront(nil)
+            // 切回卡片模式从悬浮球开始；模式内反复触发（@AppStorage 写入）不打断展开态
+            if modeChanged { cardExpanded = false }
+            updateCardAutoCollapseTimer()
+            if !panelTransitioning {
+                if cardExpanded { panel.orderFront(nil) } else { panel.orderOut(nil) }
+            }
+            ballPanel.orderFront(nil)
         }
+        syncPanelAttachment()
+    }
+
+    // MARK: 原生窗口组跟随
+
+    private func screenContainingMost(of frame: NSRect) -> NSScreen? {
+        NSScreen.screens.filter { $0.visibleFrame.intersects(frame) }.max {
+            let lhs = $0.visibleFrame.intersection(frame)
+            let rhs = $1.visibleFrame.intersection(frame)
+            return lhs.width * lhs.height < rhs.width * rhs.height
+        }
+    }
+
+    private func freezePanelSizing() {
+        if #available(macOS 13.0, *), restorePanelSizing == nil {
+            let options = hosting.sizingOptions
+            hosting.sizingOptions = []
+            restorePanelSizing = { [weak self] in self?.hosting.sizingOptions = options }
+        }
+    }
+
+    private func restorePanelSizingIfIdle() {
+        guard !desktopAnchorMoving, !panelTransitioning else { return }
+        restorePanelSizing?()
+        restorePanelSizing = nil
+    }
+
+    private func detachPanel() {
+        guard let panel else { return }
+        panel.parent?.removeChildWindow(panel)
+        panel.isMovableByWindowBackground = true
+    }
+
+    private func syncPanelAttachment() {
+        guard let panel, panel.isVisible, !fullscreenAutoHidden else {
+            detachPanel()
+            return
+        }
+        let parent: NSPanel?
+        switch desktopPresentationMode {
+        case "pet": parent = petDetailsExpanded ? petPanel : nil
+        case "card": parent = cardExpanded ? ballPanel : nil
+        default: parent = nil
+        }
+        guard let parent else { detachPanel(); return }
+        guard panel.parent !== parent else { return }
+        detachPanel()
+        parent.addChildWindow(panel, ordered: .above)
+        panel.isMovableByWindowBackground = false
+    }
+
+    /// 热路径仅记下移动时间；相对位置由窗口组维护，不写设置、不定位、不截图。
+    private func desktopAnchorDidMove(originKey: String) {
+        pendingOriginKeys.insert(originKey)
+        lastDesktopMoveTime = ProcessInfo.processInfo.systemUptime
+        if !desktopAnchorMoving {
+            desktopAnchorMoving = true
+            freezePanelSizing()
+            appearanceCaptureGeneration &+= 1  // 丢弃拖动前尚未完成的采样。
+            appearanceRecheckWorkItem?.cancel()
+        }
+        guard desktopMoveTimer == nil else { return }
+        let timer = Timer(timeInterval: 0.10, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            // 按住鼠标停顿不算结束，避免拖动中途换边；程序化移动也会收敛。
+            guard NSEvent.pressedMouseButtons & 1 == 0,
+                  ProcessInfo.processInfo.systemUptime - self.lastDesktopMoveTime >= 0.15 else { return }
+            self.finishDesktopMovement(reposition: true)
+        }
+        timer.tolerance = 0.02
+        desktopMoveTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func finishDesktopMovement(reposition: Bool) {
+        desktopMoveTimer?.invalidate()
+        desktopMoveTimer = nil
+        let wasMoving = desktopAnchorMoving
+        desktopAnchorMoving = false
+        restorePanelSizingIfIdle()
+        let keys = pendingOriginKeys
+        pendingOriginKeys.removeAll()
+        for key in keys {
+            let window = key == "petOrigin" ? petPanel : ballPanel
+            if let window {
+                UserDefaults.standard.set(NSStringFromPoint(window.frame.origin), forKey: key)
+            }
+        }
+        guard wasMoving, reposition else { return }
+        if panelSizeUpdatePending && !panelTransitioning { updatePanelSize() }
+        if !fullscreenAutoHidden {
+            if desktopPresentationMode == "pet", petDetailsExpanded { positionDetailsPanelNextToPet() }
+            if desktopPresentationMode == "card", cardExpanded { positionCardPanelNextToBall() }
+        }
+        let appearance = deferredPanelAppearance
+        deferredPanelAppearance = nil
+        appearance?()
+        scheduleAppearanceRecheck()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        finishDesktopMovement(reposition: false)
     }
 
     @objc private func selectCardMode() { setDesktopPresentationMode("card") }
@@ -900,10 +1225,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         guard desktopPresentationMode == "pet" else { return }
         petDetailsExpanded.toggle()
         if petDetailsExpanded {
-            positionDetailsPanelNextToPet()
-            panel.orderFront(nil)
+            if !panel.isVisible {
+                updatePanelSize()
+                positionDetailsPanelNextToPet()
+            }
+            transitionPanel(visible: true)
         } else {
-            panel.orderOut(nil)
+            transitionPanel(visible: false)
         }
     }
 
@@ -933,6 +1261,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         UserDefaults.standard.set(pinned, forKey: "panelPinned")
         applyWindowLevel(to: panel)
         applyWindowLevel(to: petPanel)
+        applyWindowLevel(to: ballPanel)
         if pinned {
             applyDesktopPresentationMode()  // 置顶时顺手提到最前，避免找不到
         }
@@ -950,7 +1279,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// 窗口 bounds 都会覆盖整屏（含菜单栏区域），普通最大化窗口只占 visibleFrame 不会命中。
     /// 只读 layer/bounds/PID、不读窗口标题，无需屏幕录制或辅助功能授权。
     private func panelScreenHasFullscreenApp() -> Bool {
-        let referenceFrame = desktopPresentationMode == "pet" ? petPanel?.frame : panel?.frame
+        // 卡片模式收起时唯一可见窗口是悬浮球，以球所在屏为准
+        let referenceFrame: NSRect?
+        switch desktopPresentationMode {
+        case "pet": referenceFrame = petPanel?.frame
+        case "hidden": referenceFrame = nil
+        default: referenceFrame = cardExpanded ? panel?.frame : ballPanel?.frame
+        }
         guard desktopPresentationMode != "hidden",
               let panelFrame = referenceFrame,
               let target = (NSScreen.screens.first { $0.frame.intersects(panelFrame) } ?? NSScreen.main)?.frame,
@@ -1017,6 +1352,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             collapseItem.image = symbol("minus.rectangle", template: true)
             menu.addItem(collapseItem)
         } else {
+            if cardExpanded {
+                let collapseItem = NSMenuItem(
+                    title: "收起到悬浮球",
+                    action: #selector(collapseCardPanel),
+                    keyEquivalent: "")
+                collapseItem.target = self
+                collapseItem.image = symbol("minus.rectangle", template: true)
+                menu.addItem(collapseItem)
+            }
             let petItem = NSMenuItem(
                 title: "切换到桌面宠物",
                 action: #selector(selectPetMode),
@@ -1051,6 +1395,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         settingsItem.target = self
         settingsItem.image = symbol("gearshape", template: true)
         menu.addItem(settingsItem)
+        menu.addItem(.separator())
+        let quitItem = NSMenuItem(
+            title: "退出灵眸",
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "")
+        quitItem.target = NSApp
+        quitItem.image = symbol("power", color: .systemRed)
+        menu.addItem(quitItem)
+        return menu
+    }
+
+    /// 悬浮球右键菜单：展开/收起 + 模式切换，其余项与面板/桌宠菜单同源
+    private func buildBallContextMenu() -> NSMenu {
+        let menu = NSMenu()
+        let toggleItem = NSMenuItem(
+            title: cardExpanded ? "收起面板" : "展开面板",
+            action: #selector(toggleCardPanel),
+            keyEquivalent: "")
+        toggleItem.target = self
+        toggleItem.image = symbol(cardExpanded ? "minus.rectangle" : "plus.rectangle", template: true)
+        menu.addItem(toggleItem)
+        let petItem = NSMenuItem(
+            title: "切换到桌面宠物",
+            action: #selector(selectPetMode),
+            keyEquivalent: "")
+        petItem.target = self
+        petItem.image = symbol("pawprint", template: true)
+        menu.addItem(petItem)
+        menu.addItem(.separator())
+
+        let pinned = UserDefaults.standard.object(forKey: "panelPinned") == nil
+            ? true : UserDefaults.standard.bool(forKey: "panelPinned")
+        let pinItem = NSMenuItem(
+            title: pinned ? "取消置顶" : "置顶",
+            action: #selector(togglePin),
+            keyEquivalent: "")
+        pinItem.target = self
+        pinItem.image = symbol("pin", template: true)
+        pinItem.state = pinned ? .on : .off
+        menu.addItem(pinItem)
+        let autoHideItem = NSMenuItem(
+            title: "全屏时自动隐藏",
+            action: #selector(toggleAutoHideFullscreen),
+            keyEquivalent: "")
+        autoHideItem.target = self
+        autoHideItem.image = symbol("arrow.up.left.and.arrow.down.right", template: true)
+        autoHideItem.state = autoHideInFullscreenEnabled ? .on : .off
+        menu.addItem(autoHideItem)
+        let settingsItem = NSMenuItem(
+            title: "设置…",
+            action: #selector(openSettings),
+            keyEquivalent: "")
+        settingsItem.target = self
+        settingsItem.image = symbol("gearshape", template: true)
+        menu.addItem(settingsItem)
+        let hideItem = NSMenuItem(
+            title: "隐藏桌面显示",
+            action: #selector(selectHiddenMode),
+            keyEquivalent: "")
+        hideItem.target = self
+        hideItem.image = symbol("eye.slash", template: true)
+        menu.addItem(hideItem)
         menu.addItem(.separator())
         let quitItem = NSMenuItem(
             title: "退出灵眸",
