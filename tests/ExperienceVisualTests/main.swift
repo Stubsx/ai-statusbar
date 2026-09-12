@@ -199,6 +199,7 @@ func renderExperience() throws {
     pipeline.accept(snapshot([("one", "ended"), ("two", "ended")], at: now + 1), now: now + 1)
     assert(delivered.isEmpty, "Merge must delay notification delivery")
     assert(pipeline.completedEventSerial == 1, "Explicit endings celebrate once per batch")
+    assert(pipeline.completedEventCount == 2, "Symbol bubble must use the actual ending batch size")
     let titled = try LocalEventFeed.read(directory: pipelineDir)
     assert(titled.events.count == 2 && titled.events[0].title != nil)
     pipelineSettings.experience.privacyMode = true
@@ -352,8 +353,34 @@ func renderExperience() throws {
     settings.experience.privacyMode = true
     try save("privacy-light", content: TaskEventRows(store: store, events: store.recentEvents, expanded: true)
         .padding(20).frame(width: 470).background(Color.white), scheme: .light)
-    try save("ball-attention", content: FloatingBallView(store: store, onToggle: {}).frame(width: 100, height: 100)
+    try save("ball-attention", content: FloatingBallView(store: store, onToggle: {}).padding(16)
         .background(Color.white), scheme: .light)
+    let petFolder = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        .deletingLastPathComponent().appendingPathComponent("AIStatusBar/Resources/Pet/rem")
+    let petTheme = PetThemeStore.loadTheme(folder: petFolder, isBuiltIn: true)
+    let bubbleSamples: [(String, StatusBubbleState, Bool)] = [
+        ("运行", StatusBubbleState(mood: .working(taskCount: 3)), false),
+        ("悬停", StatusBubbleState(mood: .working(taskCount: 3)), true),
+        ("部分结束", StatusBubbleState(mood: .working(taskCount: 2), completedCount: 1,
+                                    completionMessage: "Codex 本轮已结束"), false),
+        ("待处理", StatusBubbleState(mood: .working(taskCount: 3), attentionCount: 1), false)
+    ]
+    for scheme in [ColorScheme.light, .dark] {
+        try save("pet-bubbles-" + (scheme == .light ? "light" : "dark"), content: HStack(spacing: 16) {
+            ForEach(0..<bubbleSamples.count, id: \.self) { index in
+                let sample = bubbleSamples[index]
+                VStack(spacing: 12) {
+                    PetSprite(mood: sample.1.completedCount > 0 ? .celebrating : sample.1.mood,
+                              theme: petTheme, scale: 1)
+                        .frame(width: 220, height: 236, alignment: .bottom)
+                        .overlay(alignment: .top) {
+                            StatusBubble(state: sample.1, expanded: sample.2).padding(.top, 3)
+                        }
+                    Text(sample.0).font(.system(size: 12))
+                }
+            }
+        }.padding(20).background(scheme == .light ? Color.white : Color(red: 0.08, green: 0.11, blue: 0.17)), scheme: scheme)
+    }
     try save("pet-gallery", content: PetGalleryView(settings: settings, catalog: catalog).background(Color.white), scheme: .light)
     let keyboardPanel = TaskPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
     keyboardPanel.isReleasedWhenClosed = false

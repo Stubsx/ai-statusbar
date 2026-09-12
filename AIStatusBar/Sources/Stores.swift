@@ -215,6 +215,8 @@ final class StatusStore: ObservableObject {
     @Published var completedEventSerial = 0
     /// 桌宠庆祝气泡文案：在序号变化前先更新，确保 UI 拿到完成任务的工具名。
     @Published var completedEventMessage = "本轮已结束"
+    /// 本次事件批次的结束数量，供符号气泡使用；不是累计完成总数。
+    @Published var completedEventCount = 0
     let collectorPath: String?
     let settings: SettingsStore
     private var timer: Timer?
@@ -442,6 +444,7 @@ final class StatusStore: ObservableObject {
         if !ended.isEmpty {
             completedEventMessage = ended.count == 1
                 ? "\(ended[0].toolName) 本轮已结束" : "\(ended.count) 个任务本轮已结束"
+            completedEventCount = ended.count
             completedEventSerial &+= 1
         }
         eventFeed.append(events.map {

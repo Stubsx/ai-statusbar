@@ -12,32 +12,30 @@ struct FloatingBallView: View {
     @State private var gaze = CGSize.zero
     @State private var eyeOpenness: CGFloat = 1
     @State private var celebratingSerial = 0
+    @State private var celebratingCount = 0
+
+    private var liveMood: PetMood {
+        PetMood.current(data: store.data, error: store.collectorError)
+    }
 
     private var mood: PetMood {
-        let liveMood = PetMood.current(data: store.data, error: store.collectorError)
         // 部分任务完成时，仍显示剩余运行数量与光晕。
         if case .working = liveMood { return liveMood }
         return celebratingSerial > 0 ? .celebrating : liveMood
     }
 
     var body: some View {
-        FloatingBallArtwork(mood: mood, gaze: gaze, hovered: hovered, reduceMotion: reduceMotion, eyeOpenness: eyeOpenness)
-            .background(
+        FloatingBallStatusArtwork(mood: mood, state: bubbleState, gaze: gaze,
+                                  hovered: hovered, reduceMotion: reduceMotion, eyeOpenness: eyeOpenness)
+            .background(alignment: .bottomLeading) {
                 BallMouseTracker(reduceMotion: reduceMotion, onGaze: { gaze = $0 }, onBlink: { eyeOpenness = $0 })
+                    .frame(width: 64, height: 64)
+                    .frame(width: FloatingBallStatusArtwork.anchorSize.width,
+                           height: FloatingBallStatusArtwork.anchorSize.height, alignment: .bottom)
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
-            )
-            .frame(width: 64, height: 64)
-            .overlay(alignment: .topTrailing) {
-                if !store.attentionEvents.isEmpty {
-                    Text("\(store.attentionEvents.count)")
-                        .font(.system(size: 10, weight: .bold, design: .rounded))
-                        .foregroundColor(.white).padding(5)
-                        .background(Circle().fill(Color.orange))
-                        .accessibilityHidden(true)
-                }
             }
-            .contentShape(Circle())
+            .contentShape(Rectangle())
             .onTapGesture(perform: onToggle)
             .onHover { inside in
                 withAnimation(reduceMotion ? nil : .easeOut(duration: 0.16)) {
@@ -47,16 +45,66 @@ struct FloatingBallView: View {
             }
             .onChange(of: store.completedEventSerial) { serial in
                 guard serial > 0 else { return }
+                celebratingCount = store.completedEventCount
                 celebratingSerial = serial
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-                    if celebratingSerial == serial { celebratingSerial = 0 }
+                    if celebratingSerial == serial {
+                        celebratingSerial = 0
+                        celebratingCount = 0
+                    }
                 }
             }
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel(Text("灵眸，\(mood.summary)，\(store.attentionEvents.count) 项需要处理"))
+            .accessibilityLabel(Text("灵眸，\(bubbleState.accessibilitySummary)"))
             .accessibilityHint(Text("点击展开或收起看板；可拖动位置"))
             .accessibilityAddTraits(.isButton)
             .accessibilityAction { onToggle() }
+    }
+
+    private var bubbleState: StatusBubbleState {
+        StatusBubbleState(mood: liveMood, attentionCount: store.attentionEvents.count,
+                          urgentAttentionCount: store.attentionEvents.filter { $0.phase != "ended" }.count,
+                          completedCount: celebratingCount)
+    }
+}
+
+/// 固定窗口留足胶囊空间，状态改变时不移动球体或调整窗口。
+struct FloatingBallStatusArtwork: View {
+    /// 原球体与单计数胶囊的坐标保持不变，窗口只向右留出消息展开的空间。
+    static let anchorSize = NSSize(width: 108, height: 78)
+    static let messageExtension: CGFloat = 60
+    static let size = NSSize(width: anchorSize.width + messageExtension, height: anchorSize.height)
+    let mood: PetMood
+    let state: StatusBubbleState
+    var gaze = CGSize.zero
+    var hovered = false
+    var reduceMotion = false
+    var eyeOpenness: CGFloat = 1
+
+    private var anchorState: StatusBubbleState {
+        state.runningCount > 0 ? StatusBubbleState(mood: .working(taskCount: state.runningCount)) : state
+    }
+
+    var body: some View {
+        FloatingBallArtwork(mood: mood, gaze: gaze, hovered: hovered,
+                            reduceMotion: reduceMotion, eyeOpenness: eyeOpenness)
+            .frame(width: Self.anchorSize.width, height: Self.anchorSize.height, alignment: .bottom)
+            .overlay(alignment: .topTrailing) {
+                if state.isVisible(expanded: false) {
+                    // 隐藏的单计数只定义锚点；可见胶囊对齐其左端，增加内容时向右生长。
+                    StatusBubble(state: anchorState, style: .ball)
+                        .hidden()
+                        .accessibilityHidden(true)
+                        .overlay(alignment: .leading) {
+                            StatusBubble(state: state, style: .ball)
+                        }
+                        .padding(.top, 3)
+                        .padding(.trailing, 4)
+                        .allowsHitTesting(false)
+                        .transition(.opacity)
+                }
+            }
+            .frame(width: Self.size.width, height: Self.size.height, alignment: .leading)
     }
 }
 
@@ -133,42 +181,13 @@ struct FloatingBallArtwork: View {
             .shadow(color: Color(red: 0.38, green: 0.68, blue: 1).opacity(0.08), radius: 2, y: 1)
             .opacity(mood == .sleeping && !hovered ? 0.78 : 1)
 
-            // 保留状态提示，但不再让球体切成红/黄/绿或用大眼睛图标盖住脸。
-            if case .working(let count) = mood, count > 0 {
-                Text(String(count))
-                    .font(.system(size: 9, weight: .bold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundColor(Color(red: 0.10, green: 0.43, blue: 0.83))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.5)
-                    .padding(.horizontal, 4)
-                    .frame(minWidth: 16, maxWidth: count < 10 ? 16 : count < 100 ? 22 : 28, minHeight: 16, maxHeight: 16)
-                    .background(Capsule().fill(Color(red: 0.92, green: 0.98, blue: 1)))
-                    .overlay(Capsule().strokeBorder(.white.opacity(0.95), lineWidth: 1))
-                    .shadow(color: Color.blue.opacity(0.12), radius: 1, y: 1)
-                    .offset(x: 15, y: 18)
-                    .allowsHitTesting(false)
-            } else if case .error = mood {
-                statusDot(symbol: "exclamationmark", color: accent)
-            } else if case .celebrating = mood {
-                statusDot(symbol: "checkmark", color: accent)
-            }
+
         }
         .frame(width: 64, height: 64)
         .scaleEffect(hovered && !reduceMotion ? 1.035 : 1)
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.22), value: mood)
-        .help(mood.summary)
     }
 
-    private func statusDot(symbol: String, color: Color) -> some View {
-        Image(systemName: symbol)
-            .font(.system(size: 7, weight: .bold))
-            .foregroundColor(Color(red: 0.05, green: 0.23, blue: 0.43))
-            .frame(width: 13, height: 13)
-            .background(Circle().fill(color))
-            .overlay(Circle().strokeBorder(.white.opacity(0.9), lineWidth: 1))
-            .offset(x: 18, y: 18)
-    }
 }
 
 /// 正交球面投影，加少量深度缩放。球体轮廓不压扁，脸部在球面上转动。

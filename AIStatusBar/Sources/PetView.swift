@@ -65,8 +65,10 @@ struct PetView: View {
     @ObservedObject var catalog: PetCatalog
     let onOpenDetails: () -> Void
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var hovered = false
     @State private var celebratingSerial = 0
+    @State private var celebratingCount = 0
     @State private var celebrationMessage = "本轮已结束"
 
     private var liveMood: PetMood {
@@ -92,95 +94,43 @@ struct PetView: View {
     private func s(_ v: CGFloat) -> CGFloat { v * scale }
 
     var body: some View {
-        // 提示/庆祝气泡是浮层而不是布局成员：相对形象顶部定位、随缩放自适应，
-        // 不出现时不占任何空间（原方案用 30pt 透明占位防跳动，窗口顶部常驻一段空白）。
+        // 一个固定锚点承载运行数、待处理与消息；不挤占形象布局。
         PetSprite(mood: mood, theme: theme, scale: scale)
             .frame(width: s(220), height: s(236), alignment: .bottom)
-            .overlay(alignment: .bottom) {
-                if !store.attentionEvents.isEmpty {
-                    Text("待处理 \(store.attentionEvents.count)")
-                        .font(.system(size: s(10), weight: .semibold))
-                        .foregroundColor(.white).padding(.horizontal, s(9)).padding(.vertical, s(4))
-                        .background(Capsule().fill(Color.orange))
-                        .allowsHitTesting(false)
-                }
-            }
             .overlay(alignment: .top) {
-                if celebratingSerial > 0 {
-                    celebrationBubble
-                } else if hovered {
-                    hoverBubble
+                if bubbleState.isVisible(expanded: hovered) {
+                    StatusBubble(state: bubbleState, expanded: hovered, scale: scale)
+                        .padding(.top, s(3))
+                        .allowsHitTesting(false)
+                        .transition(.opacity)
                 }
             }
             .contentShape(Rectangle())
             .onTapGesture(perform: onOpenDetails)
             .onHover { inside in
-                withAnimation(.easeOut(duration: 0.16)) { hovered = inside }
+                withAnimation(reduceMotion ? nil : .easeOut(duration: 0.16)) { hovered = inside }
             }
             .onChange(of: store.completedEventSerial) { serial in
                 guard serial > 0 else { return }
                 celebrationMessage = store.completedEventMessage
+                celebratingCount = store.completedEventCount
                 celebratingSerial = serial
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
                     if celebratingSerial == serial {
                         celebratingSerial = 0
+                        celebratingCount = 0
                         celebrationMessage = "本轮已结束"
                     }
                 }
             }
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel(
-            "\(celebratingSerial > 0 ? celebrationMessage : mood.summary)，\(store.attentionEvents.count) 项需要处理，单击展开详情"
-        )
+            .accessibilityLabel("\(bubbleState.accessibilitySummary)，单击展开详情")
     }
 
-    /// 任务完成后的庆祝气泡（浮层，3 秒自动消失）
-    private var celebrationBubble: some View {
-        Text(celebrationMessage)
-            .font(.system(size: s(10.5), weight: .semibold, design: .rounded))
-            .foregroundColor(Color(red: 0.25, green: 0.40, blue: 0.65))
-            .lineLimit(1)
-            .truncationMode(.tail)
-            .frame(maxWidth: s(184))
-            .padding(.horizontal, s(10))
-            .padding(.vertical, s(6))
-            .background(
-                Capsule()
-                    .fill(Color(red: 0.92, green: 0.96, blue: 1.0).opacity(0.96))
-                    .overlay(Capsule().stroke(Color.white.opacity(0.96), lineWidth: s(1.3)))
-                    .overlay(
-                        Capsule()
-                            .stroke(
-                                Color(red: 0.55, green: 0.72, blue: 0.92).opacity(0.58),
-                                lineWidth: s(0.6)
-                            )
-                            .padding(s(1))
-                    )
-            )
-            .shadow(
-                color: Color(red: 0.34, green: 0.59, blue: 0.88).opacity(0.22),
-                radius: s(6),
-                y: s(2)
-            )
-            .padding(.top, s(2))
-            .transition(.opacity.combined(with: .move(edge: .bottom)))
-    }
-
-    /// hover 时的状态提示气泡（浮层，覆盖在形象上沿，不挤占布局）
-    private var hoverBubble: some View {
-        Text(store.attentionEvents.isEmpty ? mood.summary : "有 \(store.attentionEvents.count) 项任务需要你处理")
-            .font(.system(size: s(11), weight: .medium))
-            .foregroundColor(.primary)
-            .padding(.horizontal, s(11))
-            .padding(.vertical, s(6))
-            .background(
-                Capsule()
-                    .fill(.ultraThinMaterial)
-                    .overlay(Capsule().stroke(Color.primary.opacity(0.12), lineWidth: s(0.5)))
-            )
-            .shadow(color: .black.opacity(0.18), radius: s(7), y: s(3))
-            .padding(.top, s(2))
-            .transition(.opacity.combined(with: .move(edge: .bottom)))
+    private var bubbleState: StatusBubbleState {
+        StatusBubbleState(mood: liveMood, attentionCount: store.attentionEvents.count,
+                          urgentAttentionCount: store.attentionEvents.filter { $0.phase != "ended" }.count,
+                          completedCount: celebratingCount, completionMessage: celebrationMessage)
     }
 }
 
@@ -233,36 +183,7 @@ struct PetSprite: View {
 
             PetEffectsForeground(mood: mood, scale: scale)
 
-            if case .working(let taskCount) = mood {
-                Text("×\(taskCount)")
-                    .font(.system(size: s(11), weight: .semibold, design: .rounded).monospacedDigit())
-                    .foregroundColor(Color(red: 0.25, green: 0.40, blue: 0.65))
-                    .padding(.horizontal, s(8))
-                    .frame(height: s(23))
-                    .background(
-                        Capsule()
-                            .fill(Color(red: 0.92, green: 0.96, blue: 1.0).opacity(0.94))
-                            .overlay(
-                                Capsule()
-                                    .stroke(Color.white.opacity(0.96), lineWidth: s(1.4))
-                            )
-                            .overlay(
-                                Capsule()
-                                    .stroke(
-                                        Color(red: 0.55, green: 0.72, blue: 0.92).opacity(0.65),
-                                        lineWidth: s(0.65)
-                                    )
-                                    .padding(s(1))
-                            )
-                    )
-                    .shadow(
-                        color: Color(red: 0.34, green: 0.59, blue: 0.88).opacity(0.24),
-                        radius: s(5),
-                        y: s(2)
-                    )
-                    .padding(.top, s(12))
-                    .padding(.trailing, s(7))
-            }
+
         }
         .frame(width: s(210), height: s(232))
         .onAppear {

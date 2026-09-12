@@ -835,7 +835,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
 
     // MARK: 悬浮球（卡片模式收起态）
 
-    /// 悬浮球是卡片模式的常驻窗口：固定 64pt，独立记忆位置（默认屏幕右下角，
+    /// 悬浮球是卡片模式的常驻窗口：固定尺寸容纳顶部状态胶囊，独立记忆位置（默认屏幕右下角，
     /// 与桌宠默认位一致）。完整面板只在展开期间出现，位置始终从球推导。
     private func buildBallPanel() {
         ballHosting = DraggableHostingView(
@@ -850,7 +850,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         }
 
         ballPanel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 64, height: 64),
+            contentRect: NSRect(origin: .zero, size: FloatingBallStatusArtwork.size),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -979,7 +979,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     private func positionCardPanelNextToBall() {
         guard !desktopAnchorMoving else { return }
         guard let panel, let ballPanel else { return }
-        let ball = ballPanel.frame
+        // 消息在窗口右侧展开，面板仍对齐球体的原有中心。
+        let ball = NSRect(origin: ballPanel.frame.origin, size: FloatingBallStatusArtwork.anchorSize)
         let screen = screenContainingMost(of: ball)
             ?? NSScreen.main
             ?? NSScreen.screens.first
