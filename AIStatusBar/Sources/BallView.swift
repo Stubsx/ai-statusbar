@@ -158,13 +158,6 @@ struct FloatingBallArtwork: View {
 
     var body: some View {
         ZStack {
-            if !appearance.isMonochrome {
-                Circle()
-                    .fill(accent.opacity(hovered ? 0.15 : 0.06))
-                    .frame(width: 50, height: 50)
-                    .blur(radius: 3)
-            }
-
             if working {
                 if appearance.isMonochrome {
                     BallInkOrbit(reduceMotion: reduceMotion)
@@ -199,8 +192,6 @@ struct FloatingBallArtwork: View {
                 }
             }
             .frame(width: 48, height: 48)
-            .shadow(color: Color(red: 0.38, green: 0.68, blue: 1)
-                .opacity(appearance.isMonochrome ? 0 : 0.08), radius: 2, y: 1)
             .opacity(mood == .sleeping && !hovered ? 0.78 : 1)
 
 
@@ -212,7 +203,7 @@ struct FloatingBallArtwork: View {
 
 }
 
-/// 纹理由 Swift 在内存中绘制，画布含透明渗墨余量，不裁成正圆。
+/// 纹理由 Swift 在内存中绘制，晕染收在固定圆形轮廓内，画布保留透明余量。
 private struct BallWashBody: View {
     let image: CGImage?
     let palette: BallInkDrawing.Palette

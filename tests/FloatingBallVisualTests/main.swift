@@ -112,8 +112,12 @@ func runChecks() throws {
                     assert(Int(bytes[index + channel]) <= alpha, "Premultiplied color must not create light fringes")
                 }
                 if row == 0 || column == 0 || row == texture.height - 1 || column == texture.width - 1 {
-                    assert(alpha == 0, "Wet edges must fit in the transparent canvas")
+                    assert(alpha == 0, "The circle must fit in the transparent canvas")
                 }
+                let radius = hypot((Double(column) + 0.5) / Double(texture.width) * 2.4 - 1.2,
+                                   (Double(row) + 0.5) / Double(texture.height) * 2.4 - 1.2)
+                if radius < 0.97 { assert(alpha == 255, "Interior washes must not punch holes in the silhouette") }
+                if radius > 1 { assert(alpha == 0, "Pigment must not bleed outside the circle") }
                 if alpha == 0 { transparent += 1 }
                 if alpha > 0 && alpha < 255 { translucent += 1 }
                 if alpha == 255 {
@@ -123,7 +127,8 @@ func runChecks() throws {
             }
         }
         assert(transparent > texture.width * texture.height / 5)
-        assert(translucent > texture.width * texture.height / 30)
+        assert(translucent > 0 && translucent < texture.width * texture.height / 40,
+               "Only a narrow antialiased edge should be translucent")
         assert(lightest - darkest > 70, "Washes need visible concentration changes, not a flat tint")
         if palette == .blue { assert(darkest > 20, "Keep the blue face bright enough") }
     }
@@ -154,9 +159,11 @@ func runChecks() throws {
                 for channel in 0..<3 {
                     assert(bytes[pixel + channel] <= bytes[pixel + 3], "Animated washes must keep valid transparent edges")
                 }
+                assert(bytes[pixel + 3] == frameBytes[0][pixel + 3],
+                       "Internal pigment flow must not move or roughen the outline")
                 let row = pixel / 4 / 160, column = pixel / 4 % 160
                 if row == 0 || column == 0 || row == 159 || column == 159 {
-                    assert(bytes[pixel + 3] == 0, "Breathing edges must not touch the frame")
+                    assert(bytes[pixel + 3] == 0, "Circle edges must not touch the frame")
                 }
             }
         }
