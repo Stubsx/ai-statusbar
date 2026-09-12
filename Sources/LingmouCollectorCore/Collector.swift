@@ -3,14 +3,17 @@ import Foundation
 public final class LingmouCollector {
     public let environment: CollectorEnvironment
     public let settings: CollectorSettings
+    private let adapters: [any ToolAdapter]
     private let files: FileSupport
     private let processes: ProcessSupport
 
     public init(
         environment: CollectorEnvironment = CollectorEnvironment(),
-        settings: CollectorSettings? = nil
+        settings: CollectorSettings? = nil,
+        adapters: [any ToolAdapter] = []
     ) {
         self.environment = environment
+        self.adapters = adapters
         self.files = FileSupport()
         self.processes = ProcessSupport()
         self.settings =
@@ -22,24 +25,41 @@ public final class LingmouCollector {
     }
 
     public func collect() -> StatusData {
-        let codex = CodexCollector(
+        collectStatus(metrics: collectMetrics())
+    }
+
+    /// Slow enrichment runs independently from the one-second local status path.
+    public func collectMetrics() -> CollectorMetrics {
+        let quota = QuotaCollector(environment: environment, settings: settings, files: files).collect()
+        let usage = UsageCollector(environment: environment, settings: settings, files: files).collectWithSync()
+        return CollectorMetrics(quotas: quota.compactMapValues { $0 }, usage: usage.local,
+                                usageMerged: usage.merged, sync: usage.sync, collectedAt: environment.now)
+    }
+
+    public func collectStatus(metrics: CollectorMetrics? = nil) -> StatusData {
+        func measured<T>(_ name: String, _ body: () -> T) -> T {
+            let start = Date()
+            let value = body()
+            if ProcessInfo.processInfo.environment["LINGMOU_PROFILE"] == "1" {
+                FileHandle.standardError.write(Data("\(name): \(Date().timeIntervalSince(start))s\n".utf8))
+            }
+            return value
+        }
+        let codex = measured("codex") { CodexCollector(
             environment: environment,
             settings: settings,
             files: files,
             processes: processes
-        ).collect()
+        ).collect() }
         let local = LocalCollectors(
             environment: environment, settings: settings, files: files, processes: processes)
-        let kimi = local.kimi()
-        let kimiWork = local.kimiWork()
-        let claude = local.claude()
-        let hermes = local.hermes()
-        let zcode = local.zcode()
-        let dsh = local.dsh()
-        let quota = QuotaCollector(environment: environment, settings: settings, files: files)
-            .collect()
-        let usage = UsageCollector(environment: environment, settings: settings, files: files)
-            .collectWithSync()
+        let kimi = measured("kimi") { local.kimi() }
+        let kimiWork = measured("kimiWork") { local.kimiWork() }
+        let claude = measured("claude") { local.claude() }
+        let hermes = measured("hermes") { local.hermes() }
+        let zcode = measured("zcode") { local.zcode() }
+        let dsh = measured("dsh") { local.dsh() }
+        let quota = metrics?.quotas ?? [:]
         var tools = [
             makeTool(
                 key: "codex-ide", letter: "C", name: "Codex App", raw: codex.ide,
@@ -60,15 +80,18 @@ public final class LingmouCollector {
                 key: "zcode", letter: "Z", name: "ZCode", raw: zcode, quota: quota["zcode"] ?? nil),
             makeTool(key: "dsh", letter: "D", name: "DSH", raw: dsh, quota: nil),
         ]
+        tools += AdapterContract.collect(adapters, excluding: Set(tools.map(\.key)),
+                                         environment: environment, settings: settings)
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "HH:mm:ss"
         return StatusData(
             updatedAt: formatter.string(from: Date(timeIntervalSince1970: environment.now)),
             tools: tools,
-            usage: usage.local,
-            usageMerged: usage.merged,
-            sync: usage.sync
+            usage: metrics?.usage,
+            usageMerged: metrics?.usageMerged,
+            sync: metrics?.sync,
+            collectedAt: environment.now
         )
     }
 
@@ -122,7 +145,9 @@ public final class LingmouCollector {
         raw: RawToolState,
         quota: ToolQuota?
     ) -> ToolStatus {
-        var state = !raw.busy.isEmpty ? "busy" : (raw.processOn ? "idle" : "off")
+        var seen = Set<String>()
+        let active = raw.busy.filter { !$0.id.isEmpty && seen.insert($0.id).inserted }
+        var state = !active.isEmpty ? "busy" : (raw.processOn ? "idle" : "off")
         if state == "idle", settings.offlineAfterSeconds > 0, raw.activity > 0,
             environment.now - raw.activity > TimeInterval(settings.offlineAfterSeconds)
         {
@@ -133,11 +158,17 @@ public final class LingmouCollector {
             letter: letter,
             name: name,
             state: state,
-            busyItems: raw.busy,
-            detail: state == "busy" ? "\(raw.busy.count) 个任务" : raw.detail,
+            busyItems: active,
+            detail: state == "busy" ? "\(active.count) 个任务" : raw.detail,
             latestTitle: raw.latest?.title,
             latestAge: raw.latest.map { ageString($0.timestamp) },
-            quota: quota
+            quota: quota,
+            activeItems: active,
+            activities: raw.activities,
+            health: ToolSupport.health(for: key, raw: raw, quota: quota,
+                                       environment: environment, settings: settings),
+            capabilities: ToolSupport.capabilities(for: key),
+            latestSessionId: raw.latest?.sessionId
         )
     }
 

@@ -7,14 +7,17 @@ struct LocalCollectors {
     let processes: ProcessSupport
 
     func kimi() -> RawToolState {
-        let count = processes.count(named: "kimi")
+        let count = processes.count(named: "kimi") + processes.count(named: "kimi-code")
         var result = RawToolState(processOn: count > 0, detail: "\(count) 个进程")
         let root = environment.path(".kimi-code", "sessions")
         let stateFiles = files.files(atDepth: 3, under: root) { $0.hasSuffix("/state.json") }
         let window = TimeInterval(max(settings.busySeconds(for: "kimi"), 1_800))
         for statePath in stateFiles {
             let directory = (statePath as NSString).deletingLastPathComponent
-            let metadata = files.read(statePath).flatMap(JSONValue.object) ?? [:]
+            guard let metadata = files.read(statePath).flatMap(JSONValue.object) else {
+                result.sourceError = "部分会话元数据不可读或格式不兼容"
+                continue
+            }
             let workDirectory = JSONValue.string(metadata["workDir"]) ?? ""
             let title =
                 JSONValue.string(metadata["title"]).flatMap { $0.isEmpty ? nil : $0 }
@@ -29,10 +32,8 @@ struct LocalCollectors {
             }
             updateLatest(&result, title: title, timestamp: modified)
             guard environment.now - modified <= window else { continue }
-            if wireFiles.contains(where: kimiWireBusy) {
-                result.busy.append(
-                    BusyItem(id: URL(fileURLWithPath: directory).lastPathComponent, title: title))
-            }
+            applyKimiSignals(wireFiles, id: URL(fileURLWithPath: directory).lastPathComponent,
+                             title: title, processOn: count > 0, to: &result)
         }
         return result
     }
@@ -49,7 +50,12 @@ struct LocalCollectors {
         guard let database = try? SQLiteDatabase(path: databasePath, readOnly: true),
             let columns = try? database.columns(in: "conversations"),
             Set(["conversation_key", "title", "updated_at_ms"]).isSubset(of: columns)
-        else { return result }
+        else {
+            if files.manager.fileExists(atPath: databasePath) {
+                result.sourceError = "会话数据库不可读或格式不兼容"
+            }
+            return result
+        }
         // 新版 Kimi（3.2.4+ 这代）不再把 running 维护进状态文件（只在 blocked 等场景
         // 写入）；运行态改为读会话库的 kernel_session_dir——内嵌 kimi-code 运行时的
         // 会话目录，用与 Kimi Code 相同的 wire.jsonl 未闭合 step/tool 判定，
@@ -62,7 +68,10 @@ struct LocalCollectors {
             WHERE title != ''
             ORDER BY updated_at_ms DESC
             """)
-        else { return result }
+        else {
+            result.sourceError = "无法查询会话数据库"
+            return result
+        }
         let window = TimeInterval(max(settings.busySeconds(for: "kimi-work"), 1_800))
         for row in rows {
             guard let id = row["conversation_key"]?.string,
@@ -83,49 +92,71 @@ struct LocalCollectors {
                 atDepth: 2,
                 under: (sessionDir as NSString).appendingPathComponent("agents")
             ) { $0.hasSuffix("/wire.jsonl") }
-            if appOn,
-                wireFiles.contains(where: { path in
-                    guard let modified = files.modificationTime(path),
-                        environment.now - modified <= window
-                    else { return false }
-                    return kimiWireBusy(path)
-                })
-            {
-                result.busy.append(BusyItem(id: id, title: title))
-            }
+            applyKimiSignals(wireFiles, id: id, title: title, processOn: appOn, to: &result)
         }
         return result
     }
 
-    private func kimiWireBusy(_ path: String) -> Bool {
-        let events: [JSONObject] = files.jsonLines(files.readTail(path)).compactMap { object in
+    private struct KimiSignal {
+        var busy = false
+        var ended: TimeInterval?
+    }
+
+    private func applyKimiSignals(_ paths: [String], id: String, title: String,
+                                  processOn: Bool, to result: inout RawToolState) {
+        let signals = paths.filter {
+            environment.now - (files.modificationTime($0) ?? 0) <= 1_800
+        }.map { ($0, kimiSignal($0)) }
+        if signals.contains(where: { $0.1.busy }) {
+            if processOn { result.busy.append(BusyItem(id: id, title: title)) }
+        } else if let ended = signals.first(where: {
+            URL(fileURLWithPath: $0.0).deletingLastPathComponent().lastPathComponent == "main"
+        })?.1.ended {
+            result.activities.append(TaskActivity(id: "\(id):ended:\(ended)", sessionId: id,
+                                                  title: title, phase: "ended", updatedAt: ended))
+        }
+    }
+
+    private func kimiSignal(_ path: String) -> KimiSignal {
+        // Ignore large context snapshots; only wire lifecycle records carry state.
+        let objects = files.readTail(path, bytes: 1 << 20).split(whereSeparator: \.isNewline)
+            .filter { $0.contains("context.append_loop_event") || $0.contains("turn.prompt") }
+            .compactMap { JSONValue.object(from: String($0)) }
+        var steps = Set<String>(), tools = Set<String>()
+        var turn: String?
+        var promptPending = false
+        var ended: TimeInterval?
+        for object in objects {
+            if JSONValue.string(object["type"]) == "turn.prompt" {
+                steps.removeAll(); tools.removeAll(); ended = nil; turn = nil
+                promptPending = true
+                continue
+            }
             guard JSONValue.string(object["type"]) == "context.append_loop_event",
-                let event = object["event"] as? JSONObject,
-                let type = JSONValue.string(event["type"]),
-                ["step.begin", "step.end", "tool.call", "tool.result"].contains(type)
-            else { return nil }
-            return event
-        }
-        guard let turn = events.reversed().compactMap({ JSONValue.string($0["turnId"]) }).first
-        else {
-            return false
-        }
-        var steps = Set<String>()
-        var tools = Set<String>()
-        for event in events {
-            let type = JSONValue.string(event["type"]) ?? ""
+                  let event = object["event"] as? JSONObject,
+                  let type = JSONValue.string(event["type"]) else { continue }
             if type == "tool.result" {
                 if let id = JSONValue.string(event["toolCallId"]) { tools.remove(id) }
                 continue
             }
-            guard JSONValue.string(event["turnId"]) == turn else { continue }
-            if type == "step.begin", let id = JSONValue.string(event["uuid"]) { steps.insert(id) }
-            if type == "step.end", let id = JSONValue.string(event["uuid"]) { steps.remove(id) }
+            if let next = JSONValue.string(event["turnId"]), next != turn {
+                turn = next; steps.removeAll(); tools.removeAll(); ended = nil
+            }
+            if type == "step.begin", let id = JSONValue.string(event["uuid"]) {
+                steps.insert(id); promptPending = false; ended = nil
+            }
+            if type == "step.end", let id = JSONValue.string(event["uuid"]) {
+                steps.remove(id)
+                if JSONValue.string(event["finishReason"]) == "end_turn",
+                   let time = JSONValue.double(object["time"]) {
+                    ended = time / 1_000; promptPending = false
+                }
+            }
             if type == "tool.call", let id = JSONValue.string(event["toolCallId"]) {
-                tools.insert(id)
+                tools.insert(id); ended = nil
             }
         }
-        return !steps.isEmpty || !tools.isEmpty
+        return KimiSignal(busy: promptPending || !steps.isEmpty || !tools.isEmpty, ended: ended)
     }
 
     func claude() -> RawToolState {
@@ -141,7 +172,19 @@ struct LocalCollectors {
             var title: String?
             var lastType: String?
             var lastKinds: [String] = []
-            for raw in (files.readText(path) ?? "").split(whereSeparator: \.isNewline) {
+            var lastStopReason: String?
+            var lastMessageTime: TimeInterval = modified
+            guard files.manager.isReadableFile(atPath: path) else {
+                result.sourceError = "部分会话日志不可读取"
+                continue
+            }
+            let text = files.readTail(path, bytes: 1 << 20)
+            if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               !text.split(whereSeparator: \.isNewline).contains(where: { JSONValue.object(from: String($0)) != nil }) {
+                result.sourceError = "部分会话日志格式不兼容"
+                continue
+            }
+            for raw in text.split(whereSeparator: \.isNewline) {
                 let line = String(raw)
                 if line.contains("\"ai-title\""), let object = JSONValue.object(from: line),
                     let value = JSONValue.string(object["aiTitle"]), !value.isEmpty
@@ -155,6 +198,8 @@ struct LocalCollectors {
                     ["user", "assistant"].contains(type)
                 else { continue }
                 lastType = type
+                lastStopReason = JSONValue.string((object["message"] as? JSONObject)?["stop_reason"])
+                lastMessageTime = DateSupport.timestamp(object["timestamp"]) ?? modified
                 if let message = object["message"] as? JSONObject,
                     let content = message["content"] as? [JSONObject]
                 {
@@ -172,8 +217,14 @@ struct LocalCollectors {
             }
             guard let title else { continue }
             updateLatest(&result, title: title, timestamp: modified)
-            if environment.now - modified <= window,
-                lastType == "user" || lastKinds.contains("tool_use")
+            if lastType == "assistant", lastStopReason == "end_turn" {
+                let id = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+                result.activities.append(TaskActivity(
+                    id: "\(id):ended:\(lastMessageTime)", sessionId: id, title: title,
+                    phase: "ended", updatedAt: lastMessageTime))
+            }
+            if count > 0, environment.now - modified <= window,
+                lastStopReason != "end_turn", lastType == "user" || lastKinds.contains("tool_use")
             {
                 result.busy.append(
                     BusyItem(
@@ -229,6 +280,9 @@ struct LocalCollectors {
                 }
             }
         }
+        else if files.manager.fileExists(atPath: cachePath) {
+            result.sourceError = "会话投影缓存不可读或格式不兼容"
+        }
         // projcache 滞后/缺失时的备份：事件流文件在 busy 窗口内有写入即视为进行中
         let sessionFiles = files.files(atDepth: 3, under: environment.path(".dsh", "sessions")) {
             $0.hasSuffix("/session.jsonl.zstd")
@@ -264,7 +318,7 @@ struct LocalCollectors {
     }
 
     func hermes() -> RawToolState {
-        let appCount = processes.count(named: "Hermes")
+        let appCount = processes.count(named: "Hermes") + processes.count(named: "hermes")
         let heartbeat = environment.path(".hermes", "state", "gateway.heartbeat")
         let gatewayAlive =
             files.modificationTime(heartbeat).map { environment.now - $0 < 120 } ?? false
@@ -275,7 +329,12 @@ struct LocalCollectors {
         let path = environment.path(".hermes", "state.db")
         guard let database = try? SQLiteDatabase(path: path, readOnly: true),
             let sessionColumns = try? database.columns(in: "sessions")
-        else { return result }
+        else {
+            if files.manager.fileExists(atPath: path) {
+                result.sourceError = "会话数据库不可读或格式不兼容"
+            }
+            return result
+        }
         if let row = try? database.query(
             """
             SELECT title, started_at FROM sessions
@@ -297,6 +356,16 @@ struct LocalCollectors {
             activity = max(activity, projected)
         }
         result.activity = activity
+
+        // Modern Hermes persists a final assistant row and an active turn lease.
+        // Usage timestamps are historical evidence, never an ongoing turn signal.
+        if let messageColumns = try? database.columns(in: "messages"),
+           Set(["id", "session_id", "role", "timestamp", "finish_reason", "tool_calls"])
+            .isSubset(of: messageColumns),
+           Set(["id", "title", "archived"]).isSubset(of: sessionColumns) {
+            collectHermesTurns(database, into: &result)
+            return result
+        }
 
         // 回合租约：回合开始即写入、进行中持续续期、结束即删除，
         // 是"正在执行回合"的实时信号（conversation_id 为压缩轮转的血缘根）。
@@ -383,6 +452,53 @@ struct LocalCollectors {
         return result
     }
 
+    private func collectHermesTurns(_ database: SQLiteDatabase, into result: inout RawToolState) {
+        var leased = Set<String>()
+        if let columns = try? database.columns(in: "session_turn_leases"), !columns.isEmpty {
+            guard Set(["conversation_id", "expires_at"]).isSubset(of: columns),
+                  let leaseRows = try? database.query(
+                    "SELECT conversation_id AS id FROM session_turn_leases WHERE expires_at > ?",
+                    binds: [.real(environment.now)]) else {
+                result.sourceError = "无法读取回合租约"; return
+            }
+            leased = Set(leaseRows.compactMap { $0["id"]?.string })
+        }
+        guard let rows = try? database.query("""
+            SELECT s.id, s.title, m.role, m.timestamp, m.finish_reason, m.tool_calls
+            FROM sessions s JOIN messages m ON m.id =
+                (SELECT MAX(id) FROM messages WHERE session_id = s.id)
+            WHERE s.archived = 0 AND m.timestamp > ?
+            """, binds: [.real(environment.now - 86_400)]) else {
+            result.sourceError = "无法读取回合消息"; return
+        }
+        var seen = Set<String>()
+        for row in rows {
+            guard let id = row["id"]?.string, let time = row["timestamp"]?.double else { continue }
+            seen.insert(id)
+            let title = row["title"]?.string?.nonempty ?? "(进行中会话)"
+            updateLatest(&result, title: title, timestamp: time)
+            let role = row["role"]?.string ?? ""
+            let reason = row["finish_reason"]?.string ?? ""
+            let calls = row["tool_calls"]?.string ?? ""
+            let pendingTools = !["", "null", "[]"].contains(calls)
+            if leased.contains(id) {
+                result.busy.append(BusyItem(id: id, title: title))
+            } else if role == "assistant", !pendingTools,
+                      ["stop", "end_turn", "length", "error", "agent_error", "content_filter"].contains(reason) {
+                let phase = ["error", "agent_error", "content_filter"].contains(reason) ? "interrupted" : "ended"
+                result.activities.append(TaskActivity(id: "\(id):\(phase):\(time)", sessionId: id,
+                                                      title: title, phase: phase, updatedAt: time))
+            } else if result.processOn, environment.now - time <= 1_800,
+                      role == "user" || role == "tool" || pendingTools {
+                result.busy.append(BusyItem(id: id, title: title))
+            }
+        }
+        // A new/rotated conversation can acquire its lease before the first row exists.
+        for id in leased.subtracting(seen) {
+            result.busy.append(BusyItem(id: id, title: "(进行中会话)"))
+        }
+    }
+
     func zcode() -> RawToolState {
         let cliCount = processes.count(named: "zcode-cli")
         let appOn = processes.count(named: "ZCode") > 0
@@ -415,6 +531,63 @@ struct LocalCollectors {
             {
                 result.latest = LatestItem(title: title, timestamp: timestamp)
             }
+        }
+        else if files.manager.fileExists(atPath: databasePath) {
+            result.sourceError = "会话索引数据库不可读或格式不兼容"
+        }
+        if let database = try? SQLiteDatabase(path: environment.path(".zcode", "cli", "db", "db.sqlite"), readOnly: true),
+           let columns = try? database.columns(in: "turn_usage"),
+           Set(["session_id", "turn_id", "status", "started_at", "completed_at"]).isSubset(of: columns),
+           let rows = try? database.query("""
+                SELECT t.session_id, t.turn_id, t.status, t.started_at, t.completed_at
+                FROM turn_usage t WHERE t.started_at > ?
+                  AND t.session_id NOT LIKE 'sess_subagent_%'
+                  AND NOT EXISTS (SELECT 1 FROM turn_usage newer
+                    WHERE newer.session_id = t.session_id AND newer.started_at > t.started_at)
+                """, binds: [.real((environment.now - 86_400) * 1_000)]) {
+            let messageColumns = (try? database.columns(in: "message")) ?? []
+            let hasMessages = Set(["session_id", "time_created", "data"]).isSubset(of: messageColumns)
+            // A just-submitted user message precedes creation of its running row.
+            // Assistant/metadata writes after completion must not reopen the turn.
+            let onsetQuery = hasMessages ? """
+                SELECT session_id, MAX(time_created) / 1000.0 AS time FROM message
+                WHERE time_created > ? AND json_valid(data) AND json_extract(data, '$.role') = 'user'
+                GROUP BY session_id
+                """ : """
+                SELECT session_id, MAX(time_updated) / 1000.0 AS time FROM part
+                WHERE time_updated > ? GROUP BY session_id
+                """
+            let parts = (try? database.query(onsetQuery, binds: [
+                .real((environment.now - TimeInterval(settings.busySeconds(for: "zcode"))) * 1_000)])) ?? []
+            var pendingParts = Dictionary(parts.compactMap { row -> (String, Double)? in
+                guard let id = row["session_id"]?.string, !id.hasPrefix("sess_subagent_"), let time = row["time"]?.double else { return nil }
+                return (id, time)
+            }, uniquingKeysWith: max)
+            for row in rows {
+                guard let id = row["session_id"]?.string, let started = row["started_at"]?.double else { continue }
+                let status = row["status"]?.string ?? ""
+                let time = (row["completed_at"]?.double ?? started) / 1_000
+                let title = titles[id] ?? "(未知任务)"
+                let partTime = pendingParts.removeValue(forKey: id) ?? 0
+                updateLatest(&result, title: title, timestamp: max(time, partTime))
+                if partTime > time, status != "running", result.processOn {
+                    result.busy.append(BusyItem(id: id, title: title))
+                } else if status == "running", result.processOn, environment.now - time <= 10_800 {
+                    result.busy.append(BusyItem(id: id, title: title))
+                } else if ["completed", "error", "cancelled"].contains(status), row["completed_at"]?.double != nil {
+                    let phase = status == "completed" ? "ended" : "interrupted"
+                    result.activities.append(TaskActivity(id: "\(id):\(phase):\(row["turn_id"]?.string ?? "")",
+                        sessionId: id, title: title, phase: phase, updatedAt: time))
+                }
+            }
+            if result.processOn {
+                for (id, time) in pendingParts {
+                    let title = titles[id] ?? "(未知任务)"
+                    updateLatest(&result, title: title, timestamp: time)
+                    result.busy.append(BusyItem(id: id, title: title))
+                }
+            }
+            return result
         }
         let cli = environment.path(".zcode", "cli")
         var activity: [String: TimeInterval] = [:]
@@ -510,7 +683,12 @@ struct LocalCollectors {
             result.latest = LatestItem(title: titles[id] ?? "(未知任务)", timestamp: time)
         }
         result.activity = activity.values.max() ?? 0
-        if result.busy.isEmpty, appOn, let latest = result.latest,
+        for (id, finished) in turnFinished where finished >= (activity[id] ?? 0) - 5 {
+            result.activities.append(TaskActivity(
+                id: "\(id):ended:\(finished)", sessionId: id, title: titles[id] ?? "(未知任务)",
+                phase: "ended", updatedAt: finished))
+        }
+        if result.busy.isEmpty, result.activities.isEmpty, appOn, let latest = result.latest,
             transientConnections(processNames: ["ZCode"])["ZCode", default: 0] > 0
         {
             result.busy = [BusyItem(id: "conn-zcode", title: latest.title)]

@@ -269,7 +269,8 @@ final class ProcessSupport {
         let lines = output(executable: "/bin/ps", arguments: ["-eo", "pid=,args="])
             .split(whereSeparator: \.isNewline).map(String.init)
         var parsed: [(pid: Int32, args: String)] = []
-        for line in lines {
+        for raw in lines {
+            let line = raw.trimmingCharacters(in: .whitespaces)
             guard let space = line.firstIndex(of: " ") else { continue }
             guard let pid = Int32(line[..<space].trimmingCharacters(in: .whitespaces)),
                 !line[space...].trimmingCharacters(in: .whitespaces).isEmpty
@@ -299,11 +300,14 @@ final class ProcessSupport {
                 while let first = tokens.first, first.contains("=") && !first.hasPrefix("/") {
                     tokens.removeFirst()
                 }
-                guard let first = tokens.first,
-                    URL(fileURLWithPath: first).lastPathComponent == basename,
-                    !excluded.contains(where: line.contains)
-                else { return }
-                count += 1
+                guard let first = tokens.first, !excluded.contains(where: line.contains) else { return }
+                let executable = URL(fileURLWithPath: first).lastPathComponent
+                let interpreted = ["python", "python3", "python3.11", "python3.12", "python3.13", "node", "bun"]
+                let script = tokens.dropFirst().first
+                if executable == basename || (interpreted.contains(executable)
+                    && script.map { URL(fileURLWithPath: $0).lastPathComponent == basename } == true) {
+                    count += 1
+                }
             }
     }
 

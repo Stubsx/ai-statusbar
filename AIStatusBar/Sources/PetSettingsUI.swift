@@ -26,6 +26,7 @@ struct PetSettingsTab: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 section("形象") { gallery }
+                section("分享与创作") { PetSharingControls(settings: settings, catalog: catalog) }
                 section("素材库位置") { libraryRow }
                 section("宠物大小") { sizeRow }
                 Spacer(minLength: 2)
@@ -421,6 +422,7 @@ struct PetEditorView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var name: String
+    @State private var metadata: PetMetadata
     @State private var draftTheme: PetTheme
     @State private var previewIndex: Int = 0
     @State private var showImportError = false
@@ -430,6 +432,7 @@ struct PetEditorView: View {
         _catalog = ObservedObject(wrappedValue: catalog)
         self.onSaved = onSaved
         _name = State(initialValue: context.initialName)
+        _metadata = State(initialValue: PetMetadata(manifest: PetSharing.manifest(at: context.draftURL)))
         _draftTheme = State(initialValue: catalog.draftTheme(at: context.draftURL))
     }
 
@@ -448,6 +451,12 @@ struct PetEditorView: View {
                 VStack(alignment: .leading, spacing: 18) {
                     header
                     nameRow
+                    VStack(spacing: 8) {
+                        TextField("作者", text: $metadata.author)
+                        TextField("版本（如 1.0.0）", text: $metadata.version)
+                        TextField("授权（如 MIT、CC BY 4.0 或保留所有权利）", text: $metadata.license)
+                        TextField("作品简介", text: $metadata.description)
+                    }.textFieldStyle(.roundedBorder)
                     previewBlock
                     slotGrid
                     legend
@@ -580,7 +589,8 @@ struct PetEditorView: View {
         guard let installed = catalog.install(
             draftAt: context.draftURL,
             name: name,
-            replacing: context.editingThemeID
+            replacing: context.editingThemeID,
+            metadata: metadata
         ) else { return }
         onSaved(installed)
         dismiss()

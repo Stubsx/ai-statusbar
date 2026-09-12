@@ -22,7 +22,8 @@ cp ../.build/apple/Products/Release/lingmou-collector "$APP/Contents/Resources/"
 chmod 755 "$APP/Contents/Resources/lingmou-collector"
 
 for arch in arm64 x86_64; do
-  swiftc -O -target "${arch}-apple-macosx12.0" -o ".build/AIStatusBar-${arch}" Sources/*.swift
+  swiftc -O -target "${arch}-apple-macosx12.0" -o ".build/AIStatusBar-${arch}" \
+    Sources/*.swift ../Sources/LingmouCollectorCore/ActivityModels.swift ../Sources/LingmouCollectorCore/EventFeed.swift
 done
 lipo -create .build/AIStatusBar-arm64 .build/AIStatusBar-x86_64 -output "$APP/Contents/MacOS/AIStatusBar"
 rm -rf .build
@@ -32,6 +33,13 @@ cp ../PRIVACY.md "$APP/Contents/Resources/PRIVACY.md"
 cp Info.plist "$APP/Contents/"
 [ -f ../icons/AppIcon.icns ] && cp ../icons/AppIcon.icns "$APP/Contents/Resources/"
 [ -d Resources/Pet ] && cp -R Resources/Pet "$APP/Contents/Resources/"
+[ -d Resources/PetGallery ] && cp -R Resources/PetGallery "$APP/Contents/Resources/"
+if [ -d ../docs ]; then
+  mkdir -p "$APP/Contents/Resources/Guides"
+  for guide in TOOLS ADAPTERS PETS LOCAL_EVENTS; do
+    cp "../docs/$guide.md" "$APP/Contents/Resources/Guides/"
+  done
+fi
 
 # 对外版本只由 SemVer tag 决定。日常 commit 沿用最近的正式版本，不再把
 # commit 数拼进补丁号；APP_VERSION 仅供 CI 或发版脚本显式覆盖。

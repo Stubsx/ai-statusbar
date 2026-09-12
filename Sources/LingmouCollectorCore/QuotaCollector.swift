@@ -51,6 +51,7 @@ struct QuotaCollector {
             cached.kimiCodingTokenMtime == codingTokenTime,
             cached.kimiTokenMtime == monthlyTokenTime,
             cached.kimiDecryptEnabled == settings.kimiTokenDecrypt,
+            (files.modificationTime(cachePath) ?? 0) >= kimiAuthorizationModificationTime,
             environment.now - (files.modificationTime(cachePath) ?? 0) <= 300
         {
             return [
@@ -186,7 +187,7 @@ struct QuotaCollector {
         return ToolQuota(
             plan: JSONValue.string(found.1["plan_type"]),
             windows: windows,
-            updatedAt: Int(environment.now)
+            updatedAt: Int(found.0)
         )
     }
 
@@ -360,6 +361,10 @@ struct QuotaCollector {
         files.modificationTime(kimiTokenPath) ?? 0
     }
 
+    private var kimiAuthorizationModificationTime: TimeInterval {
+        files.modificationTime(environment.path(".ai-statusbar", "kimi-keychain-authorized")) ?? 0
+    }
+
     private var kimiWorkRoot: String {
         environment.path("Library", "Application Support", "kimi-desktop")
     }
@@ -393,6 +398,7 @@ struct QuotaCollector {
         if let cacheData = files.read(cachePath),
             let cache = try? decoder.decode(MonthlyCache.self, from: cacheData),
             cache.schema == 2,
+            cache.checkedAt >= kimiAuthorizationModificationTime,
             environment.now - cache.checkedAt < 3_600, cache.tokenMtime == tokenTime,
             cache.decryptEnabled == settings.kimiTokenDecrypt
         {

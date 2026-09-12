@@ -42,6 +42,11 @@ struct ToolStatus: Codable {
     let latestTitle: String?
     let latestAge: String?
     let quota: ToolQuota?
+    var activeItems: [BusyItem]? = nil
+    var activities: [TaskActivity]? = nil
+    var health: ToolHealth? = nil
+    var capabilities: ToolCapabilities? = nil
+    var latestSessionId: String? = nil
 }
 
 struct UsageEntry: Codable {
@@ -89,6 +94,7 @@ struct UsageSyncStatus: Codable {
 }
 
 struct StatusData: Codable {
+    var collectedAt: TimeInterval? = nil
     let updatedAt: String
     let tools: [ToolStatus]
     let usage: UsageData?

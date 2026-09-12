@@ -72,6 +72,11 @@ public struct ToolStatus: Codable, Hashable, Sendable {
     public let latestTitle: String?
     public let latestAge: String?
     public let quota: ToolQuota?
+    public let activeItems: [BusyItem]?
+    public let activities: [TaskActivity]?
+    public let health: ToolHealth?
+    public let capabilities: ToolCapabilities?
+    public let latestSessionId: String?
 
     public init(
         key: String,
@@ -82,7 +87,12 @@ public struct ToolStatus: Codable, Hashable, Sendable {
         detail: String,
         latestTitle: String?,
         latestAge: String?,
-        quota: ToolQuota?
+        quota: ToolQuota?,
+        activeItems: [BusyItem]? = nil,
+        activities: [TaskActivity]? = nil,
+        health: ToolHealth? = nil,
+        capabilities: ToolCapabilities? = nil,
+        latestSessionId: String? = nil
     ) {
         self.key = key
         self.letter = letter
@@ -94,6 +104,11 @@ public struct ToolStatus: Codable, Hashable, Sendable {
         self.latestTitle = latestTitle
         self.latestAge = latestAge
         self.quota = quota
+        self.activeItems = activeItems
+        self.activities = activities
+        self.health = health
+        self.capabilities = capabilities
+        self.latestSessionId = latestSessionId
     }
 }
 
@@ -248,6 +263,7 @@ public struct UsageSyncStatus: Codable, Hashable, Sendable {
 }
 
 public struct StatusData: Codable, Hashable, Sendable {
+    public let collectedAt: TimeInterval?
     public let updatedAt: String
     public let tools: [ToolStatus]
     public let usage: UsageData?
@@ -260,19 +276,22 @@ public struct StatusData: Codable, Hashable, Sendable {
         tools: [ToolStatus],
         usage: UsageData?,
         usageMerged: UsageData? = nil,
-        sync: UsageSyncStatus? = nil
+        sync: UsageSyncStatus? = nil,
+        collectedAt: TimeInterval? = nil
     ) {
         self.updatedAt = updatedAt
         self.tools = tools
         self.usage = usage
         self.usageMerged = usageMerged
         self.sync = sync
+        self.collectedAt = collectedAt
     }
 }
 
 struct LatestItem: Sendable {
     let title: String
     let timestamp: TimeInterval
+    var sessionId: String? = nil
 }
 
 struct RawToolState: Sendable {
@@ -281,4 +300,6 @@ struct RawToolState: Sendable {
     var latest: LatestItem?
     var activity: TimeInterval = 0
     var detail = "无进程"
+    var activities: [TaskActivity] = []
+    var sourceError: String?
 }

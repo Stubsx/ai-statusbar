@@ -110,6 +110,30 @@ struct ConditionalGlass: ViewModifier {
 
 // MARK: - 可拖动的 HostingView：让 isMovableByWindowBackground 生效（原生拖动，零抖动）
 
+/// 状态面板支持键盘；菜单中的 SwiftUI 快捷键在首次展开菜单前可能尚未注册。
+final class TaskPanel: NSPanel {
+    var navigationDefaults = UserDefaults.standard
+    override var canBecomeKey: Bool { true }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        let key = event.charactersIgnoringModifiers?.lowercased() ?? ""
+        let current = navigationDefaults.string(forKey: "panelTab") ?? "status"
+        var destination: String?
+        if modifiers == .command {
+            destination = ["1": "status", "2": "usage", "3": "heat", "4": "quota", "5": "history"][key]
+            if key == "e" { destination = current == "details" ? "status" : "details" }
+        } else if modifiers.isEmpty && event.keyCode == 53 && current != "status" {
+            destination = "status"
+        }
+        if let destination, attachedSheet == nil {
+            navigationDefaults.set(destination, forKey: "panelTab")
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
 final class DraggableHostingView<Content: View>: NSHostingView<Content> {
     override var mouseDownCanMoveWindow: Bool { true }
 

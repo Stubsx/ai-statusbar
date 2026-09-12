@@ -55,7 +55,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // 历史版本只在开关从关→开时请求一次系统授权，且忽略结果；若当时授权
         // 未完成（如签名身份变化），此后通知会被系统静默丢弃。启动时补查一次：
         // notDetermined 才真正弹系统授权框，已允许/已拒绝都不打扰用户。
-        if settings.notifyEnabled {
+        if settings.notifyEnabled || settings.experience.quotaAlerts {
             UNUserNotificationCenter.current().getNotificationSettings { s in
                 if s.authorizationStatus == .notDetermined {
                     UNUserNotificationCenter.current().requestAuthorization(
@@ -77,6 +77,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         buildBallPanel()
         applyDesktopPresentationMode()
         store.start()
+        if !settings.experience.onboardingCompleted { showSettings(tab: "welcome") }
         NotificationCenter.default.addObserver(self, selector: #selector(onStatusUpdated),
                                                name: .statusUpdated, object: nil)
         // 防止 macOS 把后台菜单栏 app 的定时器节流（App Nap），保住 3 秒背景采样
@@ -94,12 +95,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
-        if response.actionIdentifier == UNNotificationDefaultActionIdentifier,
-            let key = response.notification.request.content.userInfo["tool"] as? String
-        {
-            NotificationRouter.openDestination(forToolKey: key)
+        if response.actionIdentifier == UNNotificationDefaultActionIdentifier {
+            let info = response.notification.request.content.userInfo
+            DispatchQueue.main.async { [weak self] in
+                defer { completionHandler() }
+                self?.store.openNotification(info) { [weak self] in self?.showTaskPanel(tab: "history") }
+            }
+        } else {
+            completionHandler()
         }
-        completionHandler()
     }
 
     /// 灵眸面板/设置恰好在前台时也照常弹横幅，避免操作面板时错过完成通知
@@ -142,7 +146,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
     @objc private func onStatusUpdated() {
-        guard let data = store.data else { return }
+        guard let data = store.data else {
+            statusItem.button?.title = store.collectorError == nil ? "AI …" : "AI !"
+            return
+        }
         let visible = data.tools.filter { $0.state != "off" }
         // 全部未运行时保留一个占位徽标，保证菜单入口还在
         statusItem.button?.attributedTitle = visible.isEmpty
@@ -150,6 +157,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                                      busyCount: 0, busyItems: [], detail: "",
                                      latestTitle: nil, latestAge: nil, quota: nil)])
             : badgeTitle(visible)
+        if !store.attentionEvents.isEmpty || store.collectorError != nil,
+           let button = statusItem.button {
+            let title = NSMutableAttributedString(attributedString: button.attributedTitle)
+            let text = store.collectorError != nil ? "  !" : "  !\(store.attentionEvents.count)"
+            title.append(NSAttributedString(string: text, attributes: [
+                .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .semibold),
+                .foregroundColor: NSColor.systemOrange,
+            ]))
+            button.attributedTitle = title
+        }
 
         // 过渡期间不争抢窗口尺寸；最后一次数据在动画完成后统一测量。
         if panelTransitioning || desktopAnchorMoving {
@@ -171,6 +188,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             var f = panel.frame
             f.origin.y += f.size.height - size.height  // 保持顶边不动
             f.size = size
+            if let screen = panel.screen ?? NSScreen.main {
+                f.origin.x = max(screen.visibleFrame.minX, min(f.origin.x, screen.visibleFrame.maxX - size.width))
+                f.origin.y = max(screen.visibleFrame.minY, min(f.origin.y, screen.visibleFrame.maxY - size.height))
+            }
             panel.setFrame(f, display: true)
         }
     }
@@ -497,6 +518,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
+        let attention = NSMenuItem(title: "打开面板",
+                                   action: #selector(openTaskCenter), keyEquivalent: "1")
+        attention.target = self
+        attention.image = symbol("eye", template: true)
+        menu.addItem(attention)
+        let history = NSMenuItem(title: "最近事件", action: #selector(openHistory), keyEquivalent: "2")
+        history.target = self
+        menu.addItem(history)
+        menu.addItem(.separator())
         let label = ["busy": "工作中", "idle": "空闲", "off": "未运行"]
         if let data = store.data {
             let visible = data.tools.filter { $0.state != "off" }
@@ -509,14 +539,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             }
             for t in visible {
                 let header = NSMenuItem(title: "\(t.name)：\(label[t.state] ?? t.state)（\(t.detail)）",
-                                        action: nil, keyEquivalent: "")
+                                        action: #selector(openTool(_:)), keyEquivalent: "")
+                header.target = self
+                header.representedObject = t.key
+                header.toolTip = NotificationRouter.destinationLabel(forToolKey: t.key)
                 header.image = symbol("circle.fill", color: NSColor.toolStatusColor(t.state), size: 10)
-                header.isEnabled = false
                 menu.addItem(header)
                 for busy in t.busyItems.prefix(3) {
-                    let item = NSMenuItem(title: truncate(busy.title), action: nil, keyEquivalent: "")
+                    let item = NSMenuItem(title: truncate(store.displayTitle(busy.title)), action: #selector(openTool(_:)), keyEquivalent: "")
+                    item.target = self
+                    item.representedObject = ToolDestination(toolKey: t.key, sessionId: busy.id)
+                    item.toolTip = store.displayTitle(busy.title) + " · " + NotificationRouter.destinationLabel(forToolKey: t.key, sessionId: busy.id)
                     item.image = symbol("play.fill", color: .systemGreen, size: 11)
-                    item.isEnabled = false
+                    item.isEnabled = true
                     item.attributedTitle = NSAttributedString(string: item.title, attributes: [
                         .font: NSFont.systemFont(ofSize: 11),
                         .foregroundColor: NSColor.systemGreen,
@@ -524,9 +559,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                     menu.addItem(item)
                 }
                 if t.busyItems.isEmpty, let latest = t.latestTitle {
-                    let item = NSMenuItem(title: "最近任务：\(truncate(latest, 34)) · \(t.latestAge ?? "")", action: nil, keyEquivalent: "")
+                    let item = NSMenuItem(title: "最近任务：\(truncate(store.displayTitle(latest), 34)) · \(t.latestAge ?? "")", action: #selector(openTool(_:)), keyEquivalent: "")
+                    item.target = self
+                    item.representedObject = ToolDestination(toolKey: t.key, sessionId: t.latestSessionId)
+                    item.toolTip = store.displayTitle(latest) + " · " + NotificationRouter.destinationLabel(forToolKey: t.key, sessionId: t.latestSessionId)
                     item.image = symbol("clock", size: 11, template: true)
-                    item.isEnabled = false
+                    item.isEnabled = true
                     item.attributedTitle = NSAttributedString(string: item.title, attributes: [
                         .font: NSFont.systemFont(ofSize: 11),
                         .foregroundColor: NSColor.secondaryLabelColor,
@@ -604,7 +642,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         hosting.contextMenuBuilder = { [weak self] in
             self?.buildPanelContextMenu() ?? NSMenu()
         }
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 320, height: 200),
+        panel = TaskPanel(contentRect: NSRect(x: 0, y: 0, width: 320, height: 200),
                         styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.identifier = NSUserInterfaceItemIdentifier("AIStatusPanel")
         panel.animationBehavior = .none  // 仅由下面的统一过渡驱动，避免系统开关动画叠加。
@@ -974,7 +1012,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                 self.cardOutsideSince = nil
                 return
             }
-            if self.panel.frame.contains(NSEvent.mouseLocation) {
+            if self.panel.isKeyWindow || self.panel.frame.contains(NSEvent.mouseLocation) {
                 self.cardOutsideSince = nil
             } else {
                 let since = self.cardOutsideSince ?? Date()
@@ -1214,6 +1252,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        store.cancelKimiAuthorization()
         finishDesktopMovement(reposition: false)
     }
 
@@ -1252,6 +1291,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         }
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    func showSettings(tab: String = "general") {
+        UserDefaults.standard.set(tab, forKey: "settingsTab")
+        openSettings()
+    }
+
+    @objc private func openTaskCenter() { showTaskPanel() }
+    @objc private func openHistory() { showTaskPanel(tab: "history") }
+    @objc private func openTool(_ sender: NSMenuItem) {
+        if let destination = sender.representedObject as? ToolDestination {
+            NotificationRouter.openDestination(destination)
+        } else if let key = sender.representedObject as? String {
+            NotificationRouter.openDestination(forToolKey: key)
+        }
+    }
+
+    func showTaskPanel(tab: String? = nil) {
+        // 普通打开复用持久化页面；显式入口先选页，避免展开时闪回其他页面。
+        if let tab { UserDefaults.standard.set(tab, forKey: "panelTab") }
+        if desktopPresentationMode == "card" {
+            if !cardExpanded { toggleCardPanel() }
+        } else if desktopPresentationMode == "pet" {
+            if !petDetailsExpanded { togglePetDetails() }
+        } else {
+            panel.center()
+            transitionPanel(visible: true)
+        }
+        updatePanelSize()
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
     }
 
     @objc private func togglePin() {
@@ -1407,8 +1477,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
     /// 悬浮球右键菜单：展开/收起 + 模式切换，其余项与面板/桌宠菜单同源
+    private func addTaskEntries(to menu: NSMenu) {
+        for (title, action, icon) in [("打开面板", #selector(openTaskCenter), "eye"),
+                                      ("最近事件", #selector(openHistory), "clock")] {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            item.image = symbol(icon, template: true)
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+    }
+
     private func buildBallContextMenu() -> NSMenu {
         let menu = NSMenu()
+        addTaskEntries(to: menu)
         let toggleItem = NSMenuItem(
             title: cardExpanded ? "收起面板" : "展开面板",
             action: #selector(toggleCardPanel),
@@ -1470,6 +1552,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
 
     private func buildPetContextMenu() -> NSMenu {
         let menu = NSMenu()
+        addTaskEntries(to: menu)
         let detailsItem = NSMenuItem(
             title: petDetailsExpanded ? "收起详情卡片" : "展开详情卡片",
             action: #selector(togglePetDetails),

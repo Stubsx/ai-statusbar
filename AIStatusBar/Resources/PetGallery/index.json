@@ -1,0 +1,11 @@
+[
+  {
+    "id": "blue-dot-starter",
+    "name": "蓝点 · 创作起点",
+    "author": "灵眸项目",
+    "version": "1.0.0",
+    "license": "MIT",
+    "summary": "透明背景、统一画布的基础模板，替换空闲图即可开始创作。",
+    "template": true
+  }
+]

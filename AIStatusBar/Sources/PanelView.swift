@@ -15,6 +15,9 @@ struct PanelView: View {
     @AppStorage("usageScope") private var usageScope = "all"
     /// 用量时间范围：today=今日（默认） 7d=近七日 30d=近30日
     @AppStorage("usageRange") private var usageRange = "today"
+    @AppStorage("usageBreakdown") private var usageBreakdown = "tools"
+    @State private var historyTool = "all"
+    @State private var clearHistoryConfirmation = false
 
     /// 当前展示的用量数据：开启同步且选择"全部"时用合并视图，否则本机
     private var usageForDisplay: UsageData? {
@@ -102,10 +105,12 @@ struct PanelView: View {
     @ViewBuilder
     private var syncSummary: some View {
         if usageScope == "all", let s = store.data?.sync, s.enabled {
-            let latest = s.sources?.map(\.updatedAt).max() ?? 0
-            Text("\(s.sources?.count ?? 1) 台设备 · 最近更新 \(latest > 0 ? timeHM(latest) : "—")")
+            let stale = s.sources?.filter { Date().timeIntervalSince1970 - $0.updatedAt > 3_600 }.count ?? 0
+            let unavailable = s.dir == nil || store.data?.usageMerged == nil
+            Text(unavailable ? "同步目录不可用 · 当前显示本机统计" :
+                 "\(s.sources?.count ?? 1) 台设备\(stale > 0 ? " · \(stale) 台超过 1 小时未更新" : " · 数据已汇总")")
                 .font(.system(size: 9).monospacedDigit())
-                .foregroundColor(.secondary.opacity(0.7))
+                .foregroundColor(unavailable || stale > 0 ? .orange : .secondary)
                 .padding(.top, 2)
                 .frame(maxWidth: .infinity, alignment: .trailing)
         }
@@ -118,114 +123,257 @@ struct PanelView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 6) {
-                Text("灵眸")
-                    .font(.system(size: 11, weight: .semibold))
-                    .tracking(1)
-                    .foregroundColor(.secondary)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 12) {
+                Text("灵眸").font(.custom("PingFangSC-Semibold", size: 15)).tracking(2)
                 Spacer()
-                tabButton("状态", "status")
-                tabButton("用量", "usage")
-                tabButton("活跃", "heat")
-                tabButton("配额", "quota")
+                if store.settings.experience.privacyMode {
+                    Image(systemName: "eye.slash").foregroundColor(.secondary).help("演示模式：任务标题已隐藏")
+                }
+                pageMenu
+                Button { (NSApp.delegate as? AppDelegate)?.showSettings() } label: {
+                    Image(systemName: "slider.horizontal.3").font(.system(size: 12))
+                }.buttonStyle(.borderless).help("设置")
             }
-            .padding(.bottom, 8)
-
-            if tab == "heat" {
-                heatView
-            } else if tab == "usage" {
-                usageView
-            } else if tab == "quota" {
-                quotaView
-            } else if let error = store.collectorError {
-                Text(error)
-                    .font(.system(size: 11))
-                    .foregroundColor(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.vertical, 4)
-            } else if let tools = store.data?.tools {
-                let visible = tools.filter { $0.state != "off" }  // 未运行的不显示
-                if visible.isEmpty {
-                    Text("全部未运行")
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary.opacity(0.7))
-                        .padding(.vertical, 4)
-                }
-                ForEach(visible, id: \.key) { t in
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 10) {
-                            Circle()
-                                .fill(color(for: t.state))
-                                .frame(width: 8, height: 8)
-                                .shadow(color: t.state == "busy" ? color(for: t.state) : .clear, radius: 3)
-                            Text(t.name)
-                                .font(.system(size: 13, weight: .medium))
-                            Spacer()
-                            Text(t.state == "busy" ? label(for: t.state) : "\(label(for: t.state)) · \(t.detail)")
-                                .font(.system(size: 11))
-                                .foregroundColor(.secondary)
-                            if t.state == "busy" {
-                                Text("\(t.busyCount)")
-                                    .font(.system(size: 11, weight: .bold))
-                                    .foregroundColor(color(for: "busy"))
-                            }
-                        }
-                        .padding(.vertical, 4)
-
-                        ForEach(t.busyItems, id: \.id) { item in
-                            HStack(spacing: 4) {
-                                Image(systemName: "play.fill")
-                                    .font(.system(size: 8, weight: .bold))
-                                    .foregroundColor(color(for: "busy").opacity(0.85))
-                                Text(item.title)
-                                    .font(.system(size: 11))
-                                    .foregroundColor(color(for: "busy").opacity(0.85))
-                                    .lineLimit(1)
-                                    .truncationMode(.tail)
-                            }
-                            .padding(.leading, 18)
-                        }
-                        if t.busyItems.isEmpty, let latest = t.latestTitle {
-                            HStack(spacing: 4) {
-                                Image(systemName: "clock")
-                                    .font(.system(size: 8))
-                                    .foregroundColor(.secondary.opacity(0.7))
-                                Text("最近：\(latest) · \(t.latestAge ?? "")")
-                                    .font(.system(size: 10))
-                                    .foregroundColor(.secondary.opacity(0.7))
-                                    .lineLimit(1)
-                                    .truncationMode(.tail)
-                            }
-                            .padding(.leading, 18)
-                            .padding(.bottom, 4)
-                        }
-                    }
-                }
+            Divider().opacity(0.5)
+            if tab == "status" {
+                summaryView
             } else {
-                Text("加载中…")
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
+                FittedPanelScrollView {
+                    VStack(alignment: .leading, spacing: 10) {
+                        if tab == "heat" { heatView }
+                        else if tab == "usage" { usageView }
+                        else if tab == "quota" { quotaView }
+                        else if tab == "history" { historyView }
+                        else { statusView }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.trailing, 2)
+                }
+            }
+            HStack {
+                FreshnessView(timestamp: store.lastCollectedAt)
+                Spacer()
+                if tab != "status" {
+                    Button("返回状态") { tab = "status" }
+                        .font(.system(size: 10)).buttonStyle(.borderless)
+                        .keyboardShortcut(.escape, modifiers: [])
+                }
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.top, 12)
-        .padding(.bottom, 10)
-        .frame(width: 300)  // 固定宽度，长标题自动省略号
+        .padding(14)
+        .frame(width: tab == "status" ? 300 : (tab == "details" ? 380 : 340))
         .modifier(ConditionalGlass(bare: bare))
         .onAppear { applyLevel() }
+        .onChange(of: tab) { _ in
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .statusUpdated, object: nil)
+            }
+        }
     }
 
-    private func tabButton(_ title: String, _ id: String) -> some View {
-        Button(action: { tab = id }) {
-            Text(title)
-                .font(.system(size: 10, weight: tab == id ? .semibold : .regular))
-                .foregroundColor(tab == id ? Color.primary : Color.secondary)
-                .padding(.horizontal, 10)
+    private var visibleTools: [ToolStatus] {
+        (store.data?.tools.filter { $0.state != "off" || $0.health?.state == "error" } ?? []).sorted {
+            func priority(_ tool: ToolStatus) -> Int {
+                tool.health?.state == "error" ? 0 : (tool.state == "busy" ? 1 : 2)
+            }
+            return priority($0) == priority($1) ? $0.key < $1.key : priority($0) < priority($1)
+        }
+    }
+
+    private var summaryToolLimit: Int {
+        store.attentionEvents.isEmpty && store.collectorError == nil ? 4 : 3
+    }
+
+    /// 默认只是状态速览；任务再多也不把浮窗撑成长看板。
+    private var summaryView: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let error = store.collectorError {
+                Button { (NSApp.delegate as? AppDelegate)?.showSettings(tab: "connections") } label: {
+                    Label("状态暂未更新 · 查看原因", systemImage: "exclamationmark.triangle")
+                        .font(.system(size: 11)).foregroundColor(.orange)
+                }.buttonStyle(.plain).help(error)
+            }
+            if let record = store.attentionEvents.first {
+                HStack(spacing: 8) {
+                    Button { store.openEvent(record) } label: {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Label("\(record.toolName) · \(record.label)", systemImage: record.symbol)
+                                .font(.system(size: 10)).foregroundColor(record.waiting || record.phase == "failed" ? .orange : .secondary)
+                                .lineLimit(1)
+                            Text(store.displayTitle(record.title)).font(.system(size: 12, weight: .medium))
+                                .lineLimit(1)
+                        }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+                    }.buttonStyle(.plain)
+                        .accessibilityIdentifier("open-event-\(record.id)")
+                        .help("\(store.displayTitle(record.title))\n\(NotificationRouter.destinationLabel(forToolKey: record.toolKey, sessionId: record.sessionId))，并清除此条提醒")
+                    Button { historyTool = "all"; tab = "history" } label: {
+                        HStack(spacing: 3) {
+                            Text("\(store.attentionEvents.count) 条")
+                            Image(systemName: "chevron.right").font(.system(size: 8, weight: .semibold))
+                        }.font(.system(size: 10)).fixedSize()
+                    }.buttonStyle(.borderless).help("查看未读事件与历史记录")
+                        .accessibilityLabel("查看全部 \(store.attentionEvents.count) 条未读事件")
+                }
+                .padding(9)
+                .background(RoundedRectangle(cornerRadius: 9).fill(
+                    record.waiting || record.phase == "failed" ? Color.orange.opacity(0.07) : Color.primary.opacity(0.035)))
+            }
+            if visibleTools.isEmpty { emptyStatus }
+            ForEach(Array(visibleTools.prefix(summaryToolLimit)), id: \.key) { tool in
+                let sessionId = tool.state == "busy" ? (tool.activeItems ?? tool.busyItems).first?.id : nil
+                Button { NotificationRouter.openDestination(forToolKey: tool.key, sessionId: sessionId) } label: {
+                    HStack(spacing: 8) {
+                        Circle().fill(tool.health?.state == "error" ? .orange : color(for: tool.state))
+                            .frame(width: 6, height: 6)
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text(tool.name).font(.system(size: 12, weight: .medium))
+                                Spacer(minLength: 6)
+                                Text(tool.health?.state == "error" ? "读取异常" :
+                                     (tool.state == "busy" ? "\(tool.busyCount) 个运行中" : label(for: tool.state)))
+                                    .font(.system(size: 10)).foregroundColor(.secondary)
+                            }
+                            if tool.state == "busy", let item = (tool.activeItems ?? tool.busyItems).first {
+                                Text(store.displayTitle(item.title)).font(.system(size: 11)).foregroundColor(.secondary)
+                                    .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        Image(systemName: "arrow.up.right").font(.system(size: 9)).foregroundColor(.secondary)
+                    }.padding(.vertical, 4).contentShape(Rectangle())
+                }.buttonStyle(.plain).help(NotificationRouter.destinationLabel(forToolKey: tool.key, sessionId: sessionId))
+            }
+            if visibleTools.count > summaryToolLimit {
+                Button("还有 \(visibleTools.count - summaryToolLimit) 个工具 · 查看全部") { tab = "details" }
+                    .font(.system(size: 10)).buttonStyle(.borderless)
+            }
+        }
+    }
+
+    private var emptyStatus: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(store.data == nil ? "正在观察你的 AI 工具…" : "当前没有运行中的工具")
+                .font(.system(size: 12, weight: .medium))
+            Text("开始工作后，状态会自动出现在这里。")
+                .font(.system(size: 11)).foregroundColor(.secondary)
+            Button("查看已识别工具") { (NSApp.delegate as? AppDelegate)?.showSettings(tab: "connections") }
+                .font(.system(size: 10)).buttonStyle(.borderless)
+        }.padding(.vertical, 4)
+    }
+
+    private var statusView: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if let error = store.collectorError {
+                Label(error, systemImage: "exclamationmark.triangle").font(.system(size: 11)).foregroundColor(.orange)
+                Button("查看连接与诊断") { (NSApp.delegate as? AppDelegate)?.showSettings(tab: "connections") }
+            }
+            if visibleTools.isEmpty { emptyStatus }
+            ForEach(visibleTools, id: \.key) { tool in
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 7) {
+                        Circle().fill(tool.health?.state == "error" ? .orange : color(for: tool.state)).frame(width: 6, height: 6)
+                        Text(tool.name).font(.system(size: 12, weight: .semibold))
+                        Spacer()
+                        Text(tool.state == "busy" ? "\(tool.busyCount) 个任务运行中" : label(for: tool.state))
+                            .font(.system(size: 10)).foregroundColor(.secondary)
+                        Button { NotificationRouter.openDestination(forToolKey: tool.key) } label: {
+                            Image(systemName: "arrow.up.right").font(.system(size: 10, weight: .semibold))
+                        }.buttonStyle(.borderless).help(NotificationRouter.destinationLabel(forToolKey: tool.key))
+                    }
+                    let items = tool.activeItems ?? tool.busyItems
+                    ForEach(items, id: \.id) { item in
+                        taskLink(title: item.title, toolKey: tool.key, sessionId: item.id)
+                    }
+                    if items.isEmpty, let title = tool.latestTitle {
+                        taskLink(title: "最近：\(title)", toolKey: tool.key, sessionId: tool.latestSessionId, secondary: true)
+                    }
+                    if tool.health?.state == "error" {
+                        Text(tool.health?.message ?? "部分数据不可读").font(.system(size: 10)).foregroundColor(.orange)
+                    }
+                }
                 .padding(.vertical, 3)
-                .background(Capsule().fill(tab == id ? Color.primary.opacity(0.16) : Color.primary.opacity(0.06)))
+            }
+        }
+    }
+
+    private func taskLink(title: String, toolKey: String, sessionId: String?, secondary: Bool = false) -> some View {
+        Button { NotificationRouter.openDestination(forToolKey: toolKey, sessionId: sessionId) } label: {
+            HStack(alignment: .top, spacing: 7) {
+                Image(systemName: secondary ? "clock" : "play.fill").font(.system(size: 8)).padding(.top, 3)
+                Text(store.displayTitle(title)).font(.system(size: 11))
+                    .lineLimit(4).frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .foregroundColor(secondary ? .secondary : .primary)
+            .padding(.leading, 13).padding(.vertical, 3).contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .help("\(store.displayTitle(title))\n\(NotificationRouter.destinationLabel(forToolKey: toolKey, sessionId: sessionId))")
+    }
+
+    private var historyView: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Picker("工具", selection: $historyTool) {
+                    Text("全部工具").tag("all")
+                    ForEach(store.data?.tools ?? [], id: \.key) { tool in Text(tool.name).tag(tool.key) }
+                }.labelsHidden().frame(maxWidth: 160)
+                Spacer()
+                Button("清空") { clearHistoryConfirmation = true }
+                    .disabled(store.recentEvents.isEmpty && store.historyError == nil).buttonStyle(.borderless)
+            }
+            Text("未读优先 · 本机保留 7 天 / 200 条").font(.system(size: 10)).foregroundColor(.secondary)
+            if let error = store.historyError { Text(error).font(.system(size: 10)).foregroundColor(.orange) }
+            if historyEvents.isEmpty {
+                Text("还没有事件。任务结束、等待或中断后会出现在这里。")
+                    .font(.system(size: 11)).foregroundColor(.secondary)
+            }
+            TaskEventRows(store: store, events: historyEvents, expanded: true)
+        }
+        .alert("清空最近事件？", isPresented: $clearHistoryConfirmation) {
+            Button("取消", role: .cancel) {}
+            Button("清空", role: .destructive) { store.clearHistory() }
+        } message: {
+            Text("仅清除灵眸本机历史，不影响原工具的任务。仍在等待回答或确认的任务会保留，旧事件不会再次推送。")
+        }
+    }
+
+    private var rangeModels: [String: UsageEntry]? {
+        guard let usage = usageForDisplay else { return nil }
+        switch usageRange {
+        case "7d": return usage.weekly?.models
+        case "30d": return usage.monthly?.models
+        default: return usage.models
+        }
+    }
+
+    private var pageMenu: some View {
+        Menu {
+            Button("状态速览") { tab = "status" }.keyboardShortcut("1", modifiers: .command)
+            Button("Token 用量") { tab = "usage" }.keyboardShortcut("2", modifiers: .command)
+            Button("活跃热力") { tab = "heat" }.keyboardShortcut("3", modifiers: .command)
+            Button("账号配额") { tab = "quota" }.keyboardShortcut("4", modifiers: .command)
+            Divider()
+            Button("最近事件") { historyTool = "all"; tab = "history" }.keyboardShortcut("5", modifiers: .command)
+            Button(tab == "details" ? "返回状态速览" : "运行详情") {
+                tab = tab == "details" ? "status" : "details"
+            }.keyboardShortcut("e", modifiers: .command)
+        } label: {
+            Text(["status": "状态", "usage": "用量", "heat": "活跃", "quota": "配额",
+                  "history": "最近事件", "details": "运行详情"][tab] ?? "状态")
+                .font(.system(size: 11, weight: .medium))
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("查看用量、配额和更多信息（⌘1–⌘5）")
+        .accessibilityLabel("切换状态、用量与记录")
+    }
+
+    private var historyEvents: [TaskRecord] {
+        store.recentEvents.filter { historyTool == "all" || $0.toolKey == historyTool }.sorted {
+            if $0.needsAttention != $1.needsAttention { return $0.needsAttention }
+            if $0.needsAttention && $0.priority != $1.priority { return $0.priority < $1.priority }
+            return $0.timestamp > $1.timestamp
+        }
     }
 
     private var usageView: some View {
@@ -242,6 +390,10 @@ struct PanelView: View {
                             .foregroundColor(.secondary.opacity(0.7))
                     }
                 }
+                HStack(spacing: 0) {
+                    segmentButton("按工具", tag: "tools", selection: $usageBreakdown)
+                    segmentButton("按模型", tag: "models", selection: $usageBreakdown)
+                }.padding(.vertical, 8)
                 Text(rangeSubtitle)
                     .font(.system(size: 9).monospacedDigit())
                     .foregroundColor(.secondary.opacity(0.7))
@@ -250,13 +402,16 @@ struct PanelView: View {
                 usageRow("总计", entries.total, bold: true)
                 Divider().background(Color.primary.opacity(0.1))
                 // 按工具总用量（输入+缓存+输出）从高到低排序
-                let sortedTools = entries.tools.sorted { lhs, rhs in
+                let sortedTools = (usageBreakdown == "models" ? (rangeModels ?? [:]) : entries.tools).sorted { lhs, rhs in
                     let l = lhs.value.input + lhs.value.output + lhs.value.cache
                     let r = rhs.value.input + rhs.value.output + rhs.value.cache
                     return l > r
                 }
                 ForEach(sortedTools, id: \.key) { key, e in
-                    usageRow(usageName(key), e, bold: false)
+                    usageRow(usageBreakdown == "models" ? key : usageName(key), e, bold: false)
+                }
+                if usageBreakdown == "models" && (rangeModels ?? [:]).isEmpty {
+                    Text("此时间范围暂无模型明细").font(.system(size: 11)).foregroundColor(.secondary)
                 }
                 syncSummary
             } else {
@@ -288,7 +443,7 @@ struct PanelView: View {
                 // Codex App/CLI 共享同一配额，合并为一张卡片
                 let withQuota = tools.filter { $0.quota != nil && $0.key != "codex-cli" }
                 if withQuota.isEmpty {
-                    Text("未检测到限额数据")
+                    Text("配额暂不可用，可在“连接与诊断”查看原因")
                         .font(.system(size: 11))
                         .foregroundColor(.secondary.opacity(0.6))
                         .padding(.vertical, 4)
@@ -309,6 +464,11 @@ struct PanelView: View {
                                     .background(Capsule().fill(Color.primary.opacity(0.08)))
                             }
                             Spacer()
+                        }
+                        if let quota = t.quota {
+                            FreshnessView(timestamp: Double(quota.updatedAt),
+                                          maxAge: t.health?.quotaState == "stale" ? 0 : (t.key == "kimi-work" ? 4_200 : 600),
+                                          staleLabel: "配额已过期 · 更新于")
                         }
                         if let notice = t.quota?.notice, !notice.isEmpty {
                             HStack(alignment: .top, spacing: 5) {

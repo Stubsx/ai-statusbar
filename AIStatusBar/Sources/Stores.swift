@@ -16,13 +16,14 @@ final class SettingsStore: ObservableObject {
     /// 桌宠显示比例范围：0.6～1.6，默认原大
     static let petScaleRange: ClosedRange<Double> = 0.6...1.6
 
+    private let systemEffects: Bool
     @Published var defaultSec = 300 { didSet { save() } }
     @Published var perTool: [String: Int] = [:] { didSet { save() } }
     @Published var offlineAfterSec = 10800 { didSet { save() } }
     @Published var notifyEnabled = false {
         didSet {
             save()
-            if notifyEnabled && !oldValue {
+            if systemEffects && notifyEnabled && !oldValue {
                 UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
             }
         }
@@ -42,15 +43,32 @@ final class SettingsStore: ObservableObject {
     @Published var usageSyncDir = "" { didSet { save() } }
     /// 用量数字单位：metric=K/M/B，wan=万/亿
     @Published var numberUnit = "metric" { didSet { save() } }
+    @Published var experience = ExperiencePreferences() {
+        didSet {
+            save()
+            if systemEffects && experience.quotaAlerts && !oldValue.quotaAlerts {
+                UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+            }
+            if systemEffects && experience.privacyMode && !oldValue.privacyMode {
+                UNUserNotificationCenter.current().removeAllDeliveredNotifications()
+                UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
+            }
+        }
+    }
 
     /// Dock 图标开关即时生效：regular 显示 Dock 图标，accessory 纯菜单栏
     func applyDockIconPolicy() {
+        guard systemEffects else { return }
         NSApp.setActivationPolicy(showDockIcon ? .regular : .accessory)
     }
 
-    private let path = NSHomeDirectory() + "/.ai-statusbar/settings.json"
+    private let path: String
 
-    init() { load() }
+    init(path: String? = nil, systemEffects: Bool = true) {
+        self.systemEffects = systemEffects
+        self.path = path ?? NSHomeDirectory() + "/.ai-statusbar/settings.json"
+        load()
+    }
 
     func busySec(for key: String) -> Int { perTool[key] ?? defaultSec }
     func notifyEnabled(for key: String) -> Bool { notifyEnabled && (notifyTools[key] ?? true) }
@@ -90,6 +108,13 @@ final class SettingsStore: ObservableObject {
             if let v = s["dir"] as? String { usageSyncDir = v }
         }
         if let v = obj["number_unit"] as? String, ["metric", "wan"].contains(v) { numberUnit = v }
+        if let value = obj["experience"], let data = try? JSONSerialization.data(withJSONObject: value),
+           let preferences = try? JSONDecoder().decode(ExperiencePreferences.self, from: data) {
+            experience = preferences
+        } else {
+            // 已有用户升级时不主动打断；指南仍可在设置中打开。
+            experience.onboardingCompleted = true
+        }
     }
 
     private func save() {
@@ -106,9 +131,10 @@ final class SettingsStore: ObservableObject {
             "kimi_token_decrypt": kimiTokenDecrypt,
             "usage_sync": ["enabled": usageSyncEnabled, "dir": usageSyncDir],
             "number_unit": numberUnit,
+            "experience": (try? JSONSerialization.jsonObject(with: JSONEncoder().encode(experience))) ?? [:],
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: .prettyPrinted) else { return }
-        let directory = NSHomeDirectory() + "/.ai-statusbar"
+        let directory = URL(fileURLWithPath: path).deletingLastPathComponent().path
         try? FileManager.default.createDirectory(
             atPath: directory,
             withIntermediateDirectories: true,
@@ -125,47 +151,255 @@ final class SettingsStore: ObservableObject {
 final class StatusStore: ObservableObject {
     @Published var data: StatusData?
     @Published var collectorError: String?
+    @Published private(set) var isAuthorizingKimi = false
+    @Published private(set) var kimiAuthorizationMessage: String?
+    private var kimiAuthorizationProcess: Process?
+    private var kimiAuthorizationCancelled = false
+
+    /// Only a settings action can enter this path. Timers never invoke it.
+    func authorizeKimiCredentials() {
+        guard !isAuthorizingKimi else { return }
+        guard let path = collectorPath else {
+            kimiAuthorizationMessage = "缺少采集器，无法发起授权。请重新安装灵眸。"
+            return
+        }
+        settings.kimiTokenDecrypt = false
+        isAuthorizingKimi = true
+        kimiAuthorizationCancelled = false
+        kimiAuthorizationMessage = "请处理系统授权窗口；60 秒内未完成会自动结束，不会重试。"
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = ["--authorize-kimi-keychain"]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        kimiAuthorizationProcess = process
+        // Launch on the main queue so cancel/quit cannot race a not-yet-started child.
+        do { try process.run() } catch {
+            kimiAuthorizationProcess = nil
+            isAuthorizingKimi = false
+            kimiAuthorizationMessage = "无法启动授权请求，解密保持关闭。"
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            var status: Int32 = -1
+            let timeout = CollectorProcessWatchdog.schedule(process, after: 62)
+            process.waitUntilExit()
+            timeout.cancel()
+            if process.terminationReason == .exit { status = process.terminationStatus }
+            let exitStatus = status
+            DispatchQueue.main.async {
+                self.kimiAuthorizationProcess = nil
+                self.isAuthorizingKimi = false
+                if self.kimiAuthorizationCancelled {
+                    self.kimiAuthorizationMessage = "已取消授权，Kimi 凭证解密保持关闭。"
+                } else if exitStatus == 0 {
+                    self.settings.kimiTokenDecrypt = true
+                    self.kimiAuthorizationMessage = "本次读取成功。后台仅使用已有权限；权限不足时显示提示，不再弹窗。"
+                    self.refresh()
+                } else if exitStatus == 124 {
+                    self.kimiAuthorizationMessage = "授权等待已超时，解密保持关闭。需要时可手动重试。"
+                } else if exitStatus == 3 {
+                    self.kimiAuthorizationMessage = "已有一个授权请求，请先处理或取消它。"
+                } else {
+                    self.kimiAuthorizationMessage = "未获得钥匙串读取权限，解密保持关闭，不会自动重试。"
+                }
+            }
+        }
+    }
+
+    func cancelKimiAuthorization() {
+        kimiAuthorizationCancelled = true
+        if let process = kimiAuthorizationProcess { CollectorProcessWatchdog.stop(process) }
+    }
     /// 任务完成事件序号：通知和桌宠共用同一套去抖后完成判定。
     @Published var completedEventSerial = 0
     /// 桌宠庆祝气泡文案：在序号变化前先更新，确保 UI 拿到完成任务的工具名。
-    @Published var completedEventMessage = "任务完成啦！"
+    @Published var completedEventMessage = "本轮已结束"
     let collectorPath: String?
     let settings: SettingsStore
     private var timer: Timer?
+    private var metricsTimer: Timer?
+    private var isRefreshingMetrics = false
     private var isRefreshing = false
+    private var sourceMonitor: SourceChangeMonitor?
+    private var pendingRefresh: DispatchWorkItem?
+    private var refreshAgain = false
+    private var lastRefreshStarted = Date.distantPast
+    @Published var recentEvents: [TaskRecord] = []
+    @Published var historyError: String?
+    @Published var lastCollectedAt: TimeInterval?
+    private let journal: EventJournal
+    private let quotaMonitor: QuotaMonitor
+    private let eventFeed: LocalEventFeed
+    private let notificationSink: ((String, String, [String: Any]) -> Void)?
+    private let eventOpener: (ToolDestination) -> Void
+    @Published var integrationError: String?
+    @Published var quotaError: String?
+    private var exportChanges: AnyCancellable?
+    private var pendingNotifications: [TaskRecord] = []
+    private var notificationWork: DispatchWorkItem?
+    private var settingsChanges: AnyCancellable?
 
-    init(collectorPath: String?, settings: SettingsStore) {
+    var attentionEvents: [TaskRecord] {
+        recentEvents.filter(\.needsAttention).sorted {
+            $0.priority == $1.priority ? $0.timestamp > $1.timestamp : $0.priority < $1.priority
+        }
+    }
+
+    func displayTitle(_ title: String, fallback: String = "任务标题已隐藏") -> String {
+        settings.experience.privacyMode ? fallback : title
+    }
+
+    func acknowledge(_ id: String) {
+        acknowledgeEvents([id])
+    }
+
+    private func acknowledgeEvents(_ ids: [String]) {
+        guard !ids.isEmpty else { return }
+        journal.acknowledge(ids)
+        let selected = Set(ids)
+        // 用户先看过的事件不应在一秒合并窗口结束后再次弹出。
+        pendingNotifications.removeAll { selected.contains($0.id) }
+        recentEvents = journal.records
+        historyError = journal.storageError
+        NotificationCenter.default.post(name: .statusUpdated, object: nil)
+    }
+
+    /// 已读只清除本次提醒；历史与原工具的等待/结束状态仍然保留。
+    func openEvent(_ record: TaskRecord) {
+        acknowledge(record.id)
+        eventOpener(ToolDestination(toolKey: record.toolKey, sessionId: record.sessionId))
+    }
+
+    func openNotification(_ info: [AnyHashable: Any], showHistory: () -> Void) {
+        let ids = info["event_ids"] as? [String] ?? []
+        let record = ids.count == 1 ? recentEvents.first { $0.id == ids[0] } : nil
+        acknowledgeEvents(ids)
+        if let key = info["tool"] as? String {
+            // Old notifications can recover their session from the journal. Quota and
+            // multi-event notifications must not guess which conversation to open.
+            let sessionId = ids.count == 1
+                ? (info["session_id"] as? String ?? (record?.toolKey == key ? record?.sessionId : nil)) : nil
+            eventOpener(ToolDestination(toolKey: key, sessionId: sessionId))
+        } else {
+            showHistory()
+        }
+    }
+
+    func clearHistory() {
+        journal.clear()
+        recentEvents = journal.records
+        historyError = journal.storageError
+        NotificationCenter.default.post(name: .statusUpdated, object: nil)
+    }
+
+    init(collectorPath: String?, settings: SettingsStore, storageDirectory: URL? = nil,
+         notificationSink: ((String, String, [String: Any]) -> Void)? = nil,
+         eventOpener: @escaping (ToolDestination) -> Void = NotificationRouter.openDestination) {
+        self.notificationSink = notificationSink
+        self.eventOpener = eventOpener
         self.collectorPath = collectorPath
         self.settings = settings
+        let directory = storageDirectory ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".ai-statusbar")
+        journal = EventJournal(directory: directory)
+        quotaMonitor = QuotaMonitor(directory: directory)
+        eventFeed = LocalEventFeed(directory: directory)
+        recentEvents = journal.records
+        historyError = journal.storageError
+        exportChanges = settings.$experience.sink { [weak self] preferences in
+            guard let self else { return }
+            self.eventFeed.configure(enabled: preferences.eventExport,
+                                     includeTitles: preferences.eventExportTitles && !preferences.privacyMode)
+            self.integrationError = self.eventFeed.storageError
+        }
+        settingsChanges = settings.objectWillChange.sink { [weak self] in
+            self?.objectWillChange.send()
+        }
     }
 
     private func finishRefresh(error: String?) {
         DispatchQueue.main.async {
             self.collectorError = error
-            self.isRefreshing = false
+            self.completeRefresh()
+            if error != nil { self.journal.invalidate() }
+            NotificationCenter.default.post(name: .statusUpdated, object: nil)
         }
     }
 
     func start() {
+        timer?.invalidate()
+        metricsTimer?.invalidate()
+        sourceMonitor = SourceChangeMonitor { [weak self] in self?.scheduleRefresh() }
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
-            self?.refresh()
+        timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            self?.refreshStatus()
+        }
+        timer?.tolerance = 0.1
+        metricsTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            self?.refreshMetrics()
+        }
+        metricsTimer?.tolerance = 2
+    }
+
+    private func scheduleRefresh() {
+        if isRefreshing { refreshAgain = true; return }
+        guard pendingRefresh == nil else { return }
+        let delay = max(0.15, 1 - Date().timeIntervalSince(lastRefreshStarted))
+        let work = DispatchWorkItem { [weak self] in
+            self?.pendingRefresh = nil
+            self?.refreshStatus()
+        }
+        pendingRefresh = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func completeRefresh() {
+        isRefreshing = false
+        if refreshAgain { refreshAgain = false; scheduleRefresh() }
+    }
+
+    private func refreshMetrics() {
+        guard !isRefreshingMetrics, let path = collectorPath else { return }
+        isRefreshingMetrics = true
+        DispatchQueue.global(qos: .utility).async {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: path)
+            process.arguments = ["--metrics-only"]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            if (try? process.run()) != nil {
+                let timeout = CollectorProcessWatchdog.schedule(process, after: 45)
+                process.waitUntilExit()
+                timeout.cancel()
+            }
+            DispatchQueue.main.async {
+                self.isRefreshingMetrics = false
+                self.scheduleRefresh()
+            }
         }
     }
 
+    /// Manual refresh includes enrichment; scheduled work keeps the two lanes independent.
     func refresh() {
+        refreshMetrics()
+        refreshStatus()
+    }
+
+    private func refreshStatus() {
         guard !isRefreshing else { return }
         guard let path = collectorPath else {
             collectorError = "应用资源不完整：缺少 Swift 状态采集器"
+            journal.invalidate()
             return
         }
             isRefreshing = true
+            lastRefreshStarted = Date()
             DispatchQueue.global(qos: .userInitiated).async {
                 let p = Process()
                 p.executableURL = URL(fileURLWithPath: path)
-                // 常驻宿主强制真采集（不读结果缓存）并回写 collector-cache.json，
-                // SwiftBar / Übersicht 同一 10 秒窗口内直接共享这份结果。
-                p.arguments = ["--json", "--refresh"]
+                // Fast local state retains independently refreshed quota and usage.
+                // Other frontends reuse the same complete JSON snapshot.
+                p.arguments = ["--json", "--status-only"]
             let pipe = Pipe()
             p.standardOutput = pipe
             p.standardError = FileHandle.nullDevice
@@ -175,8 +409,10 @@ final class StatusStore: ObservableObject {
                 self.finishRefresh(error: "无法启动 Swift 状态采集器")
                 return
             }
+            let timeout = CollectorProcessWatchdog.schedule(p, after: 15)
             let raw = pipe.fileHandleForReading.readDataToEndOfFile()
             p.waitUntilExit()
+            timeout.cancel()
             guard p.terminationStatus == 0 else {
                 self.finishRefresh(error: "状态采集器异常退出（代码 \(p.terminationStatus)）")
                 return
@@ -188,207 +424,87 @@ final class StatusStore: ObservableObject {
                 return
             }
             DispatchQueue.main.async {
-                self.data = decoded
-                self.collectorError = nil
-                self.isRefreshing = false
-                self.checkTransitions(decoded)
+                self.accept(decoded)
+                self.completeRefresh()
                 NotificationCenter.default.post(name: .statusUpdated, object: nil)
             }
         }
     }
 
-    /// 会话级完成通知：按稳定会话 ID 追踪忙碌任务，某会话连续消失 N 轮才判定完成。
-    /// 标题中途改名不会误报（ID 不变）；短暂卡顿掉线有宽限，不抖动。
-    private static let finishGraceRounds = 3  // 连续消失 3 轮（约 30s）才通知
-    private var trackedBusy: [String: [String: String]] = [:]   // toolKey -> (sessionId -> title)
-    private var missingRounds: [String: [String: Int]] = [:]    // toolKey -> (sessionId -> 连续缺失轮数)
-
-    private func checkTransitions(_ decoded: StatusData) {
-        for t in decoded.tools {
-            let skey = SettingsStore.settingKey(for: t.key)
-            let current = Dictionary(uniqueKeysWithValues: t.busyItems.map { ($0.id, $0.title) })
-            let prev = trackedBusy[t.key] ?? [:]
-
-            // 消失的会话累计缺失轮数；重新出现的清零
-            var missing = missingRounds[t.key] ?? [:]
-            for id in prev.keys where current[id] == nil {
-                missing[id] = (missing[id] ?? 0) + 1
+    func accept(_ decoded: StatusData, now: TimeInterval = Date().timeIntervalSince1970) {
+        lastCollectedAt = decoded.collectedAt ?? now
+        data = decoded
+        collectorError = nil
+        let events = journal.observe(decoded.tools, now: now)
+        recentEvents = journal.records
+        historyError = journal.storageError
+        let ended = events.filter { $0.phase == "ended" }
+        if !ended.isEmpty {
+            completedEventMessage = ended.count == 1
+                ? "\(ended[0].toolName) 本轮已结束" : "\(ended.count) 个任务本轮已结束"
+            completedEventSerial &+= 1
+        }
+        eventFeed.append(events.map {
+            LocalEvent(id: $0.id, tool: $0.toolKey, session: $0.sessionId, timestamp: $0.timestamp,
+                       phase: $0.phase, evidence: $0.evidence, title: $0.title)
+        }, includeTitles: settings.experience.eventExportTitles && !settings.experience.privacyMode, now: now)
+        integrationError = eventFeed.storageError
+        enqueueNotifications(events)
+        if settings.experience.quotaAlerts, settings.experience.muteUntil <= now {
+            for alert in quotaMonitor.observe(decoded.tools, threshold: settings.experience.quotaThreshold,
+                                               recovery: settings.experience.quotaRecovery, now: now) {
+                postNotification(title: alert.title, body: alert.body, info: ["tool": alert.toolKey])
             }
-            for id in current.keys { missing.removeValue(forKey: id) }
-
-            // 达到宽限轮数 → 判定完成，发通知（用最新标题），并从追踪表移除防止重复通知
-            let finished = missing.filter { $0.value >= Self.finishGraceRounds }.map(\.key)
-            if !finished.isEmpty {
-                for id in finished { missing.removeValue(forKey: id) }
-                let titles = finished.map { prev[$0] ?? "" }
-                completedEventMessage = "\(t.name) 完成了任务"
-                completedEventSerial &+= 1
-                if settings.notifyEnabled(for: skey) {
-                    notify(tool: t.name, key: t.key, finished: titles.map { $0.isEmpty ? "(任务)" : $0 })
-                }
-            }
-            missingRounds[t.key] = missing
-            var newTracked = current.merging(prev.filter { current[$0.key] == nil }) { new, _ in new }
-            for id in finished { newTracked.removeValue(forKey: id) }
-            trackedBusy[t.key] = newTracked
+            quotaError = quotaMonitor.storageError
         }
     }
 
-    private func notify(tool: String, key: String, finished: [String]) {
+    private func enqueueNotifications(_ events: [TaskRecord]) {
+        let eligible = events.filter { settings.notifyEnabled(for: SettingsStore.settingKey(for: $0.toolKey)) }
+        guard !eligible.isEmpty, settings.experience.muteUntil <= Date().timeIntervalSince1970 else { return }
+        if !settings.experience.mergeNotifications || eligible.contains(where: \.waiting) {
+            deliverNotifications(eligible)
+            return
+        }
+        pendingNotifications.append(contentsOf: eligible)
+        notificationWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            let records = self.pendingNotifications
+            self.pendingNotifications.removeAll()
+            self.deliverNotifications(records)
+        }
+        notificationWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
+    }
+
+    private func deliverNotifications(_ records: [TaskRecord]) {
+        guard settings.experience.muteUntil <= Date().timeIntervalSince1970 else { return }
+        let eligible = records.filter { settings.notifyEnabled(for: SettingsStore.settingKey(for: $0.toolKey)) }
+        guard let first = eligible.first else { return }
+        let title = eligible.count == 1 ? "\(first.toolName) · \(first.label)" : "\(eligible.count) 项任务有更新"
+        let body = eligible.prefix(5).map {
+            settings.experience.privacyMode ? "\($0.toolName)：\($0.label)" : "\($0.title) · \($0.label)"
+        }.joined(separator: "\n")
+        var info: [String: Any] = ["event_ids": eligible.map(\.id)]
+        if eligible.count == 1 {
+            info["tool"] = first.toolKey
+            info["session_id"] = first.sessionId
+        }
+        postNotification(title: title, body: String(body.prefix(400)), info: info)
+    }
+
+    private func postNotification(title: String, body: String, info: [String: Any]) {
+        if let notificationSink { notificationSink(title, body, info); return }
         let content = UNMutableNotificationContent()
-        content.title = "\(tool) 进入空闲"
-        var body = "已完成：" + finished.joined(separator: "、")
-        if body.count > 120 { body = String(body.prefix(119)) + "…" }
+        content.title = title
         content.body = body
         content.sound = .default
-        content.userInfo = ["tool": key]  // 点击通知时据此跳转对应 App / 宿主终端
+        content.userInfo = info
         UNUserNotificationCenter.current().add(
             UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         ) { error in
-            // 系统拒绝投递（未授权等）时留下日志，不再静默吞掉
             if let error { NSLog("灵眸：通知投递失败：\(error.localizedDescription)") }
         }
-    }
-}
-
-// MARK: - 通知点击路由：跳到对应工具的 App 或宿主终端
-
-/// "任务完成"通知被点击后的跳转规则：
-/// - App 型工具（ZCode / Codex App / Kimi Work）激活对应应用，未运行则从 /Applications 拉起；
-/// - CLI 型工具（Codex CLI / Kimi Code）回到跑着该进程的宿主终端——沿进程父链向上
-///   找最近的 regular GUI 应用，编辑器内置终端（VS Code/Cursor）里的会话也能回到正确窗口。
-/// 找不到宿主（CLI 已退出，或跑在 tmux 等脱离终端的服务端下）时不动作，保持默认行为。
-enum NotificationRouter {
-    /// 与 collector 的 Codex CLI 判定同一套排除串：ChatGPT/Codex App 与编辑器
-    /// 扩展托管的 codex app-server / mcp-server 不算终端会话。
-    private static let hostedCodexMarks = ["ChatGPT.app/", "Codex.app/", "app-server", "mcp-server"]
-
-    static func openDestination(forToolKey key: String) {
-        DispatchQueue.main.async {
-            switch key {
-            case "zcode":
-                if activateRunningApp(named: ["ZCode"]) { return }
-                if let terminal = hostTerminal(of: "zcode-cli") { activate(terminal); return }
-                openApplication(bundleID: "dev.zcode.app", path: "/Applications/ZCode.app")
-            case "codex-ide":
-                // Codex 桌面体验可能跑在 Codex.app 或 ChatGPT.app 里，激活正在运行的那个
-                if activateRunningApp(named: ["Codex", "ChatGPT"]) { return }
-                openApplication(bundleID: "com.openai.codex", path: "/Applications/Codex.app")
-            case "kimi-work":
-                if activateRunningApp(named: ["Kimi"]) { return }
-                openApplication(bundleID: nil, path: "/Applications/Kimi.app")
-            case "codex-cli":
-                if let terminal = hostTerminal(of: "codex", excluding: hostedCodexMarks) {
-                    activate(terminal)
-                }
-            case "kimi":
-                if let terminal = hostTerminal(of: "kimi") { activate(terminal) }
-            case "dsh":
-                // dsh 是浏览器里的 web 端，直接打开页面
-                NSWorkspace.shared.open(URL(string: "http://127.0.0.1:3080/")!)
-            default:
-                break
-            }
-        }
-    }
-
-    private static func activateRunningApp(named names: [String]) -> Bool {
-        let running = NSWorkspace.shared.runningApplications
-        for name in names {
-            if let app = running.first(where: {
-                $0.activationPolicy == .regular && $0.localizedName == name
-            }) {
-                activate(app)
-                return true
-            }
-        }
-        return false
-    }
-
-    private static func activate(_ app: NSRunningApplication) {
-        if #available(macOS 14, *) {
-            app.activate()
-        } else {
-            app.activate(options: [])
-        }
-    }
-
-    /// 未运行时拉起。Codex.app 与 ChatGPT.app 的 bundle id 同为 com.openai.codex，
-    /// 按 bundle id 解析可能命中另一个，所以优先固定路径，找不到再交给 LaunchServices。
-    private static func openApplication(bundleID: String?, path: String) {
-        if FileManager.default.fileExists(atPath: path) {
-            NSWorkspace.shared.openApplication(
-                at: URL(fileURLWithPath: path), configuration: NSWorkspace.OpenConfiguration())
-            return
-        }
-        if let bundleID,
-            let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
-        {
-            NSWorkspace.shared.openApplication(
-                at: url, configuration: NSWorkspace.OpenConfiguration())
-        }
-    }
-
-    /// 跑着指定 CLI 进程的宿主 GUI 应用：按可执行名筛出目标进程，再沿父进程链
-    /// 向上找最近的 regular App（终端或编辑器）。进程匹配语义与 collector 的
-    /// CLI 判定一致，避免误把 App/无头服务托管的进程当作终端会话。
-    private static func hostTerminal(
-        of processName: String, excluding: [String] = []
-    ) -> NSRunningApplication? {
-        guard let lines = psLines() else { return nil }
-        let appByPid = Dictionary(
-            NSWorkspace.shared.runningApplications
-                .filter { $0.activationPolicy == .regular }
-                .map { ($0.processIdentifier, $0) },
-            uniquingKeysWith: { first, _ in first })
-        let parents = Dictionary(
-            lines.map { ($0.pid, $0.ppid) }, uniquingKeysWith: { first, _ in first })
-        for line in lines where isCLI(line.args, named: processName, excluding: excluding) {
-            var cursor = line.ppid
-            while cursor > 1 {
-                if let app = appByPid[cursor] { return app }
-                cursor = parents[cursor] ?? 0
-            }
-        }
-        return nil
-    }
-
-    /// 与 collector ProcessSupport.count 同语义：剥掉前导环境变量赋值后按可执行
-    /// 文件名匹配；整行含排除串（如 app-server 托管进程）则跳过。
-    private static func isCLI(_ args: String, named name: String, excluding: [String]) -> Bool {
-        var tokens = args.split(separator: " ").map(String.init)
-        while let first = tokens.first, first.contains("=") && !first.hasPrefix("/") {
-            tokens.removeFirst()
-        }
-        guard let executable = tokens.first,
-            URL(fileURLWithPath: executable).lastPathComponent == name,
-            !excluding.contains(where: args.contains)
-        else { return false }
-        return true
-    }
-
-    private static func psLines() -> [(pid: pid_t, ppid: pid_t, args: String)]? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/ps")
-        process.arguments = ["-eo", "pid=,ppid=,args="]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-        } catch {
-            return nil
-        }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        var lines: [(pid: pid_t, ppid: pid_t, args: String)] = []
-        for raw in String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline) {
-            let fields = raw.split(separator: " ", maxSplits: 2).map(String.init)
-            guard fields.count == 3, let pid = Int32(fields[0]), let ppid = Int32(fields[1]) else {
-                continue
-            }
-            lines.append((pid, ppid, fields[2]))
-        }
-        return lines
     }
 }

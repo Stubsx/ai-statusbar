@@ -30,6 +30,8 @@ struct CodexCollector {
         result.ide.processOn = appCount > 0
         result.ide.detail = appCount > 0 ? "App 在线" : "无进程"
 
+        let cache = SourceStateCache(home: environment.homeDirectory)
+        defer { cache.save() }
         let threads = loadThreads()
         let sessionsRoot = environment.path(".codex", "sessions")
         let sessionFiles = files.files(atDepth: 4, under: sessionsRoot) { $0.hasSuffix(".jsonl") }
@@ -39,17 +41,26 @@ struct CodexCollector {
                 continue
             }
             let id = sessionID(from: path)
-            let info = threads[id] ?? ThreadInfo(title: "(未命名会话)", updated: modified, kind: "ide")
+            let stored = threads[id]
+            let info = ThreadInfo(title: stored?.title ?? "(未命名会话)", updated: stored?.updated ?? modified,
+                                  kind: sessionKind(path) ?? stored?.kind ?? "ide")
             let timestamp = info.updated > 0 ? info.updated : modified
-            let latest = LatestItem(title: info.title, timestamp: timestamp)
+            let latest = LatestItem(title: info.title, timestamp: timestamp, sessionId: id)
+            let signal = sessionSignal(path: path, sessionID: id, title: info.title,
+                                       processAlive: info.kind == "cli" ? cliCount > 0 : appCount > 0,
+                                       modified: modified, cache: cache)
             if info.kind == "cli" {
                 update(&result.cli, latest: latest, modified: modified)
-                if isBusy(path: path, processAlive: cliCount > 0, modified: modified) {
+                if let activity = signal.activity { result.cli.activities.append(activity) }
+                if signal.unreadable { result.cli.sourceError = "部分会话日志不可读取" }
+                if signal.busy {
                     result.cli.busy.append(BusyItem(id: id, title: info.title))
                 }
             } else {
                 update(&result.ide, latest: latest, modified: modified)
-                if isBusy(path: path, processAlive: appCount > 0, modified: modified) {
+                if let activity = signal.activity { result.ide.activities.append(activity) }
+                if signal.unreadable { result.ide.sourceError = "部分会话日志不可读取" }
+                if signal.busy {
                     result.ide.busy.append(BusyItem(id: id, title: info.title))
                 }
             }
@@ -94,6 +105,20 @@ struct CodexCollector {
         }
     }
 
+    /// The session header identifies the actual source even while the thread DB is
+    /// migrating, locked, or a different CLI/App schema was most recently touched.
+    private func sessionKind(_ path: String) -> String? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        let data = (try? handle.read(upToCount: 65_536)) ?? Data()
+        guard let line = String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline).first,
+              let object = JSONValue.object(from: String(line)),
+              JSONValue.string(object["type"]) == "session_meta",
+              let payload = object["payload"] as? JSONObject,
+              let source = JSONValue.string(payload["source"]) else { return nil }
+        return ["cli", "exec"].contains(source) ? "cli" : "ide"
+    }
+
     private func sessionID(from path: String) -> String {
         let name = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
         let parts = name.split(separator: "-")
@@ -106,43 +131,87 @@ struct CodexCollector {
         state.activity = max(state.activity, modified, latest.timestamp)
     }
 
-    private func isBusy(path: String, processAlive: Bool, modified: TimeInterval) -> Bool {
+    private func sessionSignal(
+        path: String, sessionID: String, title: String, processAlive: Bool, modified: TimeInterval,
+        cache: SourceStateCache
+    ) -> (busy: Bool, activity: TaskActivity?, unreadable: Bool) {
+        guard files.manager.isReadableFile(atPath: path) else { return (false, nil, true) }
+        let parsed: ParsedSignal = cache.value(at: path) {
+            parseSignal(path: path, modified: modified)
+        }
+        if parsed.unreadable { return (false, nil, true) }
+        let lastTask = parsed.lastTask, lifecycleTime = parsed.lifecycleTime, pending = parsed.pending
+        func activity(_ phase: String, _ time: TimeInterval, token: String = "") -> TaskActivity {
+            TaskActivity(id: "\(sessionID):\(phase):\(time):\(token)", sessionId: sessionID,
+                         title: title, phase: phase, updatedAt: time)
+        }
+        // 结束／中断是明确事件；即使应用随后退出，也保留它的含义。
+        if lastTask == "task_complete", pending.isEmpty {
+            return (false, activity("ended", lifecycleTime), false)
+        }
+        if lastTask == "turn_aborted", pending.isEmpty {
+            return (false, activity("interrupted", lifecycleTime), false)
+        }
         guard processAlive,
-            environment.now - modified
-                < TimeInterval(max(settings.busySeconds(for: "codex"), 10_800))
-        else {
-            return false
+              environment.now - modified < TimeInterval(max(settings.busySeconds(for: "codex"), 10_800))
+        else { return (false, nil, false) }
+        // 仅 request_user_input 的未返回调用能证明等待回答，普通工具调用不推断为审批。
+        if let waiting = pending.sorted(by: { $0.key < $1.key }).first(where: {
+            $0.value.name == "request_user_input" || $0.value.name.hasSuffix("__request_user_input")
+        }) {
+            return (false, activity("waiting_input", waiting.value.time, token: waiting.key), false)
         }
-        // 会话文件是 append-only JSONL，最后一次任务事件几乎总在文件末尾：
-        // 先在尾部倒序找标记（literal 反向搜索走 C 快路径，只解析候选行），
-        // 尾部找不到再对全文件倒序找。不要逐行 contains 扫全文件——
-        // 多个 MB 级会话文件每 10 秒全量扫一遍，单轮采集会拖到 20 秒以上。
-        var lastTask = lastTaskEvent(in: files.readTail(path, bytes: 1 << 20))
-        if lastTask == nil {
-            lastTask = lastTaskEvent(in: files.readText(path))
+        let busy = lastTask == "task_started" || !pending.isEmpty
+        return (busy, busy ? activity("working", lifecycleTime) : nil, false)
+    }
+
+    private struct PendingCall: Codable {
+        let name: String
+        let time: TimeInterval
+    }
+    private struct ParsedSignal: Codable {
+        let lastTask: String?
+        let lifecycleTime: TimeInterval
+        let pending: [String: PendingCall]
+        let unreadable: Bool
+    }
+
+    private func parseSignal(path: String, modified: TimeInterval) -> ParsedSignal {
+        let tail = files.readTail(path, bytes: 1 << 20)
+        if !tail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           !tail.split(whereSeparator: \.isNewline).contains(where: { JSONValue.object(from: String($0)) != nil }) {
+            return ParsedSignal(lastTask: nil, lifecycleTime: modified, pending: [:], unreadable: true)
         }
-        var pending = Set<String>()
-        for object in files.jsonLines(files.readTail(path)) {
+        let lifecycle = lastTaskEvent(in: tail) ?? lastTaskEvent(in: files.readText(path))
+        let payload = lifecycle?["payload"] as? JSONObject
+        var lastTask = JSONValue.string(payload?["type"])
+        var lifecycleTime = DateSupport.timestamp(lifecycle?["timestamp"]) ?? modified
+        var pending: [String: PendingCall] = [:]
+        let signalLines = tail.split(whereSeparator: \.isNewline).filter {
+            $0.contains("event_msg") || $0.contains("function_call") || $0.contains("custom_tool_call")
+        }
+        for line in signalLines {
+            guard let object = JSONValue.object(from: String(line)) else { continue }
             guard let payload = object["payload"] as? JSONObject,
-                let type = JSONValue.string(payload["type"])
-            else { continue }
+                  let type = JSONValue.string(payload["type"]) else { continue }
             if JSONValue.string(object["type"]) == "event_msg",
-                ["task_started", "task_complete", "turn_aborted"].contains(type)
-            {
+               Self.taskEventMarkers.contains(type) {
                 lastTask = type
+                lifecycleTime = DateSupport.timestamp(object["timestamp"]) ?? modified
+                pending.removeAll()
             } else if JSONValue.string(object["type"]) == "response_item" {
                 if ["function_call", "custom_tool_call"].contains(type),
-                    let id = JSONValue.string(payload["call_id"]) ?? JSONValue.string(payload["id"])
-                {
-                    pending.insert(id)
+                   let id = JSONValue.string(payload["call_id"]) ?? JSONValue.string(payload["id"]) {
+                    let name = JSONValue.string(payload["name"]) ?? ""
+                    pending[id] = PendingCall(name: name, time: name.contains("request_user_input")
+                        ? DateSupport.timestamp(object["timestamp"]) ?? modified : lifecycleTime)
                 } else if ["function_call_output", "custom_tool_call_output"].contains(type),
-                    let id = JSONValue.string(payload["call_id"])
-                {
-                    pending.remove(id)
+                          let id = JSONValue.string(payload["call_id"]) {
+                    pending.removeValue(forKey: id)
                 }
             }
         }
-        return lastTask == "task_started" || !pending.isEmpty
+        return ParsedSignal(lastTask: lastTask, lifecycleTime: lifecycleTime, pending: pending, unreadable: false)
     }
 
     private static let taskEventMarkers = ["task_started", "task_complete", "turn_aborted"]
@@ -150,7 +219,7 @@ struct CodexCollector {
     /// 倒序找文本里最后一次任务事件（task_started / task_complete / turn_aborted）。
     /// 每个候选行按事件结构校验；正文里恰好提到这些词的行会被跳过（最多回溯 32 个候选，
     /// 再多视为没有事件，由调用方走全文件兜底或按 pending 判定）。
-    private func lastTaskEvent(in text: String?) -> String? {
+    private func lastTaskEvent(in text: String?) -> JSONObject? {
         guard let text, !text.isEmpty else { return nil }
         var searchUpper = text.endIndex
         for _ in 0..<32 {
@@ -174,7 +243,7 @@ struct CodexCollector {
                 let payload = object["payload"] as? JSONObject,
                 JSONValue.string(payload["type"]) == found.marker
             {
-                return found.marker
+                return object
             }
             searchUpper = lineStart
         }

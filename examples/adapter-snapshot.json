@@ -1,0 +1,7 @@
+{
+  "key": "sample", "letter": "S", "name": "示例工具", "state": "idle",
+  "busy_count": 0, "busy_items": [], "active_items": [], "detail": "本轮已结束",
+  "activities": [{"id": "sample-session:ended:2000000000", "session_id": "sample-session", "title": "虚构演示任务", "phase": "ended", "updated_at": 2000000000, "evidence": "explicit"}],
+  "health": {"state": "ready", "message": "本地读取正常", "checked_at": 2000000000, "source_updated_at": 2000000000, "quota_state": "unsupported"},
+  "capabilities": {"event_phases": ["ended"], "usage": false, "quota": false, "navigation": "unsupported"}
+}

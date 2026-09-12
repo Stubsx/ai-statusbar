@@ -28,6 +28,15 @@ struct FloatingBallView: View {
                     .accessibilityHidden(true)
             )
             .frame(width: 64, height: 64)
+            .overlay(alignment: .topTrailing) {
+                if !store.attentionEvents.isEmpty {
+                    Text("\(store.attentionEvents.count)")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundColor(.white).padding(5)
+                        .background(Circle().fill(Color.orange))
+                        .accessibilityHidden(true)
+                }
+            }
             .contentShape(Circle())
             .onTapGesture(perform: onToggle)
             .onHover { inside in
@@ -44,7 +53,7 @@ struct FloatingBallView: View {
                 }
             }
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel(Text("灵眸，\(mood.summary)"))
+            .accessibilityLabel(Text("灵眸，\(mood.summary)，\(store.attentionEvents.count) 项需要处理"))
             .accessibilityHint(Text("点击展开或收起看板；可拖动位置"))
             .accessibilityAddTraits(.isButton)
             .accessibilityAction { onToggle() }

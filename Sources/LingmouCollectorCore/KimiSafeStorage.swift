@@ -1,5 +1,6 @@
 import CommonCrypto
 import Foundation
+import LocalAuthentication
 import Security
 
 /// 解密新版 Kimi 桌面端（3.2.4+）写入 `token-store.json` 的 Electron safeStorage 密文。
@@ -9,26 +10,48 @@ import Security
 /// 统一方案 PBKDF2-HMAC-SHA1(口令, salt="saltysalt", 1003 轮, 16 字节) 派生；
 /// IV 固定 16 个空格。口令存在钥匙串 "kimi-desktop Safe Storage"（账户 "kimi-desktop
 /// Key"）。解开后是 token store 的 JSON 文本（实测为 {"origin":…,"tokens":{…}}）。
-/// 默认关闭，需用户在设置中显式开启（首次读取会弹一次钥匙串授权，选“始终允许”后
-/// 不再打扰）。
+/// 默认关闭。后台读取始终禁止授权界面；交互授权由独立的手动命令完成。
 enum KimiSafeStorage {
     static let keychainService = "kimi-desktop Safe Storage"
     static let keychainAccount = "kimi-desktop Key"
 
-    /// 读取钥匙串口令；独立成闭包便于测试注入。读取失败（不存在 / 用户拒绝）返回 nil。
+    private static let interactionLock = NSLock()
+
+    /// 后台读取必须快速降级，不能让定时采集停在系统授权窗口。
     static func readKeychainPassword(service: String, account: String) -> Data? {
+        copyKeychainPassword(service: service, account: account).password
+    }
+
+    static func copyKeychainPassword(
+        service: String, account: String, allowInteraction: Bool = false,
+        getInteraction: (UnsafeMutablePointer<DarwinBoolean>) -> OSStatus = SecKeychainGetUserInteractionAllowed,
+        setInteraction: (Bool) -> OSStatus = SecKeychainSetUserInteractionAllowed,
+        copyMatching: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>) -> OSStatus = SecItemCopyMatching
+    ) -> (status: OSStatus, password: Data?) {
+        // Electron uses the legacy login keychain. LAContext alone does not suppress
+        // legacy ACL/unlock dialogs, so also disable Security.framework interaction.
+        // This flag is process-wide; serialize and restore it for library callers.
+        interactionLock.lock()
+        defer { interactionLock.unlock() }
+        var previous = DarwinBoolean(false)
+        guard getInteraction(&previous) == errSecSuccess,
+              setInteraction(allowInteraction) == errSecSuccess else {
+            return (errSecInteractionNotAllowed, nil)
+        }
+        defer { _ = setInteraction(previous.boolValue) }
+        let context = LAContext()
+        context.interactionNotAllowed = !allowInteraction
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecUseAuthenticationContext as String: context,
         ]
         var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess else {
-            return nil
-        }
-        return item as? Data
+        let status = copyMatching(query as CFDictionary, &item)
+        return (status, status == errSecSuccess ? item as? Data : nil)
     }
 
     /// Chromium os_crypt 的密钥派生（macOS/Linux 统一）：

@@ -12,6 +12,7 @@ final class StatusStore: ObservableObject {
     @Published var data: Int?
     @Published var collectorError: String?
     @Published var completedEventSerial = 0
+    var attentionEvents: [Int] = []
 }
 
 @MainActor

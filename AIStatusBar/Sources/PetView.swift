@@ -18,6 +18,9 @@ enum PetMood: Equatable {
             total + (tool.state == "busy" ? tool.busyCount : 0)
         }
         if busyCount > 0 { return .working(taskCount: busyCount) }
+        if data.tools.contains(where: { tool in
+            tool.state != "off" && (tool.activities ?? []).contains { ["waiting_input", "waiting_permission"].contains($0.phase) }
+        }) { return .loading }
         if data.tools.contains(where: { $0.state == "idle" }) { return .idle }
         return .sleeping
     }
@@ -48,7 +51,7 @@ enum PetMood: Equatable {
         case .working(let taskCount): return "正在处理 \(taskCount) 个任务"
         case .idle: return "AI 工具正在空闲"
         case .sleeping: return "AI 工具都没有运行"
-        case .celebrating: return "任务完成啦！"
+        case .celebrating: return "本轮已结束，可查看结果"
         case .error: return "状态采集遇到了问题"
         }
     }
@@ -64,7 +67,7 @@ struct PetView: View {
 
     @State private var hovered = false
     @State private var celebratingSerial = 0
-    @State private var celebrationMessage = "任务完成啦！"
+    @State private var celebrationMessage = "本轮已结束"
 
     private var liveMood: PetMood {
         PetMood.current(data: store.data, error: store.collectorError)
@@ -93,6 +96,15 @@ struct PetView: View {
         // 不出现时不占任何空间（原方案用 30pt 透明占位防跳动，窗口顶部常驻一段空白）。
         PetSprite(mood: mood, theme: theme, scale: scale)
             .frame(width: s(220), height: s(236), alignment: .bottom)
+            .overlay(alignment: .bottom) {
+                if !store.attentionEvents.isEmpty {
+                    Text("待处理 \(store.attentionEvents.count)")
+                        .font(.system(size: s(10), weight: .semibold))
+                        .foregroundColor(.white).padding(.horizontal, s(9)).padding(.vertical, s(4))
+                        .background(Capsule().fill(Color.orange))
+                        .allowsHitTesting(false)
+                }
+            }
             .overlay(alignment: .top) {
                 if celebratingSerial > 0 {
                     celebrationBubble
@@ -112,13 +124,13 @@ struct PetView: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
                     if celebratingSerial == serial {
                         celebratingSerial = 0
-                        celebrationMessage = "任务完成啦！"
+                        celebrationMessage = "本轮已结束"
                     }
                 }
             }
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(
-            "\(celebratingSerial > 0 ? celebrationMessage : mood.summary)，单击展开详情"
+            "\(celebratingSerial > 0 ? celebrationMessage : mood.summary)，\(store.attentionEvents.count) 项需要处理，单击展开详情"
         )
     }
 
@@ -156,7 +168,7 @@ struct PetView: View {
 
     /// hover 时的状态提示气泡（浮层，覆盖在形象上沿，不挤占布局）
     private var hoverBubble: some View {
-        Text(mood.summary)
+        Text(store.attentionEvents.isEmpty ? mood.summary : "有 \(store.attentionEvents.count) 项任务需要你处理")
             .font(.system(size: s(11), weight: .medium))
             .foregroundColor(.primary)
             .padding(.horizontal, s(11))

@@ -200,6 +200,8 @@ final class CollectorTests: XCTestCase {
         try FileManager.default.setAttributes(
             [.modificationDate: Date(timeIntervalSince1970: now)], ofItemAtPath: session.path)
         XCTAssertTrue(collector.collect().cli.busy.isEmpty)
+        XCTAssertEqual(collector.collect().cli.latest?.sessionId, "12345678-1234-1234-1234-123456789abc",
+                       "Finished conversations must retain their identity for the recent-task link")
     }
 
     /// 正文里恰好提到任务标记词（如工具输出里出现 task_complete 字样）不能误判成任务已结束：
@@ -860,7 +862,7 @@ final class CollectorTests: XCTestCase {
         let home = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: home) }
         try write(
-            "{\"encryption\":\"safeStorage.v1\",\"data\":\"djEwdGVzdA==\"}",
+            "{\"encryption\":\"safeStorage.v1\",\"data\":\"\(try encryptedV10Payload("{\"tokens\":{\"access_token\":\"test\"}}", password: "test-key"))\"}",
             to: home.appendingPathComponent(
                 "Library/Application Support/kimi-desktop/bridge-store/token-store.json"))
         var collector = QuotaCollector(
@@ -869,9 +871,45 @@ final class CollectorTests: XCTestCase {
             files: FileSupport(),
             requestOverride: { _ in nil }
         )
-        collector.kimiKeychainOverride = { _, _ in nil }
+        var reads = 0
+        collector.kimiKeychainOverride = { _, _ in reads += 1; return nil }
         let quota = collector.collect()
         XCTAssertEqual(quota["kimi-work"]??.notice, QuotaCollector.kimiDecryptFailedNotice)
+        for _ in 0..<5 { _ = collector.collect() }
+        XCTAssertEqual(reads, 1, "A denied read must be cached across repeated collection")
+    }
+
+    func testManualAuthorizationInvalidatesBothFailureCaches() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let tokenStore = home.appendingPathComponent(
+            "Library/Application Support/kimi-desktop/bridge-store/token-store.json")
+        let payload = try encryptedV10Payload("{\"tokens\":{\"access_token\":\"test-token\"}}", password: "test-key")
+        try write("{\"encryption\":\"safeStorage.v1\",\"data\":\"\(payload)\"}", to: tokenStore)
+        var reads = 0
+        var collector = QuotaCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: 2_000_000_000),
+            settings: CollectorSettings(onlineQuota: true, kimiTokenDecrypt: true), files: FileSupport(),
+            requestOverride: { _ in nil }, kimiKeychainOverride: { _, _ in reads += 1; return nil })
+        _ = collector.collect()
+        let quotaCache = home.appendingPathComponent(".ai-statusbar/quota-cache.json")
+        try touch(quotaCache, at: 2_000_000_000)
+        let marker = home.appendingPathComponent(".ai-statusbar/kimi-keychain-authorized")
+        try write("", to: marker)
+        try touch(marker, at: 2_000_000_001)
+        collector = QuotaCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: 2_000_000_002),
+            settings: collector.settings, files: FileSupport(), requestOverride: { request in
+                if request.url?.path.contains("GetSubscriptionStats") == true {
+                    return ["subscriptionBalance": ["amountUsedRatio": 0.25,
+                        "kimiCodeUsedRatio": 0.1, "expireTime": "2033-05-18T03:33:20Z"]]
+                }
+                return nil
+            },
+            kimiKeychainOverride: { _, _ in reads += 1; return Data("test-key".utf8) })
+        let quota = collector.collect()
+        XCTAssertEqual(reads, 2, "Explicit authorization must bypass both otherwise fresh failure caches")
+        XCTAssertNotEqual(quota["kimi-work"]??.notice, QuotaCollector.kimiDecryptFailedNotice)
     }
 
     /// 旧月度缓存不感知解密开关：开关关闭时写入的“未开启解密”提示缓存，
@@ -1599,6 +1637,8 @@ final class CollectorTests: XCTestCase {
         )
         XCTAssertEqual(
             collectors.zcode().busy, [BusyItem(id: "sess_onset", title: "ZCode 新会话")])
+        XCTAssertEqual(collectors.zcode().activities.first?.sessionId, "sess_done")
+        XCTAssertEqual(collectors.zcode().activities.first?.phase, "ended")
     }
 
     func testZcodeNewTurnAfterCompletionStaysBusy() throws {
@@ -1628,6 +1668,7 @@ final class CollectorTests: XCTestCase {
         ).zcode()
         XCTAssertEqual(state.busy, [BusyItem(id: "sess_live", title: "(未知任务)")])
         XCTAssertEqual(state.activity, now - 2, accuracy: 0.001)
+        XCTAssertTrue(state.activities.isEmpty, "A new turn cannot export a previous completion")
     }
 
     func testUsageIncrementalScanDoesNotDoubleCount() throws {

@@ -14,6 +14,8 @@ struct SettingsView: View {
     @State private var showKimiDecryptAlert = false
     @State private var showAdaptiveAlert = false
     @State private var perToolBusyExpanded = false
+    @State private var advancedExpanded = false
+    @StateObject private var maintenance = MaintenanceStore()
     /// 系统级通知授权状态（设置窗口打开通知页时查询，用于提示"被系统拒绝"的情况）
     @State private var notifyAuth: UNAuthorizationStatus = .notDetermined
     @AppStorage("desktopPresentationMode") private var desktopPresentationMode = "card"
@@ -56,15 +58,33 @@ struct SettingsView: View {
             case "pet":
                 PetSettingsTab(settings: settings, catalog: catalog)
             case "models":
-                settingsScroll { modelsSection }
+                settingsScroll {
+                    Text("模型用量已移到看板的“用量”页。")
+                    Button("查看模型用量") {
+                        UserDefaults.standard.set("models", forKey: "usageBreakdown")
+                        (NSApp.delegate as? AppDelegate)?.showTaskPanel(tab: "usage")
+                    }
+                }
+            case "connections":
+                settingsScroll { ConnectionDiagnosticsView(store: store) }
+            case "welcome":
+                settingsScroll { welcomeSection }
             case "data":
-                settingsScroll { dataSection }
+                settingsScroll { dataSection; eventInterfaceSection }
             case "notify":
-                settingsScroll { notifySection }
+                settingsScroll {
+                    notifySection
+                    notificationControlsSection
+                    quotaAlertsSection
+                }
             default:
                 settingsScroll {
-                    statusSection
                     appearanceSection
+                    maintenanceSection
+                    DisclosureGroup("高级状态判定", isExpanded: $advancedExpanded) {
+                        statusSection.padding(.top, 10)
+                    }
+                    .font(.system(size: 12, weight: .medium))
                 }
             }
         }
@@ -77,8 +97,8 @@ struct SettingsView: View {
             tabButton("通用", "general")
             tabButton("桌宠", "pet")
             tabButton("数据", "data")
-            tabButton("模型", "models")
             tabButton("通知", "notify")
+            tabButton("连接", "connections")
             Spacer()
         }
         .padding(.horizontal, 24)
@@ -154,6 +174,10 @@ struct SettingsView: View {
                 Text("背景自适应需要截取面板正下方一小块屏幕区域来判断明暗，因此需要录屏权限。截图只在内存中计算，不会保存或上传。")
             }
             divider
+            settingRow("演示模式", detail: "隐藏看板、桌宠和通知中的任务标题，并移除已有通知预览") {
+                toggle($settings.experience.privacyMode)
+            }
+            divider
             settingRow("数量单位", detail: "用量数字按 K/M/B 或 万/亿 显示") {
                 modePicker($settings.numberUnit, options: [
                     ("K / M / B", "metric"), ("万 / 亿", "wan"),
@@ -182,16 +206,25 @@ struct SettingsView: View {
             divider
             if settings.onlineQuota {
                 settingRow(
-                    "解密新版 Kimi 凭证",
-                    detail: "Kimi 3.2.4+ 将登录凭证加密存储；开启后需授权钥匙串“kimi-desktop Safe Storage”读取月度额度"
+                    "读取 Kimi 月度额度",
+                    detail: "连接后自动更新月度额度；后台不会弹出钥匙串窗口"
                 ) {
                     toggle(kimiTokenDecryptBinding)
+                        .disabled(store.isAuthorizingKimi)
                 }
-                .alert("开启 Kimi 凭证解密？", isPresented: $showKimiDecryptAlert) {
+                .alert("连接 Kimi 月度额度？", isPresented: $showKimiDecryptAlert) {
                     Button("取消", role: .cancel) {}
-                    Button("开启") { settings.kimiTokenDecrypt = true }
+                    Button("连接并开启") { store.authorizeKimiCredentials() }
                 } message: {
-                    Text("首次读取时 macOS 会询问是否允许访问钥匙串“kimi-desktop Safe Storage”，选择“始终允许”后不再弹出。口令仅用于在本机解密凭证并查询 Kimi 官方配额接口，不会外传。")
+                    Text("灵眸需要读取钥匙串“kimi-desktop Safe Storage”来解密 Kimi 登录凭证。本次连接最多等待 60 秒；拒绝或超时后不会自动重试。“始终允许”可让系统记住授权。之后后台只使用已有权限，权限失效时显示提示。口令只用于本机解密，不会外传。")
+                }
+                if store.isAuthorizingKimi {
+                    settingRow("等待钥匙串授权", detail: store.kimiAuthorizationMessage ?? "") {
+                        Button("取消请求") { store.cancelKimiAuthorization() }
+                    }
+                } else if let message = store.kimiAuthorizationMessage {
+                    Text(message).font(.system(size: 11)).foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             divider
@@ -204,151 +237,142 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: 模型用量（按模型汇总今日 / 近七日 / 近30日）
-
-    /// 模型用量页数据行：同一模型在三个时间窗口的用量，缺数据以 nil 显示"—"
-    private struct ModelUsageRow: Identifiable {
-        let name: String
-        let today: UsageEntry?
-        let weekly: UsageEntry?
-        let monthly: UsageEntry?
-
-        var id: String { name }
-
-        /// 排序键：三个窗口中的最大用量，避免只看 30 日时压低今天刚切换的模型
-        var rank: Int {
-            max(modelUsageTotal(today), max(modelUsageTotal(weekly), modelUsageTotal(monthly)))
+    private var eventInterfaceSection: some View {
+        section("本地事件接口") {
+            settingRow("允许本机脚本订阅", detail: "默认关闭；仅导出开启后观测到的新事件，灵眸需保持运行") {
+                toggle($settings.experience.eventExport)
+            }
+            if settings.experience.eventExport {
+                divider
+                settingRow("包含任务标题", detail: "默认只含工具、会话标识、时间与状态；演示模式始终隐藏标题") {
+                    toggle($settings.experience.eventExportTitles)
+                }
+            }
+            divider
+            settingRow("快捷指令与 Raycast", detail: "本机轮询接口；不启动网络服务，也不自动执行命令") {
+                Button("接入指南") {
+                    if let url = Bundle.main.url(forResource: "LOCAL_EVENTS", withExtension: "md", subdirectory: "Guides") {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+            }
+            if let error = store.integrationError {
+                Text(error).font(.system(size: 11)).foregroundColor(.orange).padding(12)
+            }
         }
     }
 
-    /// 与状态面板口径一致：开启同步时优先展示多设备合并视图
-    private var modelUsageData: UsageData? {
-        store.data?.usageMerged ?? store.data?.usage
-    }
-
-    /// 三个窗口出现过的模型全集，按最大窗口用量从高到低排列
-    private var modelUsageRows: [ModelUsageRow] {
-        guard let usage = modelUsageData else { return [] }
-        var names = Set<String>()
-        if let keys = usage.models?.keys { names.formUnion(keys) }
-        if let keys = usage.weekly?.models?.keys { names.formUnion(keys) }
-        if let keys = usage.monthly?.models?.keys { names.formUnion(keys) }
-        return names
-            .map {
-                ModelUsageRow(
-                    name: $0, today: usage.models?[$0],
-                    weekly: usage.weekly?.models?[$0],
-                    monthly: usage.monthly?.models?[$0])
+    private var welcomeSection: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            Image(systemName: "eye").font(.system(size: 34, weight: .light)).foregroundColor(.accentColor)
+            Text("让 AI 在一旁工作").font(.custom("PingFangSC-Semibold", size: 23))
+            Text("灵眸会观察本机 AI 工具，在需要你接手时提醒你。")
+                .font(.system(size: 13)).foregroundColor(.secondary)
+            section("三步开始") {
+                guideRow("1", "打开你的 AI 工具", "开始一个任务，运行状态会自动出现在灵眸中。")
+                divider
+                guideRow("2", "选择喜欢的显示方式", "使用桌面卡片、浮球或桌宠，也可以只保留菜单栏。")
+                divider
+                guideRow("3", "按需开启提醒", "通知默认关闭；启用后才会申请系统通知权限。")
             }
-            .sorted { $0.rank != $1.rank ? $0.rank > $1.rank : $0.name < $1.name }
+            let detected = store.data?.tools.filter { $0.health?.state != "not_detected" } ?? []
+            Text(detected.isEmpty ? "还没有发现本地工具，打开一个 AI 工具后再试试。" :
+                 "已发现：\(detected.map(\.name).joined(separator: "、"))")
+                .font(.system(size: 11)).foregroundColor(.secondary)
+            HStack {
+                Button("查看连接") { settingsTab = "connections" }
+                Spacer()
+                Button("开始使用") {
+                    settings.experience.onboardingCompleted = true
+                    settingsTab = "general"
+                    (NSApp.delegate as? AppDelegate)?.showTaskPanel()
+                }.keyboardShortcut(.defaultAction)
+            }
+        }
     }
 
-    private var modelsSection: some View {
-        section("模型用量") {
-            VStack(spacing: 0) {
-                modelUsageHeaderRow
-                Divider().opacity(0.4)
-                modelUsageTotalRow
-                let rows = modelUsageRows
-                if rows.isEmpty {
-                    Text(modelUsageData == nil
-                         ? "统计中…（首次全量索引约需几秒）"
-                         : "暂无模型用量数据")
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary.opacity(0.8))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 14)
-                } else {
-                    ForEach(rows) { row in
-                        Divider().opacity(0.4)
-                        modelUsageRow(row)
-                    }
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("数字为 输入+缓存+输出 的 token 总量；同名模型跨工具合并")
-                        if let sync = store.data?.sync, sync.enabled,
-                            let count = sync.sources?.count, count > 1
-                        {
-                            Text("已合并 \(count) 台设备的用量")
-                        }
-                    }
-                    .font(.system(size: 9.5))
-                    .foregroundColor(.secondary.opacity(0.7))
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 14)
-                    .padding(.top, 8)
-                    .padding(.bottom, 9)
+    private func guideRow(_ number: String, _ title: String, _ detail: String) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Text(number).font(.custom("AvenirNext-DemiBold", size: 16)).foregroundColor(.accentColor)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).font(.system(size: 12, weight: .semibold))
+                Text(detail).font(.system(size: 11)).foregroundColor(.secondary)
+            }
+            Spacer()
+        }.padding(14)
+    }
+
+    private var maintenanceSection: some View {
+        section("启动与更新") {
+            settingRow("登录时启动", detail: maintenance.loginMessage) {
+                Toggle("", isOn: Binding(get: { maintenance.loginEnabled },
+                                         set: { maintenance.setLoginEnabled($0) }))
+                    .labelsHidden().toggleStyle(.switch)
+            }
+            if maintenance.loginMessage.contains("系统设置") {
+                settingRow("系统登录项") { Button("打开") { maintenance.openLoginSettings() } }
+            }
+            divider
+            settingRow("检查更新", detail: maintenance.updateMessage) {
+                Button(maintenance.checking ? "检查中…" : "检查") { maintenance.checkUpdates() }
+                    .disabled(maintenance.checking)
+            }
+            if let url = maintenance.releaseURL {
+                settingRow("正式发布与下载", detail: "从项目 GitHub 发布页获取安装包") {
+                    Button("打开发布页") { NSWorkspace.shared.open(url) }
+                }
+            }
+            divider
+            settingRow("使用指南") { Button("查看") { settingsTab = "welcome" } }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            maintenance.refreshLoginState()
+        }
+    }
+
+    private var notificationControlsSection: some View {
+        section("提醒方式") {
+            settingRow("合并相近提醒", detail: "将短时间内的更新合成一条；等待你处理的事件优先提醒") {
+                toggle($settings.experience.mergeNotifications)
+            }
+            divider
+            settingRow("暂时静音", detail: settings.experience.muteUntil > Date().timeIntervalSince1970
+                       ? "任务和配额提醒已静音，事件仍会记录在本机"
+                       : "暂停任务和配额提醒，保留事件记录") {
+                Menu(settings.experience.muteUntil > Date().timeIntervalSince1970 ? "静音中" : "选择时长") {
+                    Button("15 分钟") { settings.experience.muteUntil = Date().timeIntervalSince1970 + 900 }
+                    Button("1 小时") { settings.experience.muteUntil = Date().timeIntervalSince1970 + 3_600 }
+                    Button("4 小时") { settings.experience.muteUntil = Date().timeIntervalSince1970 + 14_400 }
+                    Divider()
+                    Button("恢复提醒") { settings.experience.muteUntil = 0 }
                 }
             }
         }
     }
 
-    /// 列头：模型 | 今日 | 近七日 | 近30日，宽度与数据行对齐
-    private var modelUsageHeaderRow: some View {
-        HStack(spacing: 8) {
-            Text("模型")
-                .frame(maxWidth: .infinity, alignment: .leading)
-            modelUsageColumn("今日")
-            modelUsageColumn("近七日")
-            modelUsageColumn("近30日")
+    private var quotaAlertsSection: some View {
+        section("配额提醒") {
+            settingRow("配额不足时提醒", detail: "仅使用仍有效的配额数据，同一账号窗口只提醒一次") {
+                toggle($settings.experience.quotaAlerts)
+            }
+            if settings.experience.quotaAlerts {
+                divider
+                settingRow("剩余配额阈值") {
+                    Picker("", selection: $settings.experience.quotaThreshold) {
+                        ForEach([10, 20, 30, 50], id: \.self) { value in Text("\(value)%").tag(value) }
+                    }.labelsHidden()
+                }
+                divider
+                settingRow("配额恢复时提醒", detail: "已触及阈值的配额恢复后提醒一次") {
+                    toggle($settings.experience.quotaRecovery)
+                }
+            }
         }
-        .font(.system(size: 10))
-        .foregroundColor(.secondary.opacity(0.85))
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-    }
-
-    private var modelUsageTotalRow: some View {
-        HStack(spacing: 8) {
-            Text("总计")
-                .font(.system(size: 12, weight: .semibold))
-            Spacer(minLength: 8)
-            modelUsageValue(modelUsageText(modelUsageData?.total), bold: true)
-            modelUsageValue(modelUsageText(modelUsageData?.weekly?.total), bold: true)
-            modelUsageValue(modelUsageText(modelUsageData?.monthly?.total), bold: true)
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 7)
-    }
-
-    private func modelUsageRow(_ row: ModelUsageRow) -> some View {
-        HStack(spacing: 8) {
-            Text(row.name)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundColor(.primary.opacity(0.85))
-                .lineLimit(1)
-                .truncationMode(.middle)
-            Spacer(minLength: 8)
-            modelUsageValue(modelUsageText(row.today))
-            modelUsageValue(modelUsageText(row.weekly))
-            modelUsageValue(modelUsageText(row.monthly))
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 6)
-    }
-
-    private func modelUsageColumn(_ title: String) -> some View {
-        Text(title)
-            .frame(width: 68, alignment: .trailing)
-    }
-
-    private func modelUsageValue(_ text: String, bold: Bool = false) -> some View {
-        Text(text)
-            .font(.system(size: 11, weight: bold ? .semibold : .regular).monospacedDigit())
-            .foregroundColor(bold ? Color.primary.opacity(0.9) : .secondary)
-            .frame(width: 68, alignment: .trailing)
-    }
-
-    /// 用量条目 → 缩写数字；nil 显示"—"（该窗口内未用过该模型）
-    private func modelUsageText(_ entry: UsageEntry?) -> String {
-        guard let entry else { return "—" }
-        return NumberFormat.tokens(modelUsageTotal(entry), unit: settings.numberUnit)
     }
 
     private var notifySection: some View {
         section("通知") {
-            settingRow("任务完成时提醒", detail: "工具从工作中转为空闲时推送") {
+            settingRow("任务更新提醒", detail: "提醒本轮结束、中断和等待回答；无活动时仅作保守提示") {
                 toggle($settings.notifyEnabled)
             }
             if settings.notifyEnabled {
@@ -413,7 +437,7 @@ struct SettingsView: View {
     private func postTestNotification() {
         let content = UNMutableNotificationContent()
         content.title = "灵眸测试通知"
-        content.body = "通知通道正常，任务完成时会这样提醒你。"
+        content.body = "通知通道正常，任务状态更新时会这样提醒你。"
         content.sound = .default
         UNUserNotificationCenter.current().add(
             UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
@@ -596,16 +620,16 @@ struct SettingsView: View {
                                     .font(.system(size: 10.5))
                                 Spacer()
                                 Text(source.updatedAt > 0
-                                     ? "\(timeHM(source.updatedAt)) · \(source.days) 天"
+                                     ? "\(ExperienceFormat.age(source.updatedAt)) · \(source.days) 天"
                                      : "尚未导出")
                                     .font(.system(size: 10).monospacedDigit())
-                                    .foregroundColor(.secondary)
+                                    .foregroundColor(Date().timeIntervalSince1970 - source.updatedAt > 3_600 ? .orange : .secondary)
                             }
                         }
                     }
                     .padding(.top, 2)
                 } else {
-                    Text("等待首次采集导出…（目录不可用时静默保持本机统计）")
+                    Text("同步目录暂不可用或尚未导出，当前显示本机统计。请检查目录与网盘状态。")
                         .font(.system(size: 10))
                         .foregroundColor(.secondary.opacity(0.8))
                 }
@@ -688,7 +712,7 @@ struct SettingsView: View {
             get: { settings.kimiTokenDecrypt },
             set: { enabled in
                 if enabled { showKimiDecryptAlert = true }
-                else { settings.kimiTokenDecrypt = false }
+                else { settings.kimiTokenDecrypt = false; store.refresh() }
             }
         )
     }

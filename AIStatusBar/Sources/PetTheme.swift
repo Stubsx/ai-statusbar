@@ -44,7 +44,7 @@ enum PetSlot: String, CaseIterable, Identifiable, Equatable {
         case .working: return "有任务正在处理时展示"
         case .loading: return "还没读到工具状态时短暂展示"
         case .sleeping: return "所有工具都没有运行时展示（本身闭眼，无需眨眼帧）"
-        case .celebrating: return "任务完成时展示约 3 秒"
+        case .celebrating: return "任务明确结束时展示约 3 秒"
         case .error: return "状态采集出错时展示"
         case .idleBlink: return "空闲姿势的闭眼帧，缺失则空闲时不眨眼"
         case .workingBlink: return "工作姿势的闭眼帧，缺失则工作时不眨眼"
@@ -302,6 +302,14 @@ final class PetCatalog: ObservableObject {
         do {
             try fm.createDirectory(at: draftURL, withIntermediateDirectories: true)
             if let source {
+                let manifest = source.folderURL.appendingPathComponent("pet.json")
+                if fm.fileExists(atPath: manifest.path) {
+                    try fm.copyItem(at: manifest, to: draftURL.appendingPathComponent("pet.json"))
+                }
+                let preview = source.folderURL.appendingPathComponent("preview.png")
+                if fm.fileExists(atPath: preview.path) {
+                    try fm.copyItem(at: preview, to: draftURL.appendingPathComponent("preview.png"))
+                }
                 for slot in PetSlot.allCases {
                     if let url = source.url(forSlot: slot) {
                         let dest = draftURL.appendingPathComponent(slot.rawValue + ".png")
@@ -365,19 +373,32 @@ final class PetCatalog: ObservableObject {
 
     /// 保存草稿：写 manifest、替换目标目录、刷新列表。返回安装后的形象。
     @discardableResult
-    func install(draftAt draftURL: URL, name: String, replacing editingThemeID: String?) -> PetTheme? {
+    func install(draftAt draftURL: URL, name: String, replacing editingThemeID: String?,
+                 metadata: PetMetadata? = nil) -> PetTheme? {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         let id = editingThemeID ?? UUID().uuidString
         let dest = userPetsDirectory.appendingPathComponent(id, isDirectory: true)
         do {
-            let manifest: [String: Any] = ["id": id, "name": trimmed]
+            var manifest = PetSharing.manifest(at: draftURL)
+            manifest["id"] = id
+            manifest["name"] = trimmed
+            if let metadata { manifest = metadata.applying(to: manifest) }
             let data = try JSONSerialization.data(
                 withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys]
             )
             try data.write(to: draftURL.appendingPathComponent("pet.json"), options: .atomic)
-            try? fm.removeItem(at: dest)
-            try fm.moveItem(at: draftURL, to: dest)
+            guard let draft = PetThemeStore.loadTheme(folder: draftURL, isBuiltIn: false),
+                  !PetSharing.validate(draft).contains(where: \.blocking) else { return nil }
+            let backup = userPetsDirectory.appendingPathComponent(".backup-\(UUID().uuidString)")
+            let replacing = fm.fileExists(atPath: dest.path)
+            if replacing { try fm.moveItem(at: dest, to: backup) }
+            do { try fm.moveItem(at: draftURL, to: dest) }
+            catch {
+                if replacing { try? fm.moveItem(at: backup, to: dest) }
+                throw error
+            }
+            if replacing { try? fm.removeItem(at: backup) }
             reload()
             return themes.first { $0.id == id }
         } catch {
@@ -434,17 +455,7 @@ final class PetCatalog: ObservableObject {
         defer { try? fm.removeItem(at: extractURL) }
 
         do {
-            try fm.createDirectory(at: extractURL, withIntermediateDirectories: true)
-            let unzip = Process()
-            unzip.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-            unzip.arguments = ["-x", "-k", zipURL.path, extractURL.path]
-            unzip.standardOutput = FileHandle.nullDevice
-            unzip.standardError = FileHandle.nullDevice
-            try unzip.run()
-            unzip.waitUntilExit()
-            guard unzip.terminationStatus == 0 else { throw ImportError.unzipFailed }
-        } catch let error as ImportError {
-            throw error
+            try PetSharing.extractPackage(zipURL, to: extractURL)
         } catch {
             throw ImportError.unzipFailed
         }
@@ -472,7 +483,13 @@ final class PetCatalog: ObservableObject {
                 guard fm.fileExists(atPath: src.path) else { continue }
                 try fm.copyItem(at: src, to: dest.appendingPathComponent(slot.rawValue + ".png"))
             }
-            let manifest: [String: Any] = ["id": id, "name": name, "nsfw": isNSFW]
+            var manifest = PetSharing.manifest(at: source)
+            manifest["id"] = id
+            manifest["name"] = name
+            manifest["nsfw"] = isNSFW
+            if let preview = try? Data(contentsOf: source.appendingPathComponent("preview.png")) {
+                try preview.write(to: dest.appendingPathComponent("preview.png"), options: .atomic)
+            }
             let data = try JSONSerialization.data(
                 withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys]
             )
