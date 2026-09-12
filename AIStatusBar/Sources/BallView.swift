@@ -1,13 +1,33 @@
 import Cocoa
 import SwiftUI
 
-// 桌面卡片收起态：蓝色球体 + 白色胶囊眼睛 + 工作时旋转的柔光环。
+enum FloatingBallAppearance: String, CaseIterable {
+    case blue, ink
+
+    var title: String {
+        switch self {
+        case .blue: return "晴蓝"
+        case .ink: return "水墨"
+        }
+    }
+
+    var isMonochrome: Bool { self == .ink }
+
+    static func migrateRemovedAppearance(in defaults: UserDefaults = .standard) {
+        if defaults.string(forKey: "floatingBallAppearance") == "white-ink" {
+            defaults.set(Self.ink.rawValue, forKey: "floatingBallAppearance")
+        }
+    }
+}
+
+// 桌面卡片收起态：圆球 + 胶囊眼睛，支持晴蓝与水墨外观。
 // 点击/拖动/右键/自动收起仍由原有 HostingView 与 AppDelegate 管理。
 struct FloatingBallView: View {
     @ObservedObject var store: StatusStore
     let onToggle: () -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @AppStorage("floatingBallAppearance") private var appearance = "blue"
     @State private var hovered = false
     @State private var gaze = CGSize.zero
     @State private var eyeOpenness: CGFloat = 1
@@ -26,7 +46,8 @@ struct FloatingBallView: View {
 
     var body: some View {
         FloatingBallStatusArtwork(mood: mood, state: bubbleState, gaze: gaze,
-                                  hovered: hovered, reduceMotion: reduceMotion, eyeOpenness: eyeOpenness)
+                                  hovered: hovered, reduceMotion: reduceMotion, eyeOpenness: eyeOpenness,
+                                  appearance: FloatingBallAppearance(rawValue: appearance) ?? .blue)
             .background(alignment: .bottomLeading) {
                 BallMouseTracker(reduceMotion: reduceMotion, onGaze: { gaze = $0 }, onBlink: { eyeOpenness = $0 })
                     .frame(width: 64, height: 64)
@@ -80,6 +101,7 @@ struct FloatingBallStatusArtwork: View {
     var hovered = false
     var reduceMotion = false
     var eyeOpenness: CGFloat = 1
+    var appearance: FloatingBallAppearance = .blue
 
     private var anchorState: StatusBubbleState {
         state.runningCount > 0 ? StatusBubbleState(mood: .working(taskCount: state.runningCount)) : state
@@ -87,16 +109,16 @@ struct FloatingBallStatusArtwork: View {
 
     var body: some View {
         FloatingBallArtwork(mood: mood, gaze: gaze, hovered: hovered,
-                            reduceMotion: reduceMotion, eyeOpenness: eyeOpenness)
+                            reduceMotion: reduceMotion, eyeOpenness: eyeOpenness, appearance: appearance)
             .frame(width: Self.anchorSize.width, height: Self.anchorSize.height, alignment: .bottom)
             .overlay(alignment: .topTrailing) {
                 if state.isVisible(expanded: false) {
                     // 隐藏的单计数只定义锚点；可见胶囊对齐其左端，增加内容时向右生长。
-                    StatusBubble(state: anchorState, style: .ball)
+                    StatusBubble(state: anchorState, style: .ball, monochrome: appearance.isMonochrome)
                         .hidden()
                         .accessibilityHidden(true)
                         .overlay(alignment: .leading) {
-                            StatusBubble(state: state, style: .ball)
+                            StatusBubble(state: state, style: .ball, monochrome: appearance.isMonochrome)
                         }
                         .padding(.top, 3)
                         .padding(.trailing, 4)
@@ -115,6 +137,11 @@ struct FloatingBallArtwork: View {
     let hovered: Bool
     let reduceMotion: Bool
     var eyeOpenness: CGFloat = 1
+    var appearance: FloatingBallAppearance = .blue
+    /// 导出动效预览时指定一帧，常规显示由原生动画层播放。
+    var washFrame: CGImage? = nil
+
+    private var palette: BallInkDrawing.Palette { appearance == .ink ? .ink : .blue }
 
     private var working: Bool {
         if case .working = mood { return true }
@@ -131,41 +158,35 @@ struct FloatingBallArtwork: View {
 
     var body: some View {
         ZStack {
-            // 透明的淡青外圈，而不是高对比硬边或黑色投影。
-            Circle()
-                .fill(accent.opacity(hovered ? 0.20 : 0.12))
-                .frame(width: 55, height: 55)
+            if !appearance.isMonochrome {
+                Circle()
+                    .fill(accent.opacity(hovered ? 0.15 : 0.06))
+                    .frame(width: 50, height: 50)
+                    .blur(radius: 3)
+            }
 
             if working {
-                BallOrbitGlow(color: accent, reduceMotion: reduceMotion)
-                    .id(reduceMotion)
+                if appearance.isMonochrome {
+                    BallInkOrbit(reduceMotion: reduceMotion)
+                        .id(reduceMotion)
+                } else {
+                    BallOrbitGlow(color: accent, reduceMotion: reduceMotion)
+                        .id(reduceMotion)
+                }
             }
 
             ZStack {
-                Circle()
-                    .fill(
-                        RadialGradient(
-                            stops: [
-                                // 明亮天蓝主色 + 浅蓝边缘反光，避免深钴蓝阴影。
-                                .init(color: Color(red: 0.32, green: 0.64, blue: 1), location: 0),
-                                .init(color: Color(red: 0.18, green: 0.56, blue: 1), location: 0.45),
-                                .init(color: Color(red: 0.17, green: 0.54, blue: 0.99), location: 0.72),
-                                .init(color: Color(red: 0.44, green: 0.71, blue: 1), location: 1)
-                            ],
-                            center: UnitPoint(x: 0.35 + gaze.width * 0.018, y: 0.29 + gaze.height * 0.018),
-                            startRadius: 0, endRadius: 37
-                        )
-                    )
-                Circle()
-                    .fill(
-                        RadialGradient(
-                            colors: [.white.opacity(0.13), .clear],
-                            center: UnitPoint(x: 0.28 + gaze.width * 0.025, y: 0.20 + gaze.height * 0.025),
-                            startRadius: 0, endRadius: 30
-                        )
-                    )
-                Circle()
-                    .strokeBorder(.white.opacity(0.22), lineWidth: 0.8)
+                Group {
+                    if let washFrame {
+                        BallWashBody(image: washFrame, palette: palette)
+                    } else if reduceMotion {
+                        BallWashBody(image: palette.still, palette: palette)
+                    } else {
+                        BallInkFlow(working: working, palette: palette, resting: mood == .sleeping)
+                            .id(appearance)
+                    }
+                }
+                .frame(width: 56, height: 56)
 
                 // 将眼睛贴在球面上投影：远侧眼睛变窄、眼距压缩，斜看时连线随头部转动。
                 ForEach([-1, 1], id: \.self) { side in
@@ -178,7 +199,8 @@ struct FloatingBallArtwork: View {
                 }
             }
             .frame(width: 48, height: 48)
-            .shadow(color: Color(red: 0.38, green: 0.68, blue: 1).opacity(0.08), radius: 2, y: 1)
+            .shadow(color: Color(red: 0.38, green: 0.68, blue: 1)
+                .opacity(appearance.isMonochrome ? 0 : 0.08), radius: 2, y: 1)
             .opacity(mood == .sleeping && !hovered ? 0.78 : 1)
 
 
@@ -188,6 +210,81 @@ struct FloatingBallArtwork: View {
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.22), value: mood)
     }
 
+}
+
+/// 纹理由 Swift 在内存中绘制，画布含透明渗墨余量，不裁成正圆。
+private struct BallWashBody: View {
+    let image: CGImage?
+    let palette: BallInkDrawing.Palette
+
+    var body: some View {
+        if let image {
+            Image(decorative: image, scale: 1)
+                .resizable()
+                .interpolation(.high)
+                .scaledToFit()
+        } else {
+            Circle().fill(palette == .ink ? Color(white: 0.16) : Color(red: 0.18, green: 0.56, blue: 0.99))
+        }
+    }
+}
+
+private struct BallInkOrbit: View {
+    let reduceMotion: Bool
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var turning = false
+
+    var body: some View {
+        ZStack {
+            ForEach(0..<3) { band in
+                BallInkArc(band: band)
+                    .fill(LinearGradient(
+                        colors: [Color(white: 0.55).opacity(0.25),
+                                 Color(white: colorScheme == .dark ? 0.82 : 0.18).opacity(0.75),
+                                 Color(white: 0.45).opacity(0.45)],
+                        startPoint: .topLeading, endPoint: .bottomTrailing))
+                    .opacity(band == 0 ? 1 : 0.48)
+            }
+        }
+        .frame(width: 58, height: 58)
+        .rotationEffect(.degrees(turning && !reduceMotion ? 360 : 0))
+        .onAppear { turning = true }
+        .animation(reduceMotion ? nil : .linear(duration: 3.6).repeatForever(autoreverses: false),
+                   value: turning)
+        .allowsHitTesting(false)
+    }
+}
+
+/// 不规则笔锋和分叉枯笔共用固定噪声场，转动时整笔旋转。
+private struct BallInkArc: Shape {
+    var band = 0
+
+    func path(in rect: CGRect) -> Path {
+        let unit = Double(min(rect.width, rect.height))
+        var outer: [CGPoint] = []
+        var inner: [CGPoint] = []
+        let start = [-51.0, 110.0, 126.0][band]
+        let sweep = [222.0, 51.0, 35.0][band]
+        for step in 0...160 {
+            let t = Double(step) / 160
+            let angle = (start + t * sweep) * .pi / 180
+            let nx = cos(angle), ny = sin(angle)
+            let flow = BallInkDrawing.field(nx * 4 + 13, ny * 4 - 9)
+            let bristle = BallInkDrawing.noise(t * 11, Double(band) + 19)
+            let radius = unit * (0.454 + Double(band) * 0.012 + flow * 0.009)
+            let pressure = pow(max(0, sin(t * .pi)), 1.3)
+            let halfWidth = unit * (0.001 + (band == 0 ? 0.018 : 0.004) * pressure)
+                * (0.70 + bristle * 0.50)
+            outer.append(CGPoint(x: Double(rect.midX) + nx * (radius + halfWidth),
+                                 y: Double(rect.midY) + ny * (radius + halfWidth)))
+            inner.append(CGPoint(x: Double(rect.midX) + nx * (radius - halfWidth),
+                                 y: Double(rect.midY) + ny * (radius - halfWidth)))
+        }
+        var path = Path()
+        path.addLines(outer + inner.reversed())
+        path.closeSubpath()
+        return path
+    }
 }
 
 /// 正交球面投影，加少量深度缩放。球体轮廓不压扁，脸部在球面上转动。

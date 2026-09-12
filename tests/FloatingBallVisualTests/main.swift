@@ -1,6 +1,7 @@
 // Standalone AppKit/SwiftUI smoke test; does not start collectors or change settings.
 import Cocoa
 import SwiftUI
+import ImageIO
 
 enum PetMood: Equatable {
     case loading, working(taskCount: Int), idle, sleeping, celebrating, error
@@ -87,6 +88,104 @@ func runChecks() throws {
 
     let output = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
     try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+    // 程序水墨必须可缓存、透明且使用合法的预乘颜色，防止深色桌面出现白框。
+    let inkStarted = Date()
+    for palette in [BallInkDrawing.Palette.ink, .blue] {
+        let texture = palette.still
+        guard let texture, let data = texture.dataProvider?.data,
+              let bytes = CFDataGetBytePtr(data) else { fatalError("Ink drawing failed") }
+        var transparent = 0
+        var translucent = 0
+        var darkest = 255
+        var lightest = 0
+        for row in 0..<texture.height {
+            for column in 0..<texture.width {
+                let index = row * texture.bytesPerRow + column * 4
+                let alpha = Int(bytes[index + 3])
+                if palette == .ink {
+                    assert(bytes[index] == bytes[index + 1] && bytes[index] == bytes[index + 2])
+                } else if alpha == 255 {
+                    assert(bytes[index + 2] > bytes[index + 1] && bytes[index + 1] > bytes[index],
+                           "Blue wash must keep its sky-blue hue")
+                }
+                for channel in 0..<3 {
+                    assert(Int(bytes[index + channel]) <= alpha, "Premultiplied color must not create light fringes")
+                }
+                if row == 0 || column == 0 || row == texture.height - 1 || column == texture.width - 1 {
+                    assert(alpha == 0, "Wet edges must fit in the transparent canvas")
+                }
+                if alpha == 0 { transparent += 1 }
+                if alpha > 0 && alpha < 255 { translucent += 1 }
+                if alpha == 255 {
+                    darkest = min(darkest, Int(bytes[index]))
+                    lightest = max(lightest, Int(bytes[index]))
+                }
+            }
+        }
+        assert(transparent > texture.width * texture.height / 5)
+        assert(translucent > texture.width * texture.height / 30)
+        assert(lightest - darkest > 70, "Washes need visible concentration changes, not a flat tint")
+        if palette == .blue { assert(darkest > 20, "Keep the blue face bright enough") }
+    }
+    assert(BallInkDrawing.dark === BallInkDrawing.dark)
+    let appearanceSuite = "lingmou.ink-migration.\(UUID().uuidString)"
+    let appearanceDefaults = UserDefaults(suiteName: appearanceSuite)!
+    defer { appearanceDefaults.removePersistentDomain(forName: appearanceSuite) }
+    appearanceDefaults.set("white-ink", forKey: "floatingBallAppearance")
+    FloatingBallAppearance.migrateRemovedAppearance(in: appearanceDefaults)
+    assert(appearanceDefaults.string(forKey: "floatingBallAppearance") == "ink")
+    appearanceDefaults.set("blue", forKey: "floatingBallAppearance")
+    FloatingBallAppearance.migrateRemovedAppearance(in: appearanceDefaults)
+    assert(appearanceDefaults.string(forKey: "floatingBallAppearance") == "blue")
+    print(String(format: "PASS: cached ink/blue washes, transparency, premultiplied color and tonal range (%.2fs)",
+                 Date().timeIntervalSince(inkStarted)))
+    let inkFrames = BallInkDrawing.flowFrames
+    let blueFrames = BallInkDrawing.blueFlowFrames
+    for palette in [BallInkDrawing.Palette.ink, .blue] {
+        let frames = palette.frames
+        assert(frames.count == BallInkDrawing.flowFrameCount)
+        assert(frames.first === palette.frames.first)
+        let frameBytes = frames.map { image -> Data in
+            assert(image.width == 160 && image.height == 160)
+            return image.dataProvider!.data! as Data
+        }
+        for bytes in frameBytes {
+            for pixel in stride(from: 0, to: bytes.count, by: 4) {
+                for channel in 0..<3 {
+                    assert(bytes[pixel + channel] <= bytes[pixel + 3], "Animated washes must keep valid transparent edges")
+                }
+                let row = pixel / 4 / 160, column = pixel / 4 % 160
+                if row == 0 || column == 0 || row == 159 || column == 159 {
+                    assert(bytes[pixel + 3] == 0, "Breathing edges must not touch the frame")
+                }
+            }
+        }
+        func difference(_ lhs: Data, _ rhs: Data) -> Double {
+            zip(lhs, rhs).reduce(0.0) { $0 + Double(abs(Int($1.0) - Int($1.1))) } / Double(lhs.count)
+        }
+        let largestStep = (1..<frameBytes.count).map { difference(frameBytes[$0 - 1], frameBytes[$0]) }.max()!
+        let seam = difference(frameBytes.last!, frameBytes.first!)
+        let excursion = difference(frameBytes[0], frameBytes[frameBytes.count / 2])
+        assert(seam <= largestStep * 1.5 + 0.01, "The loop seam must be as smooth as neighboring frames")
+        assert(largestStep < 2.5 && excursion > 1, "Washes should flow gradually without flickering or staying still")
+        print(String(format: "PASS: %@ flow, %d cached frames, step %.3f / seam %.3f / motion %.3f",
+                     String(describing: palette), frames.count, largestStep, seam, excursion))
+    }
+    var flowClock = BallInkFlowClock(duration: 14)
+    flowClock.resume(at: 100)
+    assert(abs(flowClock.phase(at: 103.5) - 0.25) < 0.00001)
+    flowClock.setDuration(8, at: 103.5)
+    assert(abs(flowClock.phase(at: 103.5) - 0.25) < 0.00001)
+    flowClock.pause(at: 105.5)
+    assert(abs(flowClock.phase(at: 1000) - 0.5) < 0.00001)
+    flowClock.resume(at: 1000)
+    assert(abs(flowClock.phase(at: 1004)) < 0.00001)
+    let flowView = BallInkFlowView(working: true)
+    assert(flowView.hitTest(.zero) == nil)
+    assert(flowView.layer?.sublayers?.first?.animation(forKey: "ink-flow") == nil)
+    flowView.stop()
+    flowView.stop()
+    print("PASS: continuous speed and pause; native animation hit-test passthrough")
     let samples: [(String, PetMood, CGSize)] = [
         ("居中", .idle, .zero),
         ("运行 1 个", .working(taskCount: 1), CGSize(width: -3.5, height: -3.5)),
@@ -183,7 +282,127 @@ func runChecks() throws {
           let directionPNG = NSBitmapImageRep(cgImage: directionImage).representation(using: .png, properties: [:])
     else { fatalError("Direction preview failed") }
     try directionPNG.write(to: output.appendingPathComponent("bubble-expand-right.png"))
+    // 同一组原生视图对比外观；原大状态与放大笔触同时可检查。
+    func renderAppearances(_ appearances: [FloatingBallAppearance], detailAppearance: FloatingBallAppearance,
+                           filename: String) throws {
+        let appearanceSheet = VStack(spacing: 0) {
+            ForEach(0..<2) { row in
+                VStack(alignment: .leading, spacing: 24) {
+                    HStack(alignment: .center, spacing: 36) {
+                        ForEach(appearances, id: \.rawValue) { appearance in
+                            HStack(spacing: 14) {
+                                FloatingBallArtwork(mood: .working(taskCount: 3), gaze: .zero,
+                                                    hovered: false, reduceMotion: true, appearance: appearance)
+                                    .scaleEffect(2).frame(width: 128, height: 128)
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text(appearance.title).font(.system(size: 22, weight: .medium))
+                                    Text(appearance == .ink ? "浓淡相生 · 一笔灵眸" : "天蓝叠染 · 水色流动")
+                                        .font(.system(size: 11)).foregroundColor(.secondary)
+                                }
+                            }
+                            .frame(width: 290, alignment: .leading)
+                        }
+                    }
+                    HStack(spacing: 0) {
+                        ForEach(0..<6) { index in
+                            let mood: PetMood = index == 1 ? .working(taskCount: 3) :
+                                index == 3 ? .sleeping : index == 4 ? .celebrating : index == 5 ? .error : .idle
+                            let state = StatusBubbleState(mood: mood, completedCount: index == 4 ? 1 : 0)
+                            VStack(spacing: 9) {
+                                FloatingBallStatusArtwork(mood: mood, state: state,
+                                    reduceMotion: true, eyeOpenness: index == 2 ? 0 : 1, appearance: detailAppearance)
+                                    .frame(width: 100, alignment: .leading)
+                                Text(["空闲", "工作", "眨眼", "休眠", "完成", "异常"][index])
+                                    .font(.system(size: 11)).foregroundColor(.secondary)
+                            }
+                            .frame(width: 108)
+                        }
+                    }
+                }
+                .padding(28)
+                .background(Color(white: row == 0 ? 0.97 : 0.10))
+                .environment(\.colorScheme, row == 0 ? .light : .dark)
+            }
+        }
+        let appearanceRenderer = ImageRenderer(content: appearanceSheet)
+        appearanceRenderer.scale = 2
+        guard let appearanceImage = appearanceRenderer.cgImage,
+              let appearancePNG = NSBitmapImageRep(cgImage: appearanceImage).representation(using: .png, properties: [:])
+        else { fatalError("Appearance preview failed") }
+        try appearancePNG.write(to: output.appendingPathComponent(filename))
+    }
+    try renderAppearances([.blue, .ink], detailAppearance: .ink, filename: "ink-appearance-preview.png")
+    for appearance in [FloatingBallAppearance.ink, .blue] {
+        let frames = appearance == .ink ? inkFrames : blueFrames
+        let duration = (appearance == .ink ? BallInkDrawing.Palette.ink : .blue).flowDuration(working: true)
+        let prefix = appearance == .ink ? "ink" : "blue"
+        let portraitContent = HStack(spacing: 0) {
+            ForEach(0..<2) { row in
+                VStack(spacing: 16) {
+                    Text(appearance.title).font(.system(size: 21, weight: .medium))
+                    FloatingBallArtwork(mood: .idle, gaze: .zero, hovered: false, reduceMotion: true, appearance: appearance)
+                        .scaleEffect(2.5).frame(width: 160, height: 160)
+                    HStack(spacing: 16) {
+                        ForEach(0..<3) { index in
+                            VStack(spacing: 8) {
+                                FloatingBallArtwork(mood: index == 1 ? .working(taskCount: 1) : .idle,
+                                    gaze: .zero, hovered: false, reduceMotion: true,
+                                    eyeOpenness: index == 2 ? 0 : 1, appearance: appearance)
+                                Text(["待命", "工作", "眨眼"][index])
+                                    .font(.system(size: 11)).foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                }
+                .padding(28)
+                .background(Color(white: row == 0 ? 0.97 : 0.10))
+                .environment(\.colorScheme, row == 0 ? .light : .dark)
+            }
+        }
+        let portraitRenderer = ImageRenderer(content: portraitContent)
+        portraitRenderer.scale = 2
+        guard let portrait = portraitRenderer.cgImage,
+              let portraitPNG = NSBitmapImageRep(cgImage: portrait).representation(using: .png, properties: [:])
+        else { fatalError("Ink portrait rendering failed") }
+        try portraitPNG.write(to: output.appendingPathComponent("\(prefix)-polished-preview.png"))
+        let gifURL = output.appendingPathComponent("\(prefix)-flow-preview.gif")
+        guard let gif = CGImageDestinationCreateWithURL(gifURL as CFURL, "com.compuserve.gif" as CFString,
+                                                        frames.count, nil) else { fatalError("GIF creation failed") }
+        CGImageDestinationSetProperties(gif, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]] as CFDictionary)
+        for (frameIndex, frame) in frames.enumerated() {
+            let content = HStack(spacing: 0) {
+                ForEach(0..<2) { row in
+                    VStack(spacing: 16) {
+                        Text("\(appearance.title) · 流动").font(.system(size: 17, weight: .medium))
+                        FloatingBallArtwork(mood: .working(taskCount: 1), gaze: .zero, hovered: false,
+                                            reduceMotion: true, appearance: appearance, washFrame: frame)
+                            .scaleEffect(2.5).frame(width: 160, height: 160)
+                        FloatingBallArtwork(mood: .idle, gaze: .zero, hovered: false,
+                                            reduceMotion: true, appearance: appearance, washFrame: frame)
+                    }
+                    .padding(24)
+                    .background(Color(white: row == 0 ? 0.97 : 0.10))
+                    .environment(\.colorScheme, row == 0 ? .light : .dark)
+                }
+            }
+            let renderer = ImageRenderer(content: content)
+            renderer.scale = 2
+            guard let image = renderer.cgImage else { fatalError("Flow frame rendering failed") }
+            // GIF 只能存百分之一秒，分配余数以保持与原生层相同的循环时长。
+            let delay = (floor(Double(frameIndex + 1) * duration * 100 / Double(frames.count))
+                         - floor(Double(frameIndex) * duration * 100 / Double(frames.count))) / 100
+            CGImageDestinationAddImage(gif, image, [kCGImagePropertyGIFDictionary: [
+                kCGImagePropertyGIFDelayTime: delay,
+                kCGImagePropertyGIFUnclampedDelayTime: delay
+            ]] as CFDictionary)
+        }
+        assert(CGImageDestinationFinalize(gif))
+    }
     print("PASS: 1681 direction/bounds samples, blink envelope, upper-right face projection, hit-test passthrough; rendered 12 state/background snapshots")
 }
 
-try MainActor.assumeIsolated { try runChecks() }
+if CommandLine.arguments.contains("--playback") {
+    MainActor.assumeIsolated { runFloatingBallPlaybackChecks() }
+} else {
+    try MainActor.assumeIsolated { try runChecks() }
+}

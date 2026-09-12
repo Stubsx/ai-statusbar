@@ -81,6 +81,7 @@ struct StatusBubble: View {
     var style: Style = .pet
     var expanded = false
     var scale: CGFloat = 1
+    var monochrome = false
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -99,20 +100,33 @@ struct StatusBubble: View {
     }
 
     private var ink: Color {
-        colorScheme == .dark ? Color(red: 0.90, green: 0.94, blue: 1) : Color(red: 0.24, green: 0.33, blue: 0.45)
+        if monochrome { return Color(white: colorScheme == .dark ? 0.94 : 0.22) }
+        return colorScheme == .dark ? Color(red: 0.90, green: 0.94, blue: 1) : Color(red: 0.24, green: 0.33, blue: 0.45)
     }
 
     private var blue: Color {
-        colorScheme == .dark ? Color(red: 0.57, green: 0.77, blue: 1) : Color(red: 0.22, green: 0.49, blue: 0.81)
+        if monochrome { return Color(white: colorScheme == .dark ? 0.82 : 0.30) }
+        return colorScheme == .dark ? Color(red: 0.57, green: 0.77, blue: 1) : Color(red: 0.22, green: 0.49, blue: 0.81)
     }
 
     private var accent: Color {
+        if monochrome { return ink }
         switch state.kind {
         case .attention: return colorScheme == .dark ? Color(red: 0.77, green: 0.70, blue: 1) : Color(red: 0.51, green: 0.40, blue: 0.75)
         case .error: return colorScheme == .dark ? Color(red: 1, green: 0.58, blue: 0.53) : Color(red: 0.80, green: 0.28, blue: 0.24)
         case .completed: return colorScheme == .dark ? Color(red: 0.48, green: 0.83, blue: 0.70) : Color(red: 0.17, green: 0.58, blue: 0.45)
         default: return blue
         }
+    }
+
+    private var background: Color {
+        if monochrome { return Color(white: colorScheme == .dark ? 0.19 : 0.97) }
+        return colorScheme == .dark ? Color(red: 0.19, green: 0.24, blue: 0.32) : Color(red: 0.96, green: 0.98, blue: 1)
+    }
+
+    private var border: Color {
+        if monochrome { return Color(white: colorScheme == .dark ? 0.42 : 0.77) }
+        return colorScheme == .dark ? Color.white.opacity(0.18) : Color(red: 0.76, green: 0.83, blue: 0.91)
     }
 
     var body: some View {
@@ -140,9 +154,9 @@ struct StatusBubble: View {
         .frame(height: (compact ? 22 : 27) * scale)
         .background(
             Capsule()
-                .fill(colorScheme == .dark ? Color(red: 0.19, green: 0.24, blue: 0.32) : Color(red: 0.96, green: 0.98, blue: 1))
+                .fill(background)
                 .overlay(Capsule().strokeBorder(
-                    colorScheme == .dark ? Color.white.opacity(0.18) : Color(red: 0.76, green: 0.83, blue: 0.91),
+                    border,
                     lineWidth: 0.7 * scale
                 ))
         )

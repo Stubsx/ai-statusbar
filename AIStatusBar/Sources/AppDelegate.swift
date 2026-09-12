@@ -50,6 +50,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     private var cancellables: Set<AnyCancellable> = []  // 设置订阅（如桌宠大小）
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        FloatingBallAppearance.migrateRemovedAppearance()
         // 通知 delegate 在启动时设置，托管横幅点击回调（跳转对应工具）
         UNUserNotificationCenter.current().delegate = self
         // 历史版本只在开关从关→开时请求一次系统授权，且忽略结果；若当时授权

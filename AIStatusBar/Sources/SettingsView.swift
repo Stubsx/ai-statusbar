@@ -20,6 +20,7 @@ struct SettingsView: View {
     @State private var notifyAuth: UNAuthorizationStatus = .notDetermined
     @AppStorage("desktopPresentationMode") private var desktopPresentationMode = "card"
     @AppStorage("panelAppearanceMode") private var appearanceMode = "system"
+    @AppStorage("floatingBallAppearance") private var ballAppearance = "blue"
     @AppStorage("settingsTab") private var settingsTab = "general"
 
     private func chooseSyncDirectory() {
@@ -156,6 +157,17 @@ struct SettingsView: View {
                 modePicker($desktopPresentationMode, options: [
                     ("桌面卡片", "card"), ("桌面宠物", "pet"), ("隐藏", "hidden"),
                 ])
+            }
+            divider
+            settingRow("浮球风格", detail: "看板收起时的圆球形象") {
+                HStack(spacing: 6) {
+                    FloatingBallArtwork(mood: .idle, gaze: .zero, hovered: false, reduceMotion: true,
+                                        appearance: FloatingBallAppearance(rawValue: ballAppearance) ?? .blue)
+                        .scaleEffect(0.5)
+                        .frame(width: 32, height: 32)
+                        .accessibilityHidden(true)
+                    modePicker($ballAppearance, options: FloatingBallAppearance.allCases.map { ($0.title, $0.rawValue) })
+                }
             }
             divider
             settingRow("面板配色", detail: "背景自适应按面板下方明暗自动反差") {
