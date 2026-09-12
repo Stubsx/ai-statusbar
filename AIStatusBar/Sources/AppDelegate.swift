@@ -68,7 +68,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         store = StatusStore(collectorPath: collectorPath, settings: settings)
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.title = "AI …"
+        if let button = statusItem.button {
+            MenuBarPresentation.update(button, data: nil, collectorError: nil, unreadCount: 0)
+        }
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
@@ -118,56 +120,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
 
     // MARK: 菜单栏标题
 
-    /// 菜单栏富文本徽标：字母(系统色) + 小圆点(状态色) + 任务数
-    private func badgeTitle(_ tools: [ToolStatus]) -> NSAttributedString {
-        let out = NSMutableAttributedString()
-        let letterAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .medium),
-        ]
-        for (i, t) in tools.enumerated() {
-            out.append(NSAttributedString(string: t.letter, attributes: letterAttrs))
-            let dotColor = NSColor.toolStatusColor(t.state)
-            out.append(NSAttributedString(string: "●", attributes: [
-                .font: NSFont.systemFont(ofSize: 7, weight: .bold),
-                .foregroundColor: dotColor,
-                .baselineOffset: 2.5,
-                .kern: -1,
-            ]))
-            if t.state == "busy" {
-                out.append(NSAttributedString(string: "\(t.busyCount)", attributes: [
-                    .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .bold),
-                    .foregroundColor: NSColor.systemGreen,
-                ]))
-            }
-            if i < tools.count - 1 {
-                out.append(NSAttributedString(string: "  ", attributes: letterAttrs))
-            }
-        }
-        return out
-    }
-
     @objc private func onStatusUpdated() {
-        guard let data = store.data else {
-            statusItem.button?.title = store.collectorError == nil ? "AI …" : "AI !"
-            return
+        if let button = statusItem.button {
+            MenuBarPresentation.update(button, data: store.data, collectorError: store.collectorError,
+                                       unreadCount: store.attentionEvents.count)
         }
-        let visible = data.tools.filter { $0.state != "off" }
-        // 全部未运行时保留一个占位徽标，保证菜单入口还在
-        statusItem.button?.attributedTitle = visible.isEmpty
-            ? badgeTitle([ToolStatus(key: "_", letter: "AI", name: "", state: "off",
-                                     busyCount: 0, busyItems: [], detail: "",
-                                     latestTitle: nil, latestAge: nil, quota: nil)])
-            : badgeTitle(visible)
-        if !store.attentionEvents.isEmpty || store.collectorError != nil,
-           let button = statusItem.button {
-            let title = NSMutableAttributedString(attributedString: button.attributedTitle)
-            let text = store.collectorError != nil ? "  !" : "  !\(store.attentionEvents.count)"
-            title.append(NSAttributedString(string: text, attributes: [
-                .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .semibold),
-                .foregroundColor: NSColor.systemOrange,
-            ]))
-            button.attributedTitle = title
-        }
+        guard store.data != nil else { return }
 
         // 过渡期间不争抢窗口尺寸；最后一次数据在动画完成后统一测量。
         if panelTransitioning || desktopAnchorMoving {
@@ -510,93 +468,79 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         }
     }
 
-    /// 标题限宽，超长截断加省略号
-    private func truncate(_ s: String, _ maxChars: Int = 40) -> String {
-        s.count > maxChars ? String(s.prefix(maxChars - 1)) + "…" : s
-    }
-
     // MARK: 菜单
 
     func menuNeedsUpdate(_ menu: NSMenu) {
+        populateStatusMenu(menu, store: store)
+    }
+
+    func populateStatusMenu(_ menu: NSMenu, store: StatusStore) {
         menu.removeAllItems()
-        let attention = NSMenuItem(title: "打开面板",
-                                   action: #selector(openTaskCenter), keyEquivalent: "1")
-        attention.target = self
-        attention.image = symbol("eye", template: true)
-        menu.addItem(attention)
-        let history = NSMenuItem(title: "最近事件", action: #selector(openHistory), keyEquivalent: "2")
-        history.target = self
-        menu.addItem(history)
-        menu.addItem(.separator())
-        let label = ["busy": "工作中", "idle": "空闲", "off": "未运行"]
-        if let data = store.data {
-            let visible = data.tools.filter { $0.state != "off" }
-            if visible.isEmpty {
-                let empty = NSMenuItem(title: "全部未运行", action: nil, keyEquivalent: "")
-                empty.image = symbol("moon.zzz", color: .systemGray, size: 12)
-                empty.isEnabled = false
-                menu.addItem(empty)
-                menu.addItem(.separator())
-            }
-            for t in visible {
-                let header = NSMenuItem(title: "\(t.name)：\(label[t.state] ?? t.state)（\(t.detail)）",
-                                        action: #selector(openTool(_:)), keyEquivalent: "")
-                header.target = self
-                header.representedObject = t.key
-                header.toolTip = NotificationRouter.destinationLabel(forToolKey: t.key)
-                header.image = symbol("circle.fill", color: NSColor.toolStatusColor(t.state), size: 10)
-                menu.addItem(header)
-                for busy in t.busyItems.prefix(3) {
-                    let item = NSMenuItem(title: truncate(store.displayTitle(busy.title)), action: #selector(openTool(_:)), keyEquivalent: "")
-                    item.target = self
-                    item.representedObject = ToolDestination(toolKey: t.key, sessionId: busy.id)
-                    item.toolTip = store.displayTitle(busy.title) + " · " + NotificationRouter.destinationLabel(forToolKey: t.key, sessionId: busy.id)
-                    item.image = symbol("play.fill", color: .systemGreen, size: 11)
-                    item.isEnabled = true
-                    item.attributedTitle = NSAttributedString(string: item.title, attributes: [
-                        .font: NSFont.systemFont(ofSize: 11),
-                        .foregroundColor: NSColor.systemGreen,
-                    ])
-                    menu.addItem(item)
-                }
-                if t.busyItems.isEmpty, let latest = t.latestTitle {
-                    let item = NSMenuItem(title: "最近任务：\(truncate(store.displayTitle(latest), 34)) · \(t.latestAge ?? "")", action: #selector(openTool(_:)), keyEquivalent: "")
-                    item.target = self
-                    item.representedObject = ToolDestination(toolKey: t.key, sessionId: t.latestSessionId)
-                    item.toolTip = store.displayTitle(latest) + " · " + NotificationRouter.destinationLabel(forToolKey: t.key, sessionId: t.latestSessionId)
-                    item.image = symbol("clock", size: 11, template: true)
-                    item.isEnabled = true
-                    item.attributedTitle = NSAttributedString(string: item.title, attributes: [
-                        .font: NSFont.systemFont(ofSize: 11),
-                        .foregroundColor: NSColor.secondaryLabelColor,
-                    ])
-                    menu.addItem(item)
-                }
-                menu.addItem(.separator())
-            }
+        if let error = store.collectorError {
+            let item = NSMenuItem(title: "状态暂未更新 · 查看原因",
+                                  action: #selector(openMenuConnections), keyEquivalent: "")
+            item.target = self
+            item.image = symbol("exclamationmark.circle", color: .systemOrange)
+            item.toolTip = error
+            menu.addItem(item)
+            menu.addItem(.separator())
         }
+        if let data = store.data {
+            MenuBarPresentation.appendTools(to: menu, tools: data.tools, target: self,
+                                            openTool: #selector(openTool(_:)),
+                                            openConnections: #selector(openMenuConnections),
+                                            displayTitle: { store.displayTitle($0) })
+        } else if store.collectorError == nil {
+            let loading = NSMenuItem(title: "正在读取工具状态…", action: nil, keyEquivalent: "")
+            loading.image = symbol("hourglass", template: true)
+            menu.addItem(loading)
+        }
+        if menu.items.last?.isSeparatorItem == false { menu.addItem(.separator()) }
+
+        let unread = store.attentionEvents.count
+        let history = NSMenuItem(title: unread > 0 ? "最近事件 · \(unread) 条未读" : "最近事件",
+                                 action: #selector(openHistory), keyEquivalent: "2")
+        history.target = self
+        history.image = symbol("clock", template: true)
+        menu.addItem(history)
+        let desktop = NSMenuItem(title: "桌面显示", action: nil, keyEquivalent: "")
+        desktop.image = symbol("rectangle.on.rectangle", template: true)
+        desktop.submenu = buildDesktopDisplayMenu()
+        menu.addItem(desktop)
+        menu.addItem(.separator())
+
         let settingsItem = NSMenuItem(title: "设置…", action: #selector(openSettings), keyEquivalent: ",")
         settingsItem.target = self
         settingsItem.image = symbol("gearshape", template: true)
         menu.addItem(settingsItem)
-        let desktopItem = NSMenuItem(title: "桌面显示", action: nil, keyEquivalent: "")
-        desktopItem.image = symbol("rectangle.on.rectangle", template: true)
-        let desktopMenu = NSMenu()
+        let refresh = NSMenuItem(title: "刷新状态", action: #selector(doRefresh), keyEquivalent: "r")
+        refresh.target = self
+        refresh.image = symbol("arrow.clockwise", template: true)
+        menu.addItem(refresh)
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "退出灵眸", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        quit.target = NSApp
+        quit.image = symbol("power", template: true)
+        menu.addItem(quit)
+    }
+
+    private func buildDesktopDisplayMenu() -> NSMenu {
+        let menu = NSMenu()
+        let panelItem = NSMenuItem(title: "打开桌面面板", action: #selector(openTaskCenter), keyEquivalent: "1")
+        panelItem.target = self
+        panelItem.image = symbol("eye", template: true)
+        menu.addItem(panelItem)
+        menu.addItem(.separator())
         let mode = desktopPresentationMode
-        let cardMode = NSMenuItem(title: "桌面卡片", action: #selector(selectCardMode), keyEquivalent: "")
-        cardMode.target = self
-        cardMode.state = mode == "card" ? .on : .off
-        desktopMenu.addItem(cardMode)
-        let petMode = NSMenuItem(title: "桌面宠物", action: #selector(selectPetMode), keyEquivalent: "")
-        petMode.target = self
-        petMode.state = mode == "pet" ? .on : .off
-        desktopMenu.addItem(petMode)
-        let hiddenMode = NSMenuItem(title: "隐藏", action: #selector(selectHiddenMode), keyEquivalent: "")
-        hiddenMode.target = self
-        hiddenMode.state = mode == "hidden" ? .on : .off
-        desktopMenu.addItem(hiddenMode)
-        desktopItem.submenu = desktopMenu
-        menu.addItem(desktopItem)
+        for (title, value, action) in [("桌面卡片", "card", #selector(selectCardMode)),
+                                       ("桌面宠物", "pet", #selector(selectPetMode)),
+                                       ("隐藏", "hidden", #selector(selectHiddenMode))] {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            item.state = mode == value ? .on : .off
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
         let pinned = UserDefaults.standard.object(forKey: "panelPinned") == nil
             ? true : UserDefaults.standard.bool(forKey: "panelPinned")
         let pin = NSMenuItem(title: "置顶桌面显示", action: #selector(togglePin), keyEquivalent: "t")
@@ -609,22 +553,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         fullscreenHide.image = symbol("arrow.up.left.and.arrow.down.right", template: true)
         fullscreenHide.state = autoHideInFullscreenEnabled ? .on : .off
         menu.addItem(fullscreenHide)
-        let refresh = NSMenuItem(title: "刷新", action: #selector(doRefresh), keyEquivalent: "r")
-        refresh.target = self
-        refresh.image = symbol("arrow.clockwise", template: true)
-        menu.addItem(refresh)
-        menu.addItem(.separator())
-        let legend = NSMenuItem(title: "C=Codex App  X=Codex CLI  K=Kimi  L=Claude  H=Hermes  Z=ZCode", action: nil, keyEquivalent: "")
-        legend.isEnabled = false
-        legend.attributedTitle = NSAttributedString(string: legend.title, attributes: [
-            .font: NSFont.systemFont(ofSize: 10),
-            .foregroundColor: NSColor.secondaryLabelColor,
-        ])
-        menu.addItem(legend)
-        let quit = NSMenuItem(title: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        quit.image = symbol("power", color: .systemRed)
-        menu.addItem(quit)
+        return menu
     }
+
+    @objc private func openMenuConnections() { showSettings(tab: "connections") }
 
     // MARK: 桌面浮窗
 

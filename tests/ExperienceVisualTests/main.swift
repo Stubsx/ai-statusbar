@@ -139,6 +139,48 @@ func renderExperience() throws {
         TaskRecord(id: "end", toolKey: "claude", toolName: "Claude Code", sessionId: "end-session", title: "检查新版本的连接诊断", phase: "ended", timestamp: now - 90, evidence: "explicit", acknowledged: false, resolved: false),
         TaskRecord(id: "abort", toolKey: "codex-ide", toolName: "Codex App", sessionId: "abort-session", title: "本地事件接口测试", phase: "interrupted", timestamp: now - 180, evidence: "explicit", acknowledged: false, resolved: false)
     ]
+    // 紧凑菜单仍要保留全部任务的精确跳转，且子菜单和提示也必须遵守演示模式。
+    func menuItems(_ menu: NSMenu) -> [NSMenuItem] {
+        menu.items.flatMap { [$0] + ($0.submenu.map(menuItems) ?? []) }
+    }
+    let menuTarget = NSObject()
+    let toolMenu = NSMenu()
+    MenuBarPresentation.appendTools(to: toolMenu, tools: store.data!.tools, target: menuTarget,
+                                    openTool: Selector(("openTool:")), openConnections: Selector(("openConnections")),
+                                    displayTitle: { store.displayTitle($0) })
+    let destinations = menuItems(toolMenu).compactMap { $0.representedObject as? ToolDestination }
+    assert(Set(destinations.compactMap(\.sessionId)) == Set((1...7).map { "s\($0)" }),
+           "Overflow must use activeItems, not the one-item busyItems preview")
+    assert(destinations.allSatisfy { $0.toolKey == "codex-ide" })
+    settings.experience.privacyMode = true
+    let privateMenu = NSMenu()
+    MenuBarPresentation.appendTools(to: privateMenu, tools: store.data!.tools, target: menuTarget,
+                                    openTool: Selector(("openTool:")), openConnections: Selector(("openConnections")),
+                                    displayTitle: { store.displayTitle($0) })
+    for item in menuItems(privateMenu) where item.representedObject is ToolDestination {
+        assert(item.title == "任务标题已隐藏" && item.toolTip?.hasPrefix("任务标题已隐藏") == true)
+    }
+    settings.experience.privacyMode = false
+    var failedTool = store.data!.tools[1]
+    failedTool.health = ToolHealth(state: "error", message: "读取失败", checkedAt: now)
+    let failedMenu = NSMenu()
+    MenuBarPresentation.appendTools(to: failedMenu, tools: [failedTool], target: menuTarget,
+                                    openTool: Selector(("openTool:")), openConnections: Selector(("openConnections")),
+                                    displayTitle: { $0 })
+    assert(failedMenu.items.contains { $0.action == Selector(("openConnections")) },
+           "Failed tools need an actionable diagnosis entry")
+    assert(MenuBarPresentation.fittedTitle("一个短标题") == "一个短标题")
+    assert(MenuBarPresentation.fittedTitle(String(repeating: "长标题", count: 50)).hasSuffix("…"))
+    let integratedMenu = NSMenu()
+    let menuDelegate = AppDelegate()
+    menuDelegate.populateStatusMenu(integratedMenu, store: store)
+    assert(integratedMenu.items.first?.representedObject as? String == "codex-ide")
+    assert(!integratedMenu.items.contains { $0.action == Selector(("openTaskCenter")) })
+    let desktopMenu = integratedMenu.items.first { $0.title == "桌面显示" }!.submenu!
+    assert(desktopMenu.items.contains { $0.action == Selector(("openTaskCenter")) && $0.keyEquivalent == "1" })
+    assert(desktopMenu.items.contains { $0.action == Selector(("togglePin")) && $0.keyEquivalent == "t" })
+    assert(integratedMenu.items.contains { $0.action == Selector(("openHistory")) && $0.keyEquivalent == "2" })
+    print("PASS: native menu preserves all seven session routes, redacts overflow titles and routes failures to diagnosis")
     @discardableResult
     func save<V: View>(_ name: String, content: V, scheme: ColorScheme) throws -> CGSize {
         let hosted = NSHostingView(rootView: content.environment(\.colorScheme, scheme))
