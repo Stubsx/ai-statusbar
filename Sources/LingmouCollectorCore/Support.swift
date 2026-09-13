@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 typealias JSONObject = [String: Any]
@@ -218,6 +219,7 @@ struct FileSupport {
 /// 实例生命周期 = 一次 `LingmouCollector.collect()`，缓存不会跨轮失效。
 final class ProcessSupport {
     var outputOverride: ((String, [String], TimeInterval) -> String)?
+    var identityOverride: ((Int32) -> (path: String, startedAt: TimeInterval)?)?
     private var argumentLinesCache: [String]?
     private var pidLinesCache: [(pid: Int32, args: String)]?
 
@@ -295,20 +297,38 @@ final class ProcessSupport {
     func count(named basename: String, excluding excluded: [String] = []) -> Int {
         cachedArgumentLines()
             .reduce(into: 0) { count, rawLine in
-                let line = rawLine.trimmingCharacters(in: .whitespaces)
-                var tokens = line.split(whereSeparator: \.isWhitespace).map(String.init)
-                while let first = tokens.first, first.contains("=") && !first.hasPrefix("/") {
-                    tokens.removeFirst()
-                }
-                guard let first = tokens.first, !excluded.contains(where: line.contains) else { return }
-                let executable = URL(fileURLWithPath: first).lastPathComponent
-                let interpreted = ["python", "python3", "python3.11", "python3.12", "python3.13", "node", "bun"]
-                let script = tokens.dropFirst().first
-                if executable == basename || (interpreted.contains(executable)
-                    && script.map { URL(fileURLWithPath: $0).lastPathComponent == basename } == true) {
+                if !excluded.contains(where: rawLine.contains), matchesName(rawLine, basename) {
                     count += 1
                 }
             }
+    }
+
+    func isNamed(pid: Int32, basename: String) -> Bool {
+        cachedPidLines().contains { $0.pid == pid && matchesName($0.args, basename) }
+    }
+
+    private func matchesName(_ line: String, _ basename: String) -> Bool {
+        var tokens = line.split(whereSeparator: \.isWhitespace).map(String.init)
+        while let first = tokens.first, first.contains("=") && !first.hasPrefix("/") {
+            tokens.removeFirst()
+        }
+        guard let first = tokens.first else { return false }
+        let executable = URL(fileURLWithPath: first).lastPathComponent
+        let interpreted = ["python", "python3", "python3.11", "python3.12", "python3.13", "node", "bun"]
+        return executable == basename || (interpreted.contains(executable)
+            && tokens.dropFirst().first.map { URL(fileURLWithPath: $0).lastPathComponent == basename } == true)
+    }
+
+    /// Read the kernel's executable and start time, unaffected by rewritten argv/process titles.
+    func identity(pid: Int32) -> (path: String, startedAt: TimeInterval)? {
+        if let identityOverride { return identityOverride(pid) }
+        var path = [CChar](repeating: 0, count: Int(4 * MAXPATHLEN))
+        guard proc_pidpath(pid, &path, UInt32(path.count)) > 0 else { return nil }
+        var info = proc_bsdinfo()
+        let size = MemoryLayout<proc_bsdinfo>.size
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(size)) == size else { return nil }
+        return (String(cString: path), Double(info.pbi_start_tvsec)
+            + Double(info.pbi_start_tvusec) / 1_000_000)
     }
 
     /// 命令行含子串的进程 PID 列表（与 pgrep -f 同语义，复用 ps 快照）。

@@ -8,6 +8,7 @@ struct LocalCollectors {
 
     func kimi() -> RawToolState {
         let count = processes.count(named: "kimi") + processes.count(named: "kimi-code")
+            + additionalKimiWebProcesses()
         var result = RawToolState(processOn: count > 0, detail: "\(count) 个进程")
         let root = environment.path(".kimi-code", "sessions")
         let stateFiles = files.files(atDepth: 3, under: root) { $0.hasSuffix("/state.json") }
@@ -18,7 +19,8 @@ struct LocalCollectors {
                 result.sourceError = "部分会话元数据不可读或格式不兼容"
                 continue
             }
-            let workDirectory = JSONValue.string(metadata["workDir"]) ?? ""
+            let workDirectory = JSONValue.string(metadata["cwd"])
+                ?? JSONValue.string(metadata["workDir"]) ?? ""
             let title =
                 JSONValue.string(metadata["title"]).flatMap { $0.isEmpty ? nil : $0 }
                 ?? URL(fileURLWithPath: workDirectory).lastPathComponent.nonempty
@@ -36,6 +38,33 @@ struct LocalCollectors {
                              title: title, processOn: count > 0, to: &result)
         }
         return result
+    }
+
+    /// Kimi Code Web can rewrite its process title to `kimi-cod`. Only accept a
+    /// registered, heartbeating instance backed by the same real Kimi process.
+    /// The registry proves service liveness, never that a particular session is busy.
+    private func additionalKimiWebProcesses() -> Int {
+        let root = environment.path(".kimi-code", "server", "instances")
+        var pids = Set<Int32>()
+        for path in files.files(atDepth: 1, under: root, where: { $0.hasSuffix(".json") }) {
+            guard let instance = files.read(path).flatMap(JSONValue.object),
+                  let rawPID = JSONValue.double(instance["pid"]),
+                  rawPID > 0, let pid = Int32(exactly: rawPID),
+                  let heartbeat = JSONValue.double(instance["heartbeat_at"]),
+                  let started = JSONValue.double(instance["started_at"]),
+                  (0...30).contains(environment.now - heartbeat / 1_000),
+                  started <= heartbeat,
+                  let identity = processes.identity(pid: pid),
+                  ["kimi", "kimi-code"].contains(URL(fileURLWithPath: identity.path).lastPathComponent),
+                  abs(identity.startedAt - started / 1_000) <= 5
+            else { continue }
+            // Normal CLI/Web titles already participate in the existing process count.
+            if !processes.isNamed(pid: pid, basename: "kimi"),
+               !processes.isNamed(pid: pid, basename: "kimi-code") {
+                pids.insert(pid)
+            }
+        }
+        return pids.count
     }
 
     func kimiWork() -> RawToolState {
