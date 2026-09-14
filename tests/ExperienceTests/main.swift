@@ -121,6 +121,112 @@ do {
                           now: now).isEmpty, "Invalid quota percentage must not alarm")
 }
 
+do {
+    func record(_ id: String, session: String = "session", key: String = "codex-ide",
+                phase: String = "ended", at time: TimeInterval = now, resolved: Bool = false,
+                read: Bool = false) -> TaskRecord {
+        TaskRecord(id: id, toolKey: key, toolName: key, sessionId: session, title: id,
+                   phase: phase, timestamp: time, evidence: "explicit", acknowledged: read, resolved: resolved)
+    }
+    let history = [record("old", at: now - 20), record("new", at: now - 10),
+                   record("other", session: "second"), record("kimi", key: "kimi")]
+    let groups = HarnessConversations.groups(tools: [tool(busy: true)], events: history)
+    let codex = groups.first { $0.id == "codex-ide" }!
+    check(codex.conversations.count == 2, "A resumed session must appear once alongside other completed sessions")
+    check(codex.conversations[0].phase == "working", "A new running turn supersedes old completion")
+    check(Set(codex.conversations[0].eventIDs) == Set(["old", "new"]), "One row retains all its own event IDs")
+    check(groups.first { $0.id == "kimi" }?.conversations.count == 1, "The same session ID in another harness is separate")
+    check(groups.first { $0.id == "kimi" }?.tool.state == "off", "An unread result remains available after its harness exits")
+    check(codex.runningCount == 1 && codex.attentionCount == 1, "Counts match running and unread rows, not historical turns")
+    let ended = HarnessConversations.conversations(tool: tool(), events: history)
+    check(ended.first { $0.sessionId == "session" }?.title == "new", "Use the latest title and outcome per conversation")
+    check(ended.filter { $0.sessionId == "session" }.count == 1, "Multiple completed turns collapse into one row")
+    let states = HarnessConversations.conversations(tool: tool(), events: [
+        record("quiet", phase: "inactive"),
+        record("resolved", session: "resolved", phase: "waiting_input", resolved: true),
+        record("waiting", session: "waiting", phase: "waiting_input"),
+        record("abort", session: "abort", phase: "interrupted")
+    ])
+    check(states.first?.sessionId == "waiting", "An unresolved wait stays before past results")
+    check(states.allSatisfy { !["resolved", "session"].contains($0.sessionId ?? "") },
+          "Resolved waits and inactivity must not appear in the live status list")
+    check(states.allSatisfy { $0.phase != "ended" }, "Inactivity and interruptions are never presented as completed")
+    var many = tool(busy: true)
+    many.activeItems = (1...8).map { BusyItem(id: "running-\($0)", title: "运行会话 \($0)") }
+    let preview = HarnessConversations.groups(tools: [many], events: history)[0].preview
+    check(preview.filter(\.current).count == 3 && preview.contains { $0.phase == "ended" },
+          "Busy harnesses must still preview recent completed conversations")
+    let anonymous = HarnessConversations.conversations(tool: tool(), events: [
+        record("anonymous-1", session: ""), record("anonymous-2", session: "")
+    ])
+    check(anonymous.count == 2 && anonymous.allSatisfy { $0.sessionId == nil }, "Missing IDs cannot merge unrelated history")
+    let readRows = HarnessConversations.conversations(tool: tool(), events: [
+        record("old-unread", at: now - 20), record("latest-read", read: true),
+        record("read-wait", session: "wait", phase: "waiting_input", read: true),
+        record("resolved-end", session: "resolved-end", resolved: true)
+    ])
+    check(readRows.isEmpty, "Reading the latest result hides the conversation without resurrecting older unread turns")
+    let historical = ToolStatus(key: "kimi", letter: "K", name: "Kimi", state: "idle", busyCount: 0,
+                                busyItems: [], detail: "", latestTitle: "很早之前的对话", latestAge: "3 天前", quota: nil)
+    check(HarnessConversations.conversations(tool: historical, events: []).isEmpty,
+          "Latest-title fallback must not add old conversations to live status")
+    check(HarnessConversations.groups(tools: [], events: [record("old-tool", read: true)]).isEmpty,
+          "Read history cannot resurrect an offline harness")
+    many.activeItems = [BusyItem(id: "same", title: "First"), BusyItem(id: "same", title: "Duplicate")]
+    check(HarnessConversations.workingItems(for: many).count == 1,
+          "Running icons and rows must share the same deduplicated session list")
+}
+
+do {
+    let window = QuotaWindow(kind: "month", label: "本月", usedPercent: 5, resetsAt: Int(now + 86_400),
+                             windowMinutes: 43_200, components: nil)
+    func reading(age: TimeInterval = 0, notice: String? = nil, windows: [QuotaWindow]? = nil) -> ToolQuota {
+        ToolQuota(plan: "Allegro", windows: windows ?? [window], updatedAt: Int(now - age), notice: notice)
+    }
+    let unavailable = QuotaPresentation(tool: tool(key: "kimi-work", quota: reading(age: 172_800,
+        notice: "凭证读取尚未开启")), now: now)
+    check(!unavailable.isCurrent && unavailable.windows.isEmpty, "Unavailable cached quota cannot show a current percentage")
+    check(unavailable.lastSuccessAt == now - 172_800, "Keep the actual successful read time when refresh fails")
+    let failedAttempt = QuotaPresentation(tool: tool(quota: reading(notice: "需要登录", windows: [])), now: now)
+    check(!failedAttempt.isCurrent && failedAttempt.lastSuccessAt == nil, "A failed attempt is not a successful update")
+    check(!QuotaPresentation(tool: tool(quota: reading(notice: "无法更新")), now: now).isCurrent,
+          "A recent timestamp cannot override an explicit read failure")
+    check(!QuotaPresentation(tool: tool(quota: reading(age: 601)), now: now).isCurrent,
+          "Old quota must expire even when the surrounding status snapshot is fresh")
+    check(QuotaPresentation(tool: tool(key: "kimi-work", quota: reading(age: 3_600)), now: now).isCurrent,
+          "Allow Kimi monthly API's documented one-hour cache")
+    check(!QuotaPresentation(tool: tool(key: "kimi-work", quota: reading(age: 4_201)), now: now).isCurrent,
+          "Monthly readings must expire after the grace period")
+    var staleTool = tool(quota: reading())
+    staleTool.health = ToolHealth(state: "ready", message: "", checkedAt: now, quotaState: "stale")
+    check(!QuotaPresentation(tool: staleTool, now: now).isCurrent, "Explicit stale health suppresses cached numbers")
+    check(!QuotaPresentation(tool: tool(quota: reading(age: -120)), now: now).isCurrent,
+          "A future timestamp cannot make a quota current")
+    let expired = QuotaWindow(kind: "primary", label: "五小时", usedPercent: 50, resetsAt: Int(now - 1),
+                              windowMinutes: 300, components: nil)
+    check(QuotaPresentation(tool: tool(quota: reading(windows: [expired, window])), now: now).windows.count == 1,
+          "Do not show old percentages from windows that have already reset")
+    let codeWindow = QuotaWindow(kind: "5h", label: "5小时", usedPercent: 95, resetsAt: Int(now + 300),
+                                 windowMinutes: 300, components: nil)
+    let cachedCode = tool(key: "kimi", quota: reading(age: 3_600, windows: [codeWindow]))
+    let codeSnapshot = QuotaPresentation(tool: cachedCode, now: now)
+    check(codeSnapshot.isHistorical && !codeSnapshot.isCurrent && codeSnapshot.windows.first?.usedPercent == 95,
+          "Kimi Code retains its previous quota as history between messages")
+    check(codeSnapshot.lastSuccessAt == now - 3_600, "Historical quota keeps its real update time")
+    let expiredCode = QuotaPresentation(tool: tool(key: "kimi", quota: reading(windows: [expired])), now: now)
+    check(expiredCode.isHistorical && expiredCode.windows.count == 1,
+          "An old Kimi window remains dated history instead of claiming current quota")
+    check(QuotaPresentation(tool: tool(key: "kimi", quota: reading(windows: [codeWindow])), now: now).isCurrent,
+          "A new Kimi reading replaces the historical snapshot")
+    check(!QuotaPresentation(tool: tool(key: "kimi", quota: reading(windows: [])), now: now).isHistorical,
+          "An empty response cannot fabricate a historical reading")
+    check(!QuotaPresentation(tool: tool(key: "kimi", quota: reading(age: -120)), now: now).isHistorical,
+          "Historical display cannot accept invalid future timestamps")
+    let codeMonitor = QuotaMonitor(directory: directory.appendingPathComponent("code-snapshots"))
+    check(codeMonitor.observe([cachedCode], threshold: 20, recovery: true, now: now).isEmpty,
+          "A historical Kimi snapshot must never trigger a quota alert")
+}
+
 let preferences = try JSONDecoder().decode(ExperiencePreferences.self, from: Data(#"{"quotaAlerts":true}"#.utf8))
 check(preferences.quotaAlerts && !preferences.eventExport && preferences.quotaThreshold == 20,
       "New preferences must decode old partial settings with safe defaults")

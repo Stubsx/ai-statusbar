@@ -15,7 +15,7 @@ enum PetMood: Equatable {
         if error != nil { return .error }
         guard let data else { return .loading }
         let busyCount = data.tools.reduce(0) { total, tool in
-            total + (tool.state == "busy" ? tool.busyCount : 0)
+            total + HarnessConversations.workingItems(for: tool).count
         }
         if busyCount > 0 { return .working(taskCount: busyCount) }
         if data.tools.contains(where: { tool in
@@ -68,8 +68,6 @@ struct PetView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var hovered = false
     @State private var celebratingSerial = 0
-    @State private var celebratingCount = 0
-    @State private var celebrationMessage = "本轮已结束"
 
     private var liveMood: PetMood {
         PetMood.current(data: store.data, error: store.collectorError)
@@ -112,14 +110,10 @@ struct PetView: View {
             }
             .onChange(of: store.completedEventSerial) { serial in
                 guard serial > 0 else { return }
-                celebrationMessage = store.completedEventMessage
-                celebratingCount = store.completedEventCount
                 celebratingSerial = serial
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
                     if celebratingSerial == serial {
                         celebratingSerial = 0
-                        celebratingCount = 0
-                        celebrationMessage = "本轮已结束"
                     }
                 }
             }
@@ -128,9 +122,11 @@ struct PetView: View {
     }
 
     private var bubbleState: StatusBubbleState {
-        StatusBubbleState(mood: liveMood, attentionCount: store.attentionEvents.count,
+        let ended = store.attentionEvents.filter { $0.phase == "ended" }
+        let message = ended.count == 1 ? "\(ended[0].toolName) 本轮已结束" : "\(ended.count) 个会话本轮已结束"
+        return StatusBubbleState(mood: liveMood, attentionCount: store.attentionEvents.count,
                           urgentAttentionCount: store.attentionEvents.filter { $0.phase != "ended" }.count,
-                          completedCount: celebratingCount, completionMessage: celebrationMessage)
+                          completedCount: celebratingSerial > 0 ? ended.count : 0, completionMessage: message)
     }
 }
 

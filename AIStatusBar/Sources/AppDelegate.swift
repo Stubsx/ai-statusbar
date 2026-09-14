@@ -66,6 +66,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         }
         let collectorPath = Bundle.main.path(forResource: "lingmou-collector", ofType: nil)
         store = StatusStore(collectorPath: collectorPath, settings: settings)
+        NotificationRouter.prefersBrowserTabReuse = { [settings] in settings.kimiWebTabReuse }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
@@ -102,7 +103,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             let info = response.notification.request.content.userInfo
             DispatchQueue.main.async { [weak self] in
                 defer { completionHandler() }
-                self?.store.openNotification(info) { [weak self] in self?.showTaskPanel(tab: "history") }
+                self?.store.openNotification(info) { [weak self] in self?.showTaskPanel(tab: "status") }
             }
         } else {
             completionHandler()
@@ -485,8 +486,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             menu.addItem(item)
             menu.addItem(.separator())
         }
-        if let data = store.data {
-            MenuBarPresentation.appendTools(to: menu, tools: data.tools, target: self,
+        if store.data != nil || !store.recentEvents.isEmpty {
+            MenuBarPresentation.appendTools(to: menu, tools: store.data?.tools ?? [],
+                                            events: store.recentEvents, target: self,
                                             openTool: #selector(openTool(_:)),
                                             openConnections: #selector(openMenuConnections),
                                             displayTitle: { store.displayTitle($0) })
@@ -497,12 +499,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         }
         if menu.items.last?.isSeparatorItem == false { menu.addItem(.separator()) }
 
-        let unread = store.attentionEvents.count
-        let history = NSMenuItem(title: unread > 0 ? "最近事件 · \(unread) 条未读" : "最近事件",
-                                 action: #selector(openHistory), keyEquivalent: "2")
-        history.target = self
-        history.image = symbol("clock", template: true)
-        menu.addItem(history)
         let desktop = NSMenuItem(title: "桌面显示", action: nil, keyEquivalent: "")
         desktop.image = symbol("rectangle.on.rectangle", template: true)
         desktop.submenu = buildDesktopDisplayMenu()
@@ -1233,9 +1229,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
     @objc private func openTaskCenter() { showTaskPanel() }
-    @objc private func openHistory() { showTaskPanel(tab: "history") }
     @objc private func openTool(_ sender: NSMenuItem) {
-        if let destination = sender.representedObject as? ToolDestination {
+        if let conversation = sender.representedObject as? HarnessConversation {
+            store.openConversation(conversation)
+        } else if let destination = sender.representedObject as? ToolDestination {
             NotificationRouter.openDestination(destination)
         } else if let key = sender.representedObject as? String {
             NotificationRouter.openDestination(forToolKey: key)
@@ -1244,7 +1241,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
 
     func showTaskPanel(tab: String? = nil) {
         // 普通打开复用持久化页面；显式入口先选页，避免展开时闪回其他页面。
-        if let tab { UserDefaults.standard.set(tab, forKey: "panelTab") }
+        let page = PanelPage.restored(tab ?? UserDefaults.standard.string(forKey: "panelTab"))
+        UserDefaults.standard.set(page.rawValue, forKey: "panelTab")
         if desktopPresentationMode == "card" {
             if !cardExpanded { toggleCardPanel() }
         } else if desktopPresentationMode == "pet" {
@@ -1412,8 +1410,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
 
     /// 悬浮球右键菜单：展开/收起 + 模式切换，其余项与面板/桌宠菜单同源
     private func addTaskEntries(to menu: NSMenu) {
-        for (title, action, icon) in [("打开面板", #selector(openTaskCenter), "eye"),
-                                      ("最近事件", #selector(openHistory), "clock")] {
+        for (title, action, icon) in [("打开面板", #selector(openTaskCenter), "eye")] {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
             item.target = self
             item.image = symbol(icon, template: true)

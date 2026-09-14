@@ -1,6 +1,29 @@
 import Cocoa
 import SwiftUI
 
+// Native wheel input scoped to a test window; a bare CGEvent has no target window.
+private final class FixtureWheelEvent: NSEvent {
+    weak var targetWindow: NSWindow?
+    var targetNumber = 0
+    var point = NSPoint.zero
+    var source: NSEvent!
+    override var type: NSEvent.EventType { .scrollWheel }
+    override var window: NSWindow? { targetWindow }
+    override var windowNumber: Int { targetNumber }
+    override var locationInWindow: NSPoint { point }
+    override var deltaX: CGFloat { source.deltaX }
+    override var deltaY: CGFloat { source.deltaY }
+    override var deltaZ: CGFloat { source.deltaZ }
+    override var scrollingDeltaX: CGFloat { source.scrollingDeltaX }
+    override var scrollingDeltaY: CGFloat { source.scrollingDeltaY }
+    override var hasPreciseScrollingDeltas: Bool { source.hasPreciseScrollingDeltas }
+    override var phase: NSEvent.Phase { source.phase }
+    override var momentumPhase: NSEvent.Phase { source.momentumPhase }
+    override var modifierFlags: NSEvent.ModifierFlags { [] }
+    override var timestamp: TimeInterval { ProcessInfo.processInfo.systemUptime }
+    override var cgEvent: CGEvent? { source.cgEvent }
+}
+
 @MainActor
 func renderExperience() throws {
     setbuf(stdout, nil)
@@ -159,6 +182,17 @@ func renderExperience() throws {
         TaskRecord(id: "end", toolKey: "claude", toolName: "Claude Code", sessionId: "end-session", title: "检查新版本的连接诊断", phase: "ended", timestamp: now - 90, evidence: "explicit", acknowledged: false, resolved: false),
         TaskRecord(id: "abort", toolKey: "codex-ide", toolName: "Codex App", sessionId: "abort-session", title: "本地事件接口测试", phase: "interrupted", timestamp: now - 180, evidence: "explicit", acknowledged: false, resolved: false)
     ]
+    store.recentEvents += [
+        TaskRecord(id: "older-end", toolKey: "claude", toolName: "Claude Code", sessionId: "end-session", title: "同一对话的上一轮结果", phase: "ended", timestamp: now - 200, evidence: "explicit", acknowledged: false, resolved: false),
+        TaskRecord(id: "read-history", toolKey: "codex-ide", toolName: "Codex App", sessionId: "read-session", title: "已查看的历史对话不应出现", phase: "ended", timestamp: now - 60, evidence: "explicit", acknowledged: true, resolved: false),
+        TaskRecord(id: "resumed-history", toolKey: "codex-ide", toolName: "Codex App", sessionId: sessionIDs[0], title: "重新运行前的旧结果", phase: "ended", timestamp: now - 60, evidence: "explicit", acknowledged: false, resolved: false)
+    ]
+    assert(store.attentionEvents.count == 3 && store.harnessGroups.reduce(0, { $0 + $1.attentionCount }) == 3,
+           "Badges and rows must count unread conversations, excluding read history and resumed turns")
+    assert(store.harnessGroups.reduce(0, { $0 + $1.runningCount }) == 7
+           && PetMood.current(data: store.data, error: nil) == .working(taskCount: 7),
+           "The running icon must count exactly the sessions shown under each harness")
+    assert(!store.harnessGroups.flatMap(\.conversations).contains { $0.sessionId == "read-session" })
     // 紧凑菜单仍要保留全部任务的精确跳转，且子菜单和提示也必须遵守演示模式。
     func menuItems(_ menu: NSMenu) -> [NSMenuItem] {
         menu.items.flatMap { [$0] + ($0.submenu.map(menuItems) ?? []) }
@@ -168,7 +202,7 @@ func renderExperience() throws {
     MenuBarPresentation.appendTools(to: toolMenu, tools: store.data!.tools, target: menuTarget,
                                     openTool: Selector(("openTool:")), openConnections: Selector(("openConnections")),
                                     displayTitle: { store.displayTitle($0) })
-    let destinations = menuItems(toolMenu).compactMap { $0.representedObject as? ToolDestination }
+    let destinations = menuItems(toolMenu).compactMap { $0.representedObject as? HarnessConversation }
     assert(Set(destinations.compactMap(\.sessionId)) == Set(sessionIDs),
            "Overflow must use activeItems, not the one-item busyItems preview")
     assert(destinations.allSatisfy { $0.toolKey == "codex-ide" })
@@ -177,8 +211,8 @@ func renderExperience() throws {
     MenuBarPresentation.appendTools(to: privateMenu, tools: store.data!.tools, target: menuTarget,
                                     openTool: Selector(("openTool:")), openConnections: Selector(("openConnections")),
                                     displayTitle: { store.displayTitle($0) })
-    for item in menuItems(privateMenu) where item.representedObject is ToolDestination {
-        assert(item.title == "任务标题已隐藏" && item.toolTip?.hasPrefix("任务标题已隐藏") == true)
+    for item in menuItems(privateMenu) where item.representedObject is HarnessConversation {
+        assert(item.title.hasPrefix("任务标题已隐藏 · ") && item.toolTip?.hasPrefix("任务标题已隐藏") == true)
     }
     settings.experience.privacyMode = false
     var failedTool = store.data!.tools[1]
@@ -199,7 +233,10 @@ func renderExperience() throws {
     let desktopMenu = integratedMenu.items.first { $0.title == "桌面显示" }!.submenu!
     assert(desktopMenu.items.contains { $0.action == Selector(("openTaskCenter")) && $0.keyEquivalent == "1" })
     assert(desktopMenu.items.contains { $0.action == Selector(("togglePin")) && $0.keyEquivalent == "t" })
-    assert(integratedMenu.items.contains { $0.action == Selector(("openHistory")) && $0.keyEquivalent == "2" })
+    assert(!integratedMenu.items.contains { $0.action == Selector(("openHistory")) || $0.title.hasPrefix("最近事件") })
+    let groupedMenuRows = menuItems(integratedMenu).compactMap { $0.representedObject as? HarnessConversation }
+    assert(groupedMenuRows.contains { $0.phase == "working" } && groupedMenuRows.contains { $0.phase == "ended" },
+           "Native menu must include current and completed conversations under each harness")
     print("PASS: native menu preserves all seven session routes, redacts overflow titles and routes failures to diagnosis")
     @discardableResult
     func save<V: View>(_ name: String, content: V, scheme: ColorScheme) throws -> CGSize {
@@ -236,14 +273,24 @@ func renderExperience() throws {
     let hostTool = ToolStatus(key: "claude", letter: "L", name: "Claude Code", state: "busy",
                               busyCount: 1, busyItems: [BusyItem(id: "host-only", title: "核对构建输出")],
                               detail: "", latestTitle: nil, latestAge: nil, quota: nil)
+    let sessionHistory = [
+        TaskRecord(id: "codex-done", toolKey: "codex-ide", toolName: "Codex App", sessionId: codexID,
+                   title: "合并远程更新并验证发布", phase: "ended", timestamp: now - 90,
+                   evidence: "explicit", acknowledged: false, resolved: false),
+        TaskRecord(id: "kimi-done", toolKey: "kimi", toolName: "Kimi Code / Web", sessionId: "kimi-finished",
+                   title: "导出产品状态与核对结果", phase: "ended", timestamp: now - 120,
+                   evidence: "explicit", acknowledged: true, resolved: false)
+    ]
     func sessionSections(webAvailable: Bool) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            ForEach([store.data!.tools[0], kimiTool, hostTool], id: \.key) { tool in
-                StatusToolSection(tool: tool, kimiWebAvailable: webAvailable,
+            ForEach(HarnessConversations.groups(tools: [store.data!.tools[0], kimiTool, hostTool],
+                                                 events: sessionHistory)) { group in
+                StatusToolSection(group: group, kimiWebAvailable: webAvailable,
                                   displayTitle: { settings.experience.privacyMode ? "任务标题已隐藏" : $0 },
-                                  openDestination: { print("SESSION_ROUTE: \($0.toolKey) / \($0.sessionId ?? "application")") })
+                                  openDestination: { print("SESSION_ROUTE: \($0.toolKey) / \($0.sessionId ?? "application")") },
+                                  openConversation: { print("SESSION_ROUTE: \($0.toolKey) / \($0.sessionId ?? "application")") })
             }
-        }.padding(14).frame(width: 300)
+        }.padding(14).frame(width: PanelView.panelWidth)
     }
     for scheme in [ColorScheme.light, .dark] {
         try save("session-list-" + (scheme == .light ? "light" : "dark"),
@@ -259,7 +306,7 @@ func renderExperience() throws {
     if CommandLine.arguments.contains("--interactive-sessions") {
         NSApp.setActivationPolicy(.regular)
         let hosted = NSHostingView(rootView: sessionSections(webAvailable: true).background(Color.white))
-        let window = NSWindow(contentRect: NSRect(x: 200, y: 200, width: 300, height: 500),
+        let window = NSWindow(contentRect: NSRect(x: 200, y: 200, width: PanelView.panelWidth, height: 500),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "状态会话交互验证"
         window.acceptsMouseMovedEvents = true
@@ -271,6 +318,29 @@ func renderExperience() throws {
         window.orderOut(nil)
         window.close()
     }
+    if CommandLine.arguments.contains("--interactive-tabs") {
+        let suite = "io.github.stubsx.lingmou.tabs.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set("status", forKey: "panelTab")
+        NSApp.setActivationPolicy(.regular)
+        let hosted = NSHostingView(rootView: PanelView(store: store).defaultAppStorage(defaults)
+            .background(Color.white)
+            .onReceive(NotificationCenter.default.publisher(for: .statusUpdated)) { _ in
+                print("PANEL_PAGE: \(defaults.string(forKey: "panelTab") ?? "status")")
+            })
+        let window = TaskPanel(contentRect: NSRect(x: 200, y: 200, width: PanelView.panelWidth, height: 440),
+                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.navigationDefaults = defaults
+        window.title = "看板横向导航验证"
+        window.acceptsMouseMovedEvents = true
+        window.isReleasedWhenClosed = false
+        window.contentView = hosted
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.run()
+        window.close()
+    }
     // A fresh collector snapshot must not make an old quota appear current.
     let staleStore = StatusStore(collectorPath: nil, settings: settings, storageDirectory: temporary.appendingPathComponent("stale"))
     staleStore.data = try decoder.decode(StatusData.self, from: Data(json.replacingOccurrences(
@@ -280,6 +350,38 @@ func renderExperience() throws {
     let staleDefaults = UserDefaults(suiteName: staleSuite)!
     staleDefaults.set("quota", forKey: "panelTab")
     try save("quota-stale", content: PanelView(store: staleStore).defaultAppStorage(staleDefaults).background(Color.white), scheme: .light)
+    for scenario in ["cached", "empty", "current"] {
+        let current = scenario == "current"
+        let monthly = QuotaWindow(kind: "month", label: "本月", usedPercent: 5,
+                                  resetsAt: Int(now + 22 * 86_400), windowMinutes: 43_200,
+                                  components: [QuotaComponent(key: "kimi", label: "Kimi", usedPercent: 1),
+                                               QuotaComponent(key: "code", label: "Code", usedPercent: 4)])
+        let quota = ToolQuota(plan: "Allegro", windows: scenario == "empty" ? [] : [monthly],
+                              updatedAt: Int(scenario == "cached" ? now - 172_800 : now),
+                              notice: current ? nil : "新版 Kimi 已加密本地凭证，月度额度暂不可读（可在设置开启解密）")
+        var kimi = ToolStatus(key: "kimi-work", letter: "W", name: "Kimi Work", state: "idle", busyCount: 0,
+                              busyItems: [], detail: "", latestTitle: nil, latestAge: nil, quota: quota)
+        kimi.health = ToolHealth(state: "ready", message: "", checkedAt: now,
+                                 quotaState: current ? "ready" : (scenario == "empty" ? "unavailable" : "stale"))
+        staleStore.data = StatusData(updatedAt: "", tools: [kimi], usage: nil, usageMerged: nil, sync: nil)
+        try save("quota-kimi-" + scenario, content: PanelView(store: staleStore).defaultAppStorage(staleDefaults)
+            .background(Color.white), scheme: .light)
+    }
+    for scheme in [ColorScheme.light, .dark] {
+        let quota = ToolQuota(plan: "Allegro", windows: [
+            QuotaWindow(kind: "week", label: "7天", usedPercent: 11, resetsAt: Int(now + 86_400),
+                        windowMinutes: 10_080, components: nil),
+            QuotaWindow(kind: "5h", label: "5小时", usedPercent: 3, resetsAt: Int(now + 3_600),
+                        windowMinutes: 300, components: nil)
+        ], updatedAt: Int(now - 900), notice: nil)
+        var kimi = ToolStatus(key: "kimi", letter: "K", name: "Kimi Code", state: "idle", busyCount: 0,
+                              busyItems: [], detail: "", latestTitle: nil, latestAge: nil, quota: quota)
+        kimi.health = ToolHealth(state: "ready", message: "", checkedAt: now, quotaState: "stale")
+        staleStore.data = StatusData(updatedAt: "", tools: [kimi], usage: nil, usageMerged: nil, sync: nil)
+        try save("quota-kimi-code-history-" + (scheme == .light ? "light" : "dark"),
+                 content: PanelView(store: staleStore).defaultAppStorage(staleDefaults)
+                    .background(scheme == .light ? Color.white : Color(red: 0.09, green: 0.11, blue: 0.16)), scheme: scheme)
+    }
     staleDefaults.removePersistentDomain(forName: staleSuite)
     // Exercise the real store pipeline with isolated preferences and a captured notification sink.
     let pipelineDir = temporary.appendingPathComponent("pipeline")
@@ -357,16 +459,24 @@ func renderExperience() throws {
     reviewDefaults.set("status", forKey: "panelTab")
     try save("event-before-reading", content: PanelView(store: reviewStore).defaultAppStorage(reviewDefaults)
         .background(Color.white), scheme: .light)
-    reviewStore.openEvent(waitingRecord)
+    let waitingConversation = reviewStore.harnessGroups.flatMap(\.conversations).first { $0.sessionId == waitingRecord.sessionId }!
+    reviewStore.openConversation(waitingConversation)
     assert(reviewStore.attentionEvents.count == 2 && openedTools == ["codex-ide"])
+    assert(!reviewStore.harnessGroups.flatMap(\.conversations).contains { $0.sessionId == waitingRecord.sessionId },
+           "Viewing a waiting reminder removes its row while leaving the original task unchanged")
     assert(openedSessions.last! == waitingRecord.sessionId)
     assert(reviewNotifications.first?["session_id"] == nil, "A batch notification must not carry a single session")
     assert(reviewStore.recentEvents.first { $0.id == waitingRecord.id }?.resolved == false)
-    reviewStore.openEvent(endedRecord)
+    reviewStore.openConversation(reviewStore.harnessGroups.flatMap(\.conversations).first { $0.sessionId == endedRecord.sessionId }!)
     assert(reviewStore.attentionEvents.count == 1 && openedTools.count == 2)
     var historyOpened = 0
     reviewStore.openNotification(["event_ids": [interruptedRecord.id]]) { historyOpened += 1 }
-    assert(reviewStore.attentionEvents.isEmpty && historyOpened == 1 && openedTools.count == 2)
+    assert(reviewStore.attentionEvents.count == 1 && historyOpened == 1 && openedTools.count == 2,
+           "A notification that opens only the list must keep its result available")
+    reviewStore.openConversation(reviewStore.harnessGroups.flatMap(\.conversations).first { $0.sessionId == interruptedRecord.sessionId }!)
+    assert(reviewStore.attentionEvents.isEmpty && openedTools.count == 3)
+    assert(reviewStore.harnessGroups.flatMap(\.conversations).isEmpty,
+           "After reading results the live list is empty, even though the journal is preserved")
     assert(reviewStore.recentEvents.count == 3 && reviewStore.recentEvents.allSatisfy(\.acknowledged))
     try save("event-after-reading", content: PanelView(store: reviewStore).defaultAppStorage(reviewDefaults)
         .background(Color.white), scheme: .light)
@@ -379,14 +489,18 @@ func renderExperience() throws {
     reviewStore.accept(snapshot([("later", "ended")], at: now + 4), now: now + 4)
     // Quota/legacy notifications have no event IDs and must not clear unrelated events.
     reviewStore.openNotification(["tool": "codex-ide"]) { historyOpened += 1 }
-    assert(reviewStore.attentionEvents.count == 3 && openedTools.count == 3)
+    assert(reviewStore.attentionEvents.count == 3 && openedTools.count == 4)
     assert(openedSessions.last! == nil, "Quota notifications must not select a conversation")
     reviewStore.openNotification(["event_ids": batchIDs]) { historyOpened += 1 }
+    assert(reviewStore.attentionEvents.count == 3, "Batch notification opens the list without hiding unread results")
+    for row in reviewStore.harnessGroups.flatMap(\.conversations) where row.eventIDs.contains(where: batchIDs.contains) {
+        reviewStore.openConversation(row)
+    }
     assert(reviewStore.attentionEvents.count == 1 && reviewStore.attentionEvents[0].sessionId == "later")
     reviewStore.openNotification(["event_ids": [reviewStore.attentionEvents[0].id], "tool": "codex-ide"]) {
         historyOpened += 1
     }
-    assert(reviewStore.attentionEvents.isEmpty && openedTools.count == 4 && historyOpened == 2)
+    assert(reviewStore.attentionEvents.isEmpty && openedTools.count == 7 && historyOpened == 2)
     assert(openedSessions.last! == "later", "Legacy notification must resolve its own event's session")
     reviewStore.openNotification(["event_ids": ["expired-event"], "tool": "codex-ide", "session_id": codexID]) {
         historyOpened += 1
@@ -399,11 +513,29 @@ func renderExperience() throws {
     RunLoop.current.run(until: Date().addingTimeInterval(4.2))
     assert(reviewNotifications.count == 1, "Read events must be removed from queued notification batches")
     print("PASS: shared event-open action, scoped notification reads, waiting semantics, persistence and queued-reminder cancellation")
+    let groupedStore = StatusStore(collectorPath: nil, settings: reviewSettings,
+                                   storageDirectory: temporary.appendingPathComponent("grouped-reads"),
+                                   notificationSink: { _, _, _ in },
+                                   eventOpener: { openedSessions.append($0.sessionId) })
+    groupedStore.accept(snapshot([], at: now), now: now)
+    groupedStore.accept(snapshot([("same", "ended"), ("unrelated", "ended")], at: now + 1), now: now + 1)
+    groupedStore.accept(snapshot([("same", "waiting_input")], at: now + 2), now: now + 2)
+    let oldRow = groupedStore.harnessGroups.flatMap(\.conversations).first { $0.sessionId == "same" }!
+    assert(oldRow.eventIDs.count == 2)
+    groupedStore.accept(snapshot([("same", "ended")], at: now + 3), now: now + 3)
+    groupedStore.openConversation(oldRow)
+    assert(openedSessions.last! == "same")
+    assert(groupedStore.recentEvents.filter { oldRow.eventIDs.contains($0.id) }.allSatisfy(\.acknowledged))
+    assert(groupedStore.attentionEvents.contains { $0.sessionId == "same" && $0.timestamp == now + 3 },
+           "An event arriving after the clicked row was rendered must remain unread")
+    assert(groupedStore.attentionEvents.contains { $0.sessionId == "unrelated" },
+           "Opening one conversation cannot acknowledge another conversation")
+    print("PASS: grouped conversation navigation preserves session IDs and scopes acknowledgements to displayed turns")
     for (name, tab, scheme) in [
         ("tasks-compact-light", "status", ColorScheme.light),
         ("status-attention-dark", "status", ColorScheme.dark),
-        ("tasks-expanded-dark", "details", ColorScheme.dark),
-        ("history-light", "history", ColorScheme.light),
+        ("legacy-details-dark", "details", ColorScheme.dark),
+        ("legacy-history-light", "history", ColorScheme.light),
         ("usage-light", "usage", ColorScheme.light),
         ("quota-dark", "quota", ColorScheme.dark)
     ] {
@@ -415,7 +547,10 @@ func renderExperience() throws {
         defaults.set(true, forKey: "panelExpanded")
         let size = try save(name, content: PanelView(store: store).defaultAppStorage(defaults)
             .background(scheme == .light ? Color.white : Color(red: 0.09, green: 0.11, blue: 0.16)), scheme: scheme)
-        if tab == "status" { assert(size.width == 300 && size.height <= 420) }
+        if ["status", "details", "history"].contains(tab) {
+            assert(size.width == 380 && size.height <= 430)
+            assert(defaults.string(forKey: "panelTab") == "status", "Removed pages must restore the unified status page")
+        }
     }
     let overviewStore = StatusStore(collectorPath: nil, settings: settings,
                                    storageDirectory: temporary.appendingPathComponent("overview"))
@@ -444,7 +579,7 @@ func renderExperience() throws {
         overviewStore.lastCollectedAt = scenario == "error" ? now - 100 : now
         let size = try save("status-" + scenario, content: PanelView(store: overviewStore)
             .defaultAppStorage(overviewDefaults).background(Color.white), scheme: .light)
-        assert(size.width == 300 && size.height <= 420, "Summary must stay bounded, even with 240 active tasks")
+        assert(size.width == 380 && size.height <= 430, "Summary must stay bounded, even with 240 active tasks")
     }
     settings.experience.privacyMode = false
     for tab in ["general", "connections", "notify", "data", "welcome"] {
@@ -456,8 +591,8 @@ func renderExperience() throws {
             .defaultAppStorage(defaults).frame(height: 740).background(Color.white), scheme: .light)
     }
     settings.experience.privacyMode = true
-    try save("privacy-light", content: TaskEventRows(store: store, events: store.recentEvents, expanded: true)
-        .padding(20).frame(width: 470).background(Color.white), scheme: .light)
+    try save("privacy-light", content: PanelView(store: store).defaultAppStorage(overviewDefaults)
+        .background(Color.white), scheme: .light)
     try save("ball-attention", content: FloatingBallView(store: store, onToggle: {}).padding(16)
         .background(Color.white), scheme: .light)
     let petFolder = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
@@ -493,28 +628,72 @@ func renderExperience() throws {
     assert(keyboardPanel.canBecomeKey, "Status panel must support keyboard focus")
     let keyboardHost = NSHostingView(rootView: PanelView(store: store).defaultAppStorage(overviewDefaults))
     keyboardPanel.contentView = keyboardHost
-    keyboardPanel.setFrame(NSRect(x: -10000, y: -10000, width: 300, height: 300), display: false)
+    keyboardPanel.setFrame(NSRect(x: -10000, y: -10000, width: PanelView.panelWidth, height: 300), display: false)
     keyboardPanel.makeKeyAndOrderFront(nil)
     RunLoop.current.run(until: Date().addingTimeInterval(0.1))
-    for (character, code, expected) in [("2", UInt16(19), "usage"), ("3", 20, "heat"), ("4", 21, "quota"), ("5", 23, "history"),
-                                        ("1", 18, "status"), ("e", 14, "details"), ("e", 14, "status")] {
+    for (character, code, expected) in [("2", UInt16(19), "usage"), ("3", 20, "heat"), ("4", 21, "quota"),
+                                        ("1", 18, "status")] {
         let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command, timestamp: 0,
                                     windowNumber: keyboardPanel.windowNumber, context: nil, characters: character,
                                     charactersIgnoringModifiers: character, isARepeat: false, keyCode: code)!
         let handled = keyboardPanel.performKeyEquivalent(with: event)
         RunLoop.current.run(until: Date().addingTimeInterval(0.1))
         assert(handled && overviewDefaults.string(forKey: "panelTab") == expected, "Panel shortcut ⌘\(character) must open \(expected)")
-        let expectedWidth: CGFloat = expected == "status" ? 300 : (expected == "details" ? 380 : 340)
-        assert(keyboardHost.fittingSize.width == expectedWidth && keyboardHost.fittingSize.height <= 420,
-               "Keyboard navigation must also update the fitted panel size")
+        let expectedWidth: CGFloat = 380
+        assert(keyboardHost.fittingSize.width == expectedWidth && keyboardHost.fittingSize.height <= 430,
+               "Switching among all four pages must keep the same wider panel width")
     }
-    overviewDefaults.set("details", forKey: "panelTab")
+    for character in ["5", "e"] {
+        let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command, timestamp: 0,
+                                    windowNumber: keyboardPanel.windowNumber, context: nil, characters: character,
+                                    charactersIgnoringModifiers: character, isARepeat: false, keyCode: 0)!
+        _ = keyboardPanel.performKeyEquivalent(with: event)
+        assert(overviewDefaults.string(forKey: "panelTab") == "status", "Removed page shortcuts cannot reopen a details page")
+    }
+    func nativeScrollViews(_ view: NSView) -> [NSScrollView] {
+        (view as? NSScrollView).map { [$0] } ?? view.subviews.flatMap(nativeScrollViews)
+    }
+    let horizontal = nativeScrollViews(keyboardHost).first {
+        ($0.documentView?.frame.width ?? 0) > $0.contentView.bounds.width + 20
+    }!
+    assert(horizontal.contentView.bounds.width > 155 && horizontal.contentView.bounds.width < 175,
+           "The tab strip must expose about three-and-a-half compact buttons")
+    // Fit the fixture as the app does so the tab strip stays inside its window.
+    keyboardPanel.setContentSize(keyboardHost.fittingSize)
+    keyboardHost.layoutSubtreeIfNeeded()
+    keyboardPanel.center()
+    RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+    func wheelEvent(_ delta: Int32) -> NSEvent {
+        let cg = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2,
+                         wheel1: 0, wheel2: delta, wheel3: 0)!
+        let event = FixtureWheelEvent()
+        event.source = NSEvent(cgEvent: cg)!
+        event.targetWindow = keyboardPanel
+        event.targetNumber = keyboardPanel.windowNumber
+        event.point = horizontal.convert(NSPoint(x: horizontal.bounds.midX, y: horizontal.bounds.midY), to: nil)
+        return event
+    }
+    // Dispatch only inside the fixture, with window-local coordinates. Never post
+    // input globally or depend on the fixture's position on the user's desktop.
+    let beforeScroll = horizontal.contentView.bounds.origin.x
+    horizontal.scrollWheel(with: wheelEvent(-90))
+    RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+    assert(horizontal.contentView.bounds.origin.x > beforeScroll,
+           "Native horizontal wheel/trackpad scrolling must reveal the offscreen page buttons")
+    assert(overviewDefaults.string(forKey: "panelTab") == "status", "Scrolling reveals choices without changing pages")
+    horizontal.scrollWheel(with: wheelEvent(90))
+    RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+    assert(horizontal.contentView.bounds.origin.x <= beforeScroll + 1,
+           "Reverse horizontal scrolling must reveal the first page again")
+    overviewDefaults.set("quota", forKey: "panelTab")
+    RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+    assert(horizontal.contentView.bounds.origin.x > 0, "Keyboard selection must reveal its selected tab")
     let escape = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
                                  windowNumber: keyboardPanel.windowNumber, context: nil, characters: "\u{1b}",
                                  charactersIgnoringModifiers: "\u{1b}", isARepeat: false, keyCode: 53)!
     assert(keyboardPanel.performKeyEquivalent(with: escape) && overviewDefaults.string(forKey: "panelTab") == "status")
     keyboardPanel.close()
-    print("PASS: 8 native panel keyboard shortcuts and fitted sizing after navigation")
-    print("PASS: rendered isolated native experience snapshots, session links, event reading, bounded summaries, light/dark, task details, privacy, settings and attention badge")
+    print("PASS: four direct page shortcuts, legacy-page migration, removed shortcuts and native horizontal tab scrolling")
+    print("PASS: rendered isolated native experience snapshots, session links, event reading, bounded summaries, light/dark, inline page tabs, privacy, settings and attention badge")
 }
 if #available(macOS 13, *) { try MainActor.assumeIsolated { try renderExperience() } }

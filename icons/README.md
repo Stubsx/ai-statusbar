@@ -4,6 +4,10 @@
 
 ## 1. App 图标（静态资产）
 
+当前图标为「晴蓝」圆球：透明背景、天蓝水洗色层与白色胶囊眼睛。
+`scripts/render-app-icon.swift` 复用 `BallInkDrawing.swift` 的静帧算法，以
+1024px 原生分辨率导出，眼睛采用悬浮球正视状态的比例；不包含运行环或计数。
+
 | 路径 | 角色 |
 | --- | --- |
 | `AppIcon-1024.png` | 源图，1024×1024，所有尺寸的唯一来源 |
@@ -14,10 +18,10 @@
 更新 App 图标的流程：
 
 ```bash
-# 1. 用新源图重新生成各尺寸（放进 AppIcon.iconset/，命名保持不变）
-# 2. 重新生成 icns
-iconutil -c icns AppIcon.iconset -o AppIcon.icns
-# 3. 重新构建验证
+# 1. 在仓库根目录运行，生成源图、全套尺寸及 icns
+bash scripts/generate-app-icon.sh
+# 2. 检查 output/app-icon/preview.png 的浅色/深色与小尺寸预览
+# 3. 重新构建验证（构建本身只复制已生成的静态图标）
 ./AIStatusBar/build.sh && open "AIStatusBar/灵眸.app"
 ```
 

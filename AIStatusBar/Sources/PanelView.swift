@@ -6,6 +6,7 @@ import SwiftUI
 // MARK: - 桌面浮窗内容
 
 struct PanelView: View {
+    static let panelWidth: CGFloat = 380
     @ObservedObject var store: StatusStore
     @Environment(\.colorScheme) private var colorScheme
     var bare = false  // true = 背景由外层 NSGlassEffectView 提供，SwiftUI 不再画背景
@@ -16,9 +17,9 @@ struct PanelView: View {
     /// 用量时间范围：today=今日（默认） 7d=近七日 30d=近30日
     @AppStorage("usageRange") private var usageRange = "today"
     @AppStorage("usageBreakdown") private var usageBreakdown = "tools"
-    @State private var historyTool = "all"
-    @State private var clearHistoryConfirmation = false
     @State private var kimiWebAvailable = false
+
+    private var page: PanelPage { PanelPage.restored(tab) }
 
     /// 当前展示的用量数据：开启同步且选择"全部"时用合并视图，否则本机
     private var usageForDisplay: UsageData? {
@@ -131,43 +132,38 @@ struct PanelView: View {
                 if store.settings.experience.privacyMode {
                     Image(systemName: "eye.slash").foregroundColor(.secondary).help("演示模式：任务标题已隐藏")
                 }
-                pageMenu
+                PanelPageTabs(selection: Binding(get: { page }, set: { tab = $0.rawValue }))
                 Button { (NSApp.delegate as? AppDelegate)?.showSettings() } label: {
                     Image(systemName: "slider.horizontal.3").font(.system(size: 12))
                 }.buttonStyle(.borderless).help("设置")
             }
             Divider().opacity(0.5)
-            if tab == "status" {
+            if page == .status {
                 FittedPanelScrollView {
                     summaryView.padding(.trailing, 2)
                 }
             } else {
-                FittedPanelScrollView {
+                // 配额页卡片多，限高放宽到 480，少滚动；用量/活跃保持 320
+                FittedPanelScrollView(maxHeight: page == .quota ? 480 : 320) {
                     VStack(alignment: .leading, spacing: 10) {
-                        if tab == "heat" { heatView }
-                        else if tab == "usage" { usageView }
-                        else if tab == "quota" { quotaView }
-                        else if tab == "history" { historyView }
-                        else { statusView }
+                        if page == .heat { heatView }
+                        else if page == .usage { usageView }
+                        else if page == .quota { quotaView }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.trailing, 2)
                 }
             }
-            HStack {
-                FreshnessView(timestamp: store.lastCollectedAt)
-                Spacer()
-                if tab != "status" {
-                    Button("返回状态") { tab = "status" }
-                        .font(.system(size: 10)).buttonStyle(.borderless)
-                        .keyboardShortcut(.escape, modifiers: [])
-                }
-            }
         }
         .padding(14)
-        .frame(width: tab == "status" ? 300 : (tab == "details" ? 380 : 340))
+        .frame(width: Self.panelWidth)
         .modifier(ConditionalGlass(bare: bare))
-        .onAppear { applyLevel() }
+        // 「返回状态」按钮行已移除（顶栏页签可直接点回），Esc 快捷键保留
+        .background(Button("") { tab = "status" }.keyboardShortcut(.escape, modifiers: []).hidden())
+        .onAppear {
+            if tab != page.rawValue { tab = page.rawValue }
+            applyLevel()
+        }
         .task(id: store.lastCollectedAt) {
             guard store.data?.tools.contains(where: { $0.key == "kimi" && $0.state != "off" }) == true else {
                 kimiWebAvailable = false
@@ -180,27 +176,16 @@ struct PanelView: View {
             guard !Task.isCancelled else { return }
             kimiWebAvailable = available
         }
-        .onChange(of: tab) { _ in
+        .onChange(of: tab) { value in
+            let restored = PanelPage.restored(value).rawValue
+            if value != restored { tab = restored }
             DispatchQueue.main.async {
                 NotificationCenter.default.post(name: .statusUpdated, object: nil)
             }
         }
     }
 
-    private var visibleTools: [ToolStatus] {
-        (store.data?.tools.filter { $0.state != "off" || $0.health?.state == "error" } ?? []).sorted {
-            func priority(_ tool: ToolStatus) -> Int {
-                tool.health?.state == "error" ? 0 : (tool.state == "busy" ? 1 : 2)
-            }
-            return priority($0) == priority($1) ? $0.key < $1.key : priority($0) < priority($1)
-        }
-    }
-
-    private var summaryToolLimit: Int {
-        store.attentionEvents.isEmpty && store.collectorError == nil ? 4 : 3
-    }
-
-    /// 会话按工具紧凑分组；展开后仍受外层滚动区域限高。
+    /// 当前会话按工具平铺分组，外层滚动区域限制面板高度。
     private var summaryView: some View {
         VStack(alignment: .leading, spacing: 8) {
             if let error = store.collectorError {
@@ -209,46 +194,21 @@ struct PanelView: View {
                         .font(.system(size: 11)).foregroundColor(.orange)
                 }.buttonStyle(.plain).help(error)
             }
-            if let record = store.attentionEvents.first {
-                HStack(spacing: 8) {
-                    Button { store.openEvent(record) } label: {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Label("\(record.toolName) · \(record.label)", systemImage: record.symbol)
-                                .font(.system(size: 10)).foregroundColor(record.waiting || record.phase == "failed" ? .orange : .secondary)
-                                .lineLimit(1)
-                            Text(store.displayTitle(record.title)).font(.system(size: 12, weight: .medium))
-                                .lineLimit(1)
-                        }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
-                    }.buttonStyle(.plain)
-                        .accessibilityIdentifier("open-event-\(record.id)")
-                        .help("\(store.displayTitle(record.title))\n\(NotificationRouter.destinationLabel(forToolKey: record.toolKey, sessionId: record.sessionId))，并清除此条提醒")
-                    Button { historyTool = "all"; tab = "history" } label: {
-                        HStack(spacing: 3) {
-                            Text("\(store.attentionEvents.count) 条")
-                            Image(systemName: "chevron.right").font(.system(size: 8, weight: .semibold))
-                        }.font(.system(size: 10)).fixedSize()
-                    }.buttonStyle(.borderless).help("查看未读事件与历史记录")
-                        .accessibilityLabel("查看全部 \(store.attentionEvents.count) 条未读事件")
-                }
-                .padding(9)
-                .background(RoundedRectangle(cornerRadius: 9).fill(
-                    record.waiting || record.phase == "failed" ? Color.orange.opacity(0.07) : Color.primary.opacity(0.035)))
+            if let error = store.historyError {
+                Text(error).font(.system(size: 10)).foregroundColor(.orange)
             }
-            if visibleTools.isEmpty { emptyStatus }
-            ForEach(Array(visibleTools.prefix(summaryToolLimit)), id: \.key) { tool in
-                StatusToolSection(tool: tool, kimiWebAvailable: kimiWebAvailable,
-                                  displayTitle: { store.displayTitle($0) })
-            }
-            if visibleTools.count > summaryToolLimit {
-                Button("还有 \(visibleTools.count - summaryToolLimit) 个工具 · 查看全部") { tab = "details" }
-                    .font(.system(size: 10)).buttonStyle(.borderless)
+            if store.harnessGroups.isEmpty { emptyStatus }
+            ForEach(store.harnessGroups) { group in
+                StatusToolSection(group: group, kimiWebAvailable: kimiWebAvailable,
+                                  displayTitle: { store.displayTitle($0) },
+                                  openConversation: store.openConversation)
             }
         }
     }
 
     private var emptyStatus: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(store.data == nil ? "正在观察你的 AI 工具…" : "当前没有运行中的工具")
+            Text(store.data == nil ? "正在观察你的 AI 工具…" : "当前没有会话")
                 .font(.system(size: 12, weight: .medium))
             Text("开始工作后，状态会自动出现在这里。")
                 .font(.system(size: 11)).foregroundColor(.secondary)
@@ -257,83 +217,12 @@ struct PanelView: View {
         }.padding(.vertical, 4)
     }
 
-    private var statusView: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if let error = store.collectorError {
-                Label(error, systemImage: "exclamationmark.triangle").font(.system(size: 11)).foregroundColor(.orange)
-                Button("查看连接与诊断") { (NSApp.delegate as? AppDelegate)?.showSettings(tab: "connections") }
-            }
-            if visibleTools.isEmpty { emptyStatus }
-            ForEach(visibleTools, id: \.key) { tool in
-                StatusToolSection(tool: tool, kimiWebAvailable: kimiWebAvailable, detailed: true,
-                                  displayTitle: { store.displayTitle($0) })
-            }
-        }
-    }
-
-    private var historyView: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Picker("工具", selection: $historyTool) {
-                    Text("全部工具").tag("all")
-                    ForEach(store.data?.tools ?? [], id: \.key) { tool in Text(tool.name).tag(tool.key) }
-                }.labelsHidden().frame(maxWidth: 160)
-                Spacer()
-                Button("清空") { clearHistoryConfirmation = true }
-                    .disabled(store.recentEvents.isEmpty && store.historyError == nil).buttonStyle(.borderless)
-            }
-            Text("未读优先 · 本机保留 7 天 / 200 条").font(.system(size: 10)).foregroundColor(.secondary)
-            if let error = store.historyError { Text(error).font(.system(size: 10)).foregroundColor(.orange) }
-            if historyEvents.isEmpty {
-                Text("还没有事件。任务结束、等待或中断后会出现在这里。")
-                    .font(.system(size: 11)).foregroundColor(.secondary)
-            }
-            TaskEventRows(store: store, events: historyEvents, expanded: true)
-        }
-        .alert("清空最近事件？", isPresented: $clearHistoryConfirmation) {
-            Button("取消", role: .cancel) {}
-            Button("清空", role: .destructive) { store.clearHistory() }
-        } message: {
-            Text("仅清除灵眸本机历史，不影响原工具的任务。仍在等待回答或确认的任务会保留，旧事件不会再次推送。")
-        }
-    }
-
     private var rangeModels: [String: UsageEntry]? {
         guard let usage = usageForDisplay else { return nil }
         switch usageRange {
         case "7d": return usage.weekly?.models
         case "30d": return usage.monthly?.models
         default: return usage.models
-        }
-    }
-
-    private var pageMenu: some View {
-        Menu {
-            Button("状态速览") { tab = "status" }.keyboardShortcut("1", modifiers: .command)
-            Button("Token 用量") { tab = "usage" }.keyboardShortcut("2", modifiers: .command)
-            Button("活跃热力") { tab = "heat" }.keyboardShortcut("3", modifiers: .command)
-            Button("账号配额") { tab = "quota" }.keyboardShortcut("4", modifiers: .command)
-            Divider()
-            Button("最近事件") { historyTool = "all"; tab = "history" }.keyboardShortcut("5", modifiers: .command)
-            Button(tab == "details" ? "返回状态速览" : "运行详情") {
-                tab = tab == "details" ? "status" : "details"
-            }.keyboardShortcut("e", modifiers: .command)
-        } label: {
-            Text(["status": "状态", "usage": "用量", "heat": "活跃", "quota": "配额",
-                  "history": "最近事件", "details": "运行详情"][tab] ?? "状态")
-                .font(.system(size: 11, weight: .medium))
-        }
-        .menuStyle(.borderlessButton)
-        .fixedSize()
-        .help("查看用量、配额和更多信息（⌘1–⌘5）")
-        .accessibilityLabel("切换状态、用量与记录")
-    }
-
-    private var historyEvents: [TaskRecord] {
-        store.recentEvents.filter { historyTool == "all" || $0.toolKey == historyTool }.sorted {
-            if $0.needsAttention != $1.needsAttention { return $0.needsAttention }
-            if $0.needsAttention && $0.priority != $1.priority { return $0.priority < $1.priority }
-            return $0.timestamp > $1.timestamp
         }
     }
 
@@ -410,46 +299,57 @@ struct PanelView: View {
                         .padding(.vertical, 4)
                 }
                 ForEach(withQuota, id: \.key) { t in
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack(spacing: 6) {
-                            Text(t.key == "codex-ide" ? "Codex" :
-                                 t.name)
-                                .font(.system(size: 12, weight: .semibold))
-                                .foregroundColor(.primary.opacity(0.9))
-                            if let plan = t.quota?.plan, !plan.isEmpty {
-                                Text(plan)
-                                    .font(.system(size: 9, weight: .medium))
-                                    .foregroundColor(.secondary)
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(Capsule().fill(Color.primary.opacity(0.08)))
+                    TimelineView(.periodic(from: .now, by: 10)) { context in
+                        let presentation = QuotaPresentation(tool: t, now: context.date.timeIntervalSince1970)
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 6) {
+                                Text(t.key == "codex-ide" ? "Codex" : t.name)
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundColor(.primary.opacity(0.9))
+                                if !presentation.windows.isEmpty, let plan = t.quota?.plan, !plan.isEmpty {
+                                    Text(plan)
+                                        .font(.system(size: 9, weight: .medium))
+                                        .foregroundColor(.secondary)
+                                        .padding(.horizontal, 6).padding(.vertical, 2)
+                                        .background(Capsule().fill(Color.primary.opacity(0.08)))
+                                }
+                                Spacer()
+                                if presentation.isHistorical {
+                                    Text("历史快照").font(.system(size: 10)).foregroundColor(.secondary)
+                                } else if presentation.windows.isEmpty {
+                                    Button("读取设置") {
+                                        (NSApp.delegate as? AppDelegate)?.showSettings(tab: "connections")
+                                    }
+                                    .font(.system(size: 10)).buttonStyle(.borderless)
+                                    .accessibilityIdentifier("quota-settings-\(t.key)")
+                                }
                             }
-                            Spacer()
-                        }
-                        if let quota = t.quota {
-                            FreshnessView(timestamp: Double(quota.updatedAt),
-                                          maxAge: t.health?.quotaState == "stale" ? 0 : (t.key == "kimi-work" ? 4_200 : 600),
-                                          staleLabel: "配额已过期 · 更新于")
-                        }
-                        if let notice = t.quota?.notice, !notice.isEmpty {
-                            HStack(alignment: .top, spacing: 5) {
-                                Image(systemName: "exclamationmark.triangle.fill")
-                                    .font(.system(size: 9))
-                                    .foregroundColor(.orange)
-                                Text(notice)
-                                    .font(.system(size: 10))
-                                    .foregroundColor(.secondary)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                            .padding(.vertical, 2)
-                        }
-                        ForEach(t.quota?.windows ?? [], id: \.label) { w in
-                            if w.kind == "month", !(w.components ?? []).isEmpty {
-                                monthlyQuotaRow(w)
+                            if !presentation.windows.isEmpty {
+                                let age = ExperienceFormat.age(presentation.lastSuccessAt ?? 0,
+                                                               now: context.date.timeIntervalSince1970)
+                                Text(presentation.isHistorical ? "上次更新 · \(age) · 发送消息后更新" : "更新于 \(age)")
+                                    .font(.system(size: 10)).foregroundColor(.secondary)
+                                ForEach(presentation.windows, id: \.label) { window in
+                                    if !presentation.isHistorical, window.kind == "month", !(window.components ?? []).isEmpty {
+                                        monthlyQuotaRow(window)
+                                    } else {
+                                        quotaRow(window, historical: presentation.isHistorical)
+                                    }
+                                }
                             } else {
-                                quotaRow(w)
+                                Label("当前额度暂不可用", systemImage: "exclamationmark.circle")
+                                    .font(.system(size: 11)).foregroundColor(.orange)
+                                Text(presentation.unavailableReason)
+                                    .font(.system(size: 10)).foregroundColor(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                if let timestamp = presentation.lastSuccessAt {
+                                    Text("上次成功读取 · \(ExperienceFormat.age(timestamp, now: context.date.timeIntervalSince1970))")
+                                        .font(.system(size: 9).monospacedDigit())
+                                        .foregroundColor(.secondary)
+                                }
                             }
                         }
+                        .accessibilityIdentifier("quota-card-\(t.key)")
                     }
                 }
             } else {
@@ -460,14 +360,14 @@ struct PanelView: View {
         }
     }
 
-    private func quotaRow(_ w: QuotaWindow) -> some View {
+    private func quotaRow(_ w: QuotaWindow, historical: Bool = false) -> some View {
         let used = min(max(w.usedPercent, 0), 100) / 100
-        let elapsed = timeElapsedFraction(w)
+        let elapsed = historical ? nil : timeElapsedFraction(w)
         return VStack(alignment: .leading, spacing: 3) {
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     Capsule().fill(Color.primary.opacity(0.08))
-                    Capsule().fill(quotaColor(w.usedPercent))
+                    Capsule().fill(historical ? Color.secondary.opacity(0.45) : quotaColor(w.usedPercent))
                         .frame(width: max(4, geo.size.width * CGFloat(used)))
                     if let elapsed {
                         timeCursor(elapsed, width: geo.size.width)
@@ -475,7 +375,8 @@ struct PanelView: View {
                 }
             }
             .frame(height: 6)
-            Text("\(w.label) · 已用 \(Int(w.usedPercent.rounded()))% · \(quotaResetText(w.resetsAt))")
+            Text(historical ? "\(w.label) · 当时已用 \(Int(w.usedPercent.rounded()))%"
+                 : "\(w.label) · 已用 \(Int(w.usedPercent.rounded()))% · \(quotaResetText(w.resetsAt))")
                 .font(.system(size: 10).monospacedDigit())
                 .foregroundColor(.secondary)
         }

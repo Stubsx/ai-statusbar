@@ -1,34 +1,14 @@
 import Cocoa
 import SwiftUI
 
-/// 状态速览和运行详情共用同一套目标与交互；应用入口不代选第一条会话。
+/// 每个 Harness 只展示运行会话与尚未查看的新结果，与状态图标逐条对应。
 struct StatusToolSection: View {
-    let tool: ToolStatus
+    let group: HarnessConversationGroup
     var kimiWebAvailable = false
-    var detailed = false
     let displayTitle: (String) -> String
     var openDestination: (ToolDestination) -> Void = NotificationRouter.openDestination
-    @State private var expanded = false
-
-    private var items: [BusyItem] { tool.activeItems ?? tool.busyItems }
-    private var hasSessionLinks: Bool { items.contains { canOpen($0.id) } }
-    private var previewLimit: Int { hasSessionLinks ? 3 : 1 }
-    private var shownItems: [BusyItem] {
-        Array(items.prefix(detailed || (expanded && hasSessionLinks) ? items.count : previewLimit))
-    }
-    private var stateLabel: String {
-        if tool.health?.state == "error" { return "读取异常" }
-        switch tool.state {
-        case "busy": return "\(max(0, tool.busyCount)) 个运行中"
-        case "idle": return "空闲"
-        default: return "未运行"
-        }
-    }
-
-    private func canOpen(_ sessionId: String?) -> Bool {
-        NotificationRouter.supportsSessionNavigation(forToolKey: tool.key, sessionId: sessionId,
-                                                      kimiWebAvailable: kimiWebAvailable)
-    }
+    let openConversation: (HarnessConversation) -> Void
+    private var tool: ToolStatus { group.tool }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
@@ -40,27 +20,10 @@ struct StatusToolSection: View {
             } else {
                 header.padding(.horizontal, 6).padding(.vertical, 4).padding(.trailing, 16)
             }
-            ForEach(shownItems, id: \.id) { item in
-                sessionRow(title: item.title, sessionId: item.id)
+            ForEach(group.conversations) { conversation in
+                sessionRow(conversation)
             }
-            if !detailed, hasSessionLinks, items.count > previewLimit {
-                Button { expanded.toggle() } label: {
-                    HStack(spacing: 5) {
-                        Image(systemName: expanded ? "chevron.up" : "chevron.down")
-                            .font(.system(size: 8, weight: .semibold)).frame(width: 8)
-                        Text(expanded ? "收起会话" : "展开其余 \(items.count - previewLimit) 条会话")
-                            .font(.system(size: 10))
-                        Spacer(minLength: 0)
-                    }.foregroundColor(.secondary)
-                }
-                .buttonStyle(StatusRowButtonStyle(showsArrow: false))
-                .padding(.leading, 14)
-                .accessibilityIdentifier("status-sessions-toggle-\(tool.key)")
-            }
-            if items.isEmpty, let title = tool.latestTitle, detailed || canOpen(tool.latestSessionId) {
-                sessionRow(title: title, sessionId: tool.latestSessionId, recent: true)
-            }
-            if detailed, tool.health?.state == "error" {
+            if tool.health?.state == "error" {
                 Text(tool.health?.message ?? "部分数据不可读")
                     .font(.system(size: 10)).foregroundColor(.orange).padding(.leading, 20)
             }
@@ -73,37 +36,72 @@ struct StatusToolSection: View {
                 .frame(width: 6, height: 6)
             Text(tool.name).font(.system(size: 12, weight: .medium)).lineLimit(1)
             Spacer(minLength: 4)
-            Text(stateLabel).font(.system(size: 10)).foregroundColor(.secondary).fixedSize()
+            HStack(spacing: 8) {
+                if group.runningCount > 0 {
+                    Label("\(group.runningCount)", systemImage: "play.fill")
+                }
+                if group.attentionCount > 0 {
+                    Label("\(group.attentionCount)", systemImage: "bubble.left.fill")
+                }
+                if group.runningCount == 0 && group.attentionCount == 0 {
+                    Text(group.statusLabel)
+                }
+            }
+            .font(.system(size: 10)).foregroundColor(.secondary).fixedSize()
+            .accessibilityElement(children: .ignore).accessibilityLabel(group.statusLabel)
         }
     }
 
+    private func statusColor(_ conversation: HarnessConversation) -> Color {
+        switch conversation.phase {
+        case "working": return .green
+        case "waiting_input", "waiting_permission", "failed": return .orange
+        default: return .secondary
+        }
+    }
+
+    private func routeHelp(_ conversation: HarnessConversation) -> String {
+        let direct = NotificationRouter.supportsSessionNavigation(forToolKey: tool.key,
+            sessionId: conversation.sessionId, kimiWebAvailable: kimiWebAvailable)
+        let route = direct
+            ? NotificationRouter.destinationLabel(forToolKey: tool.key, sessionId: conversation.sessionId)
+            : NotificationRouter.destinationLabel(forToolKey: tool.key)
+        let age = conversation.timestamp.map { " · " + ExperienceFormat.age($0) } ?? ""
+        return "\(displayTitle(conversation.title))\n\(conversation.label)\(age)\n\(route)"
+            + (conversation.needsAttention ? "，并清除此会话的提醒" : "")
+    }
+
     @ViewBuilder
-    private func sessionRow(title: String, sessionId: String?, recent: Bool = false) -> some View {
-        let visibleTitle = displayTitle(title)
-        let navigable = canOpen(sessionId)
+    private func sessionRow(_ conversation: HarnessConversation) -> some View {
+        let navigable = NotificationRouter.supportsApplicationNavigation(forToolKey: tool.key)
         Group {
             if navigable {
-                Button { openDestination(ToolDestination(toolKey: tool.key, sessionId: sessionId)) } label: {
-                    sessionLabel(visibleTitle, recent: recent, navigable: true)
-                }
-                .buttonStyle(StatusRowButtonStyle())
-                .help("\(visibleTitle)\n\(NotificationRouter.destinationLabel(forToolKey: tool.key, sessionId: sessionId))")
-                .accessibilityIdentifier("status-session-\(tool.key)-\(sessionId ?? "")")
+                Button { openConversation(conversation) } label: { sessionLabel(conversation) }
+                    .buttonStyle(StatusRowButtonStyle())
+                    .help(routeHelp(conversation))
+                    .accessibilityIdentifier("status-session-\(tool.key)-\(conversation.sessionId ?? conversation.id)")
             } else {
-                sessionLabel(visibleTitle, recent: recent, navigable: false)
+                sessionLabel(conversation)
                     .padding(.trailing, 16).padding(.horizontal, 6).padding(.vertical, 4)
-                    .help("\(visibleTitle)\n暂不支持直达会话，可点击工具名称打开应用或宿主")
+                    .help(displayTitle(conversation.title) + "\n暂不支持自动打开")
             }
         }.padding(.leading, 14)
     }
 
-    private func sessionLabel(_ title: String, recent: Bool, navigable: Bool) -> some View {
+    private func sessionLabel(_ conversation: HarnessConversation) -> some View {
         HStack(spacing: 6) {
-            Image(systemName: recent ? "clock" : "text.bubble")
-                .font(.system(size: 9)).foregroundColor(.secondary).frame(width: 10)
-            Text(recent ? "最近：\(title)" : title)
-                .font(.system(size: 11)).foregroundColor(navigable && !recent ? .primary : .secondary)
+            Image(systemName: conversation.symbol).font(.system(size: 9))
+                .foregroundColor(statusColor(conversation)).frame(width: 10)
+            Text(displayTitle(conversation.title))
+                .font(.system(size: 11))
+                .foregroundColor(conversation.current || conversation.needsAttention ? .primary : .secondary)
                 .lineLimit(1).truncationMode(.tail).frame(maxWidth: .infinity, alignment: .leading)
+            if conversation.needsAttention {
+                Circle().fill(Color.accentColor).frame(width: 4, height: 4)
+                    .accessibilityLabel("未读")
+            }
+            Text(conversation.label).font(.system(size: 9))
+                .foregroundColor(statusColor(conversation)).fixedSize()
         }
     }
 }

@@ -58,6 +58,27 @@ final class KeychainInteractionTests: XCTestCase {
         XCTAssertEqual(changes, [true, false])
     }
 
+    func testKeyCacheRoundTripPermissionsAndClear() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let path = KimiSafeStorage.keyCachePath(homeDirectory: home.path)
+        XCTAssertNil(KimiSafeStorage.cachedPassword(homeDirectory: home.path))
+        KimiSafeStorage.cachePassword(Data("secret-pass".utf8), homeDirectory: home.path)
+        XCTAssertEqual(KimiSafeStorage.cachedPassword(homeDirectory: home.path),
+                       Data("secret-pass".utf8))
+        let filePerms = try FileManager.default.attributesOfItem(atPath: path)[.posixPermissions] as? Int
+        XCTAssertEqual(filePerms, 0o600)
+        let dirPerms = try FileManager.default.attributesOfItem(
+            atPath: (path as NSString).deletingLastPathComponent)[.posixPermissions] as? Int
+        XCTAssertEqual(dirPerms, 0o700)
+        // 覆盖写入（口令轮换后重新授权）不能沿用旧文件的宽松权限
+        KimiSafeStorage.cachePassword(Data("rotated".utf8), homeDirectory: home.path)
+        XCTAssertEqual(KimiSafeStorage.cachedPassword(homeDirectory: home.path), Data("rotated".utf8))
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: path)[.posixPermissions] as? Int, 0o600)
+        KimiSafeStorage.clearCachedPassword(homeDirectory: home.path)
+        XCTAssertNil(KimiSafeStorage.cachedPassword(homeDirectory: home.path))
+    }
+
     func testAuthorizationLockRejectsOverlapAndReleasesAfterDenial() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

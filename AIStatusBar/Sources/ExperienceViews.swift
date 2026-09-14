@@ -8,6 +8,7 @@ private struct PanelContentHeightKey: PreferenceKey {
 
 /// 短内容自然收高，长内容才滚动，避免按条数猜高度产生大片留白。
 struct FittedPanelScrollView<Content: View>: View {
+    var maxHeight: CGFloat = 320
     @ViewBuilder let content: Content
     @State private var contentHeight: CGFloat = 120
 
@@ -19,7 +20,7 @@ struct FittedPanelScrollView<Content: View>: View {
                     Color.clear.preference(key: PanelContentHeightKey.self, value: geometry.size.height)
                 })
         }
-        .frame(height: min(320, max(1, contentHeight)))
+        .frame(height: min(maxHeight, max(1, contentHeight)))
         .onPreferenceChange(PanelContentHeightKey.self) { height in
             guard height > 0, abs(contentHeight - height) > 0.5 else { return }
             contentHeight = height
@@ -42,7 +43,8 @@ enum ExperienceFormat {
         return formatter.string(from: Date(timeIntervalSince1970: timestamp))
     }
 
-    static func quotaState(_ state: String?) -> String {
+    static func quotaState(_ state: String?, historical: Bool = false) -> String {
+        if historical { return "上次配额记录 · 发送消息后更新" }
         switch state {
         case "ready": return "配额读取正常"
         case "local": return "来自本地记录"
@@ -66,57 +68,6 @@ struct FreshnessView: View {
                  "\(age > maxAge ? staleLabel : "更新于") \(ExperienceFormat.age(timestamp ?? 0, now: context.date.timeIntervalSince1970))")
                 .font(.system(size: 10).monospacedDigit())
                 .foregroundColor(age > maxAge && timestamp != nil ? .orange : .secondary)
-        }
-    }
-}
-
-struct TaskEventRows: View {
-    @ObservedObject var store: StatusStore
-    let events: [TaskRecord]
-    var expanded = false
-    var body: some View {
-        VStack(spacing: 7) {
-            ForEach(events) { record in
-                HStack(alignment: .top, spacing: 9) {
-                    Image(systemName: record.symbol)
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundColor(record.waiting ? .orange : .accentColor)
-                        .frame(width: 17).padding(.top, 2)
-                    Button {
-                        store.openEvent(record)
-                    } label: {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(store.displayTitle(record.title))
-                                .font(.system(size: 12, weight: .medium))
-                                .lineLimit(expanded ? 3 : 1)
-                            Text("\(record.toolName) · \(record.label)")
-                                .font(.system(size: 10)).foregroundColor(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                            Text(ExperienceFormat.age(record.timestamp))
-                                .font(.system(size: 9)).foregroundColor(.secondary)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityIdentifier("open-event-\(record.id)")
-                    .help("\(store.displayTitle(record.title))\n\(NotificationRouter.destinationLabel(forToolKey: record.toolKey, sessionId: record.sessionId))，并标记已读")
-                    if record.needsAttention {
-                        Button { store.acknowledge(record.id) } label: {
-                            Image(systemName: "checkmark").font(.system(size: 11, weight: .semibold))
-                        }
-                        .buttonStyle(.borderless).help("清除此条提醒，保留历史记录")
-                        .accessibilityLabel("标记已读")
-                    } else if record.acknowledged {
-                        Image(systemName: "checkmark").font(.system(size: 9)).foregroundColor(.secondary.opacity(0.6))
-                            .help(record.waiting && !record.resolved ? "提醒已读，任务仍在等待" : "已读")
-                            .accessibilityLabel(record.waiting && !record.resolved ? "提醒已读，任务仍在等待" : "已读")
-                    }
-                }
-                .padding(10)
-                .background(RoundedRectangle(cornerRadius: 10).fill(
-                    record.waiting && !record.resolved ? Color.orange.opacity(0.09) : Color.primary.opacity(0.035)))
-            }
         }
     }
 }
@@ -145,6 +96,7 @@ struct ConnectionDiagnosticsView: View {
                 Label(error, systemImage: "internaldrive").foregroundColor(.orange)
             }
             ForEach(store.data?.tools ?? [], id: \.key) { tool in
+                let quota = QuotaPresentation(tool: tool, now: Date().timeIntervalSince1970)
                 VStack(alignment: .leading, spacing: 7) {
                     HStack {
                         Text(tool.name).font(.system(size: 13, weight: .semibold))
@@ -158,7 +110,7 @@ struct ConnectionDiagnosticsView: View {
                         .font(.system(size: 11)).foregroundColor(.secondary)
                     Text("任务事件：\(phaseDescription(tool.capabilities?.eventPhases ?? []))")
                         .font(.system(size: 10)).foregroundColor(.secondary)
-                    Text("\(NotificationRouter.destinationLabel(forToolKey: tool.key)) · \(ExperienceFormat.quotaState(tool.health?.quotaState))")
+                    Text("\(NotificationRouter.destinationLabel(forToolKey: tool.key)) · \(ExperienceFormat.quotaState(tool.health?.quotaState, historical: quota.isHistorical))")
                         .font(.system(size: 10)).foregroundColor(.secondary)
                     if let timestamp = tool.health?.sourceUpdatedAt {
                         Text("最近本地活动：\(ExperienceFormat.age(timestamp))")

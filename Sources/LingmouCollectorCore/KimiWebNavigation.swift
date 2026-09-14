@@ -171,6 +171,66 @@ struct KimiWebResolver {
     }
 }
 
+// MARK: - 浏览器标签页复用（纯决策逻辑；App 端用 osascript 执行）
+
+/// 枚举脚本输出的一个标签页。windowIndex／tabIndex 都从 1 开始，
+/// 窗口序按脚本枚举顺序视为前到后（与两家浏览器的窗口排序一致）。
+struct BrowserTabAddress: Equatable {
+    let windowIndex: Int
+    let tabIndex: Int
+    let url: String
+}
+
+enum BrowserTabReusePlan: Equatable {
+    case focus(BrowserTabAddress)
+    case navigate(BrowserTabAddress, to: String)
+    case newTab
+}
+
+enum BrowserTabReuse {
+    /// 解析枚举脚本输出：每行 "windowIndex\ttabIndex\tURL"；索引非法、URL 不成形
+    /// （含 Safari 的 "missing value" 占位）的行跳过。
+    static func parseTabs(_ output: String) -> [BrowserTabAddress] {
+        output.split(whereSeparator: \.isNewline).compactMap { line in
+            let fields = line.split(separator: "\t", omittingEmptySubsequences: false)
+            guard fields.count == 3,
+                let windowIndex = Int(fields[0]), windowIndex >= 1,
+                let tabIndex = Int(fields[1]), tabIndex >= 1 else { return nil }
+            let url = String(fields[2])
+            guard !url.isEmpty, URL(string: url)?.scheme != nil else { return nil }
+            return BrowserTabAddress(windowIndex: windowIndex, tabIndex: tabIndex, url: url)
+        }
+    }
+
+    /// 目标会话页已精确打开 → 聚焦；同源标签已打开 → 导航到目标（每个服务只占一个
+    /// 标签页）；都没有 → 新建。纯 origin 目标（无会话 id）只聚焦已开的同源标签，
+    /// 不把会话页强行拽回列表。
+    static func plan(tabs: [BrowserTabAddress], target: URL) -> BrowserTabReusePlan {
+        guard let origin = normalizedOrigin(of: target) else { return .newTab }
+        let usable = tabs.filter { tab in
+            guard let tabURL = URL(string: tab.url) else { return false }
+            return normalizedOrigin(of: tabURL) == origin
+        }
+        if let exact = usable.filter({ $0.url == target.absoluteString })
+            .min(by: { ($0.windowIndex, $0.tabIndex) < ($1.windowIndex, $1.tabIndex) }) {
+            return .focus(exact)
+        }
+        guard let reuse = usable.min(by: {
+            ($0.windowIndex, $0.tabIndex) < ($1.windowIndex, $1.tabIndex)
+        }) else { return .newTab }
+        if target.path.isEmpty || target.path == "/" { return .focus(reuse) }
+        return .navigate(reuse, to: target.absoluteString)
+    }
+
+    /// scheme://host:port 的规范化比较键；端口缺省时两侧同样省略，避免
+    /// "127.0.0.1:5863" 误匹配 "127.0.0.1:58627" 这类前缀陷阱。
+    static func normalizedOrigin(of url: URL) -> String? {
+        guard let scheme = url.scheme?.lowercased(), let host = url.host?.lowercased() else { return nil }
+        let port = url.port.map { ":\($0)" } ?? ""
+        return "\(scheme)://\(host)\(port)"
+    }
+}
+
 private final class KimiWebHTTP: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     private let lock = NSLock()
     private var result: (Int, Data)?

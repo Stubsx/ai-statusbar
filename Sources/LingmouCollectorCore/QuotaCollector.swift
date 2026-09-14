@@ -342,7 +342,12 @@ struct QuotaCollector {
         guard settings.kimiTokenDecrypt else {
             return (nil, false, Self.kimiEncryptedNotice)
         }
-        let provider = kimiKeychainOverride ?? KimiSafeStorage.readKeychainPassword
+        let base = kimiKeychainOverride ?? KimiSafeStorage.readKeychainPassword
+        // 钥匙串拒绝时回退到授权时备份的口令副本：重建/重装灵眸后 ACL 失效也能继续读。
+        let provider: (String, String) -> Data? = { service, account in
+            base(service, account)
+                ?? KimiSafeStorage.cachedPassword(homeDirectory: environment.homeDirectory)
+        }
         guard let plain = KimiSafeStorage.decryptTokenStore(payload: payload, keyProvider: provider)
         else { return (nil, false, Self.kimiDecryptFailedNotice) }
         // 兼容 {"tokens":{"access_token":…}} 与解密后直接平铺两种形态。

@@ -1,12 +1,11 @@
 import Cocoa
 
-/// 菜单栏只提供紧凑的状态入口与任务跳转，统计和提醒详情仍由桌面面板承载。
+/// 菜单栏与桌面面板共用按 Harness 分组的会话列表。
 enum MenuBarPresentation {
     static func update(_ button: NSStatusBarButton, data: StatusData?,
                        collectorError: String?, unreadCount: Int) {
         let tools = data?.tools ?? []
-        let running = tools.filter { $0.state == "busy" && $0.health?.state != "error" }
-            .reduce(0) { $0 + max(0, $1.busyCount) }
+        let running = tools.reduce(0) { $0 + HarnessConversations.workingItems(for: $1).count }
         let hasError = collectorError != nil || tools.contains { $0.health?.state == "error" }
         button.image = image(marked: hasError || unreadCount > 0)
         button.imagePosition = .imageLeading
@@ -20,10 +19,10 @@ enum MenuBarPresentation {
         } else {
             summary.append(running > 0 ? "\(running) 个任务运行中" : "当前没有运行中的任务")
         }
-        if unreadCount > 0 { summary.append("\(unreadCount) 条未读事件") }
+        if unreadCount > 0 { summary.append("\(unreadCount) 条会话待查看") }
         for tool in tools where tool.state != "off" || tool.health?.state == "error" {
             let state = tool.health?.state == "error" ? "读取异常" :
-                (tool.state == "busy" ? "\(max(0, tool.busyCount)) 个任务运行中" : "空闲")
+                (tool.state == "busy" ? "\(HarnessConversations.workingItems(for: tool).count) 个任务运行中" : "空闲")
             summary.append("\(tool.name) · \(state)")
         }
         button.toolTip = summary.joined(separator: "\n")
@@ -53,30 +52,36 @@ enum MenuBarPresentation {
     }
 
     /// 保留原生菜单的键盘导航、高亮、子菜单与任务路由。
-    static func appendTools(to menu: NSMenu, tools: [ToolStatus], target: AnyObject,
+    static func appendTools(to menu: NSMenu, tools: [ToolStatus], events: [TaskRecord] = [], target: AnyObject,
                             openTool: Selector, openConnections: Selector,
                             displayTitle: (String) -> String) {
-        let visible = tools.filter { $0.state != "off" || $0.health?.state == "error" }
-        let foreground = visible.filter { $0.state == "busy" || $0.health?.state == "error" }
-        let idle = visible.filter { $0.state != "busy" && $0.health?.state != "error" }
+        let groups = HarnessConversations.groups(tools: tools, events: events)
 
-        func taskItem(_ task: BusyItem, tool: ToolStatus) -> NSMenuItem {
-            let title = displayTitle(task.title)
-            let item = NSMenuItem(title: fittedTitle(title), action: openTool, keyEquivalent: "")
+        func taskItem(_ conversation: HarnessConversation) -> NSMenuItem {
+            let title = displayTitle(conversation.title)
+            let item = NSMenuItem(title: "\(fittedTitle(title, maxWidth: 240)) · \(conversation.label)",
+                                  action: openTool, keyEquivalent: "")
             item.target = target
-            item.image = symbol("play", size: 10, template: true)
+            item.image = symbol(conversation.symbol, size: 10, template: true)
             item.attributedTitle = NSAttributedString(string: item.title, attributes: [
                 .font: NSFont.menuFont(ofSize: 12),
             ])
-            item.representedObject = ToolDestination(toolKey: tool.key, sessionId: task.id)
-            item.toolTip = title + " · " + NotificationRouter.destinationLabel(forToolKey: tool.key, sessionId: task.id)
+            item.representedObject = conversation
+            item.toolTip = title + " · " + conversation.label + "\n"
+                + NotificationRouter.destinationLabel(forToolKey: conversation.toolKey, sessionId: conversation.sessionId)
+                + (conversation.needsAttention ? "，并清除此会话的提醒" : "")
+            if conversation.needsAttention {
+                item.onStateImage = symbol("circle.fill", color: .controlAccentColor, size: 5)
+                item.state = .on
+            }
             return item
         }
 
-        func append(_ tool: ToolStatus, to destination: NSMenu) {
+        for (index, group) in groups.enumerated() {
+            if index > 0 { menu.addItem(.separator()) }
+            let tool = group.tool
             let failed = tool.health?.state == "error"
-            let detail = failed ? "读取异常" :
-                (tool.state == "busy" ? "\(max(0, tool.busyCount)) 个任务" : "空闲")
+            let detail = group.statusLabel
             let header = NSMenuItem(title: "\(tool.name) · \(detail)",
                                     action: failed ? openConnections : openTool, keyEquivalent: "")
             header.target = target
@@ -84,58 +89,28 @@ enum MenuBarPresentation {
             header.image = failed ? symbol("exclamationmark.circle", color: .systemOrange) :
                 symbol("circle.fill", color: tool.state == "busy" ? .systemGreen : .systemGray, size: 7)
             header.toolTip = failed ? tool.health?.message : NotificationRouter.destinationLabel(forToolKey: tool.key)
-            destination.addItem(header)
-            guard !failed else { return }
-
-            // busyItems 是限长预览，activeItems 才包含全部任务；溢出项仍可逐个跳转。
-            let tasks = tool.state == "busy" ? (tool.activeItems ?? tool.busyItems) : []
-            for task in tasks.prefix(3) {
-                let item = taskItem(task, tool: tool)
+            menu.addItem(header)
+            for conversation in group.preview {
+                let item = taskItem(conversation)
                 item.indentationLevel = 1
-                destination.addItem(item)
+                menu.addItem(item)
             }
-            if tasks.count > 3 {
-                let more = NSMenuItem(title: "其余 \(tasks.count - 3) 个任务", action: nil, keyEquivalent: "")
+            let visibleIDs = Set(group.preview.map(\.id))
+            let remaining = group.conversations.filter { !visibleIDs.contains($0.id) }
+            if !remaining.isEmpty {
+                let more = NSMenuItem(title: "其余 \(remaining.count) 条会话", action: nil, keyEquivalent: "")
                 more.image = symbol("ellipsis", size: 11, template: true)
                 more.indentationLevel = 1
                 let submenu = NSMenu()
-                for task in tasks.dropFirst(3) { submenu.addItem(taskItem(task, tool: tool)) }
+                for conversation in remaining { submenu.addItem(taskItem(conversation)) }
                 more.submenu = submenu
-                destination.addItem(more)
-            }
-            if tool.state == "idle", let latest = tool.latestTitle {
-                let title = displayTitle(latest)
-                let item = NSMenuItem(title: "最近：\(fittedTitle(title, maxWidth: 270))",
-                                      action: openTool, keyEquivalent: "")
-                item.target = target
-                item.image = symbol("clock", size: 11, template: true)
-                item.representedObject = ToolDestination(toolKey: tool.key, sessionId: tool.latestSessionId)
-                item.indentationLevel = 1
-                item.toolTip = title + (tool.latestAge.map { " · \($0)" } ?? "")
-                destination.addItem(item)
+                menu.addItem(more)
             }
         }
-
-        for (index, tool) in foreground.enumerated() {
-            if index > 0 { menu.addItem(.separator()) }
-            append(tool, to: menu)
-        }
-        if foreground.isEmpty {
-            let empty = NSMenuItem(title: visible.isEmpty ? "当前没有运行中的工具" : "当前没有运行中的任务",
-                                   action: nil, keyEquivalent: "")
+        if groups.isEmpty {
+            let empty = NSMenuItem(title: "当前没有会话", action: nil, keyEquivalent: "")
             empty.image = symbol("moon", template: true)
             menu.addItem(empty)
-        }
-        if !idle.isEmpty {
-            let item = NSMenuItem(title: "空闲工具 · \(idle.count)", action: nil, keyEquivalent: "")
-            item.image = symbol("pause.circle", template: true)
-            let submenu = NSMenu()
-            for (index, tool) in idle.enumerated() {
-                if index > 0 { submenu.addItem(.separator()) }
-                append(tool, to: submenu)
-            }
-            item.submenu = submenu
-            menu.addItem(item)
         }
     }
 

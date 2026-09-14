@@ -12,7 +12,9 @@ public enum KimiKeychainAuthorization {
                 service: KimiSafeStorage.keychainService,
                 account: KimiSafeStorage.keychainAccount,
                 allowInteraction: true)
-            guard result.status == errSecSuccess && result.password != nil else { return 1 }
+            guard result.status == errSecSuccess, let password = result.password else { return 1 }
+            // 钥匙串 ACL 随重建失效，备份口令让授权真正持久（见 KimiSafeStorage.keyCachePath）。
+            KimiSafeStorage.cachePassword(password, homeDirectory: homeDirectory)
             // Invalidate permission-failure caches without deleting the last good quota.
             let marker = URL(fileURLWithPath: homeDirectory)
                 .appendingPathComponent(".ai-statusbar/kimi-keychain-authorized")

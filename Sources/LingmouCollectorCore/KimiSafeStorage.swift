@@ -17,6 +17,40 @@ enum KimiSafeStorage {
 
     private static let interactionLock = NSLock()
 
+    /// 钥匙串 ACL 的"始终允许"只认本次构建的二进制哈希：哪怕用同一本自签名证书
+    /// 重新构建/替换 App，授权也会失效。因此授权成功时把口令在本机备份一份
+    ///（目录 0700、文件 0600，仅当前用户可读），后台读取在钥匙串拒绝时回退到它。
+    /// 关闭解密开关会删除该文件；Kimi 桌面端轮换口令后需在设置里重新授权一次。
+    static func keyCachePath(homeDirectory: String = NSHomeDirectory()) -> String {
+        URL(fileURLWithPath: homeDirectory)
+            .appendingPathComponent(".ai-statusbar/kimi-safe-storage.key").path
+    }
+
+    /// 只允许在交互授权成功后调用；覆盖写入前先删旧文件，避免沿用更宽的权限位。
+    static func cachePassword(_ password: Data, homeDirectory: String = NSHomeDirectory()) {
+        guard !password.isEmpty else { return }
+        let directory = URL(fileURLWithPath: homeDirectory).appendingPathComponent(".ai-statusbar")
+        try? FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let path = keyCachePath(homeDirectory: homeDirectory)
+        try? FileManager.default.removeItem(atPath: path)
+        FileManager.default.createFile(
+            atPath: path, contents: password.base64EncodedData(),
+            attributes: [.posixPermissions: 0o600])
+    }
+
+    static func cachedPassword(homeDirectory: String = NSHomeDirectory()) -> Data? {
+        guard let data = FileManager.default.contents(atPath: keyCachePath(homeDirectory: homeDirectory)),
+            let password = Data(base64Encoded: data, options: [.ignoreUnknownCharacters]),
+            !password.isEmpty
+        else { return nil }
+        return password
+    }
+
+    static func clearCachedPassword(homeDirectory: String = NSHomeDirectory()) {
+        try? FileManager.default.removeItem(atPath: keyCachePath(homeDirectory: homeDirectory))
+    }
+
     /// 后台读取必须快速降级，不能让定时采集停在系统授权窗口。
     static func readKeychainPassword(service: String, account: String) -> Data? {
         copyKeychainPassword(service: service, account: account).password

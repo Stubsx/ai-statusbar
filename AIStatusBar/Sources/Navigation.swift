@@ -1,4 +1,5 @@
 import Cocoa
+import Darwin
 
 struct ToolDestination {
     let toolKey: String
@@ -9,6 +10,8 @@ struct ToolDestination {
 enum NotificationRouter {
     private static let hostedCodexMarks = ["ChatGPT.app/", "Codex.app/", "app-server", "mcp-server"]
     private static var resolvingKimi = false
+    /// 由 AppDelegate 注入：跳转 Kimi 网页时是否优先复用已打开的同源标签页。
+    static var prefersBrowserTabReuse: () -> Bool = { false }
 
     /// Rendering must never probe local servers or infer a session route from an app route.
     static func supportsSessionNavigation(forToolKey key: String, sessionId: String?,
@@ -124,6 +127,19 @@ enum NotificationRouter {
             explain("无法打开 Kimi 会话", detail: "请先配置默认浏览器。")
             return
         }
+        guard prefersBrowserTabReuse() else {
+            openInNewBrowserTab(url, browser: browser)
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            // 复用失败（浏览器无脚本接口、未授权、超时、窗口序变化）都静默回落
+            // 到原有新开标签页路径。
+            if BrowserTabScriptRunner.reuse(url: url, browser: browser) { return }
+            DispatchQueue.main.async { openInNewBrowserTab(url, browser: browser) }
+        }
+    }
+
+    private static func openInNewBrowserTab(_ url: URL, browser: URL) {
         if openInDefaultChromiumProfile(url, browser: browser) { return }
         if #available(macOS 14, *), let bundleID = Bundle(url: browser)?.bundleIdentifier {
             NSApp.yieldActivation(toApplicationWithBundleIdentifier: bundleID)
@@ -349,5 +365,101 @@ enum NotificationRouter {
         alert.addButton(withTitle: "知道了")
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
+    }
+}
+
+/// 通过 osascript 复用默认浏览器里已打开的 Kimi 同源标签页：命中则聚焦并
+/// （会话目标时）导航过去，否则返回 false 交给调用方新开标签页。只支持带
+/// 标签页脚本接口的浏览器（Chromium 系与 Safari）；授权、超时等一切失败都
+/// 走回落，不影响原有路径。运行在后台线程。
+private enum BrowserTabScriptRunner {
+    private static let chromiumBundleIDs = ["com.google.Chrome", "com.microsoft.edgemac",
+                                            "org.chromium.Chromium", "com.brave.Browser"]
+
+    static func reuse(url: URL, browser: URL) -> Bool {
+        guard let bundleID = Bundle(url: browser)?.bundleIdentifier,
+            // 浏览器没在运行就没有可复用的标签页；枚举还会把它冷启动起来。
+            NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+                .contains(where: { !$0.isTerminated }) else { return false }
+        let safari = bundleID == "com.apple.Safari"
+        guard safari || chromiumBundleIDs.contains(bundleID) else { return false }
+        let fetch = """
+        with timeout of 3 seconds
+            tell application id "\(bundleID)"
+                set out to ""
+                set wcount to 0
+                repeat with w in windows
+                    set wcount to wcount + 1
+                    set tcount to 0
+                    repeat with t in tabs of w
+                        set tcount to tcount + 1
+                        try
+                            set out to out & wcount & (character id 9) & tcount & (character id 9) & ((URL of t) as text) & linefeed
+                        end try
+                    end repeat
+                end repeat
+                return out
+            end tell
+        end timeout
+        """
+        guard let output = runScript(fetch) else { return false }
+        switch BrowserTabReuse.plan(tabs: BrowserTabReuse.parseTabs(output), target: url) {
+        case .newTab: return false
+        case let .focus(tab): return act(bundleID: bundleID, safari: safari, tab: tab, navigate: nil)
+        case let .navigate(tab, to: target): return act(bundleID: bundleID, safari: safari, tab: tab, navigate: target)
+        }
+    }
+
+    /// 先核对目标标签页 URL 与枚举时一致：两段脚本之间窗口序变了就放弃复用，
+    /// 绝不误碰别的标签页。
+    private static func act(bundleID: String, safari: Bool, tab: BrowserTabAddress, navigate: String?) -> Bool {
+        let tabRef = "tab \(tab.tabIndex) of window \(tab.windowIndex)"
+        var statements = """
+        if ((URL of \(tabRef)) as text) is not "\(escape(tab.url))" then return "stale"
+        activate
+        """
+        // 两家浏览器的“置为当前标签”接口不同；导航都是改 tab 的 URL。
+        statements += safari ? "\nset current tab of window \(tab.windowIndex) to \(tabRef)"
+            : "\nset active tab index of window \(tab.windowIndex) to \(tab.tabIndex)"
+        if let navigate {
+            statements += "\nset URL of \(tabRef) to \"\(escape(navigate))\""
+        }
+        statements += """
+        \ntry
+            set index of window \(tab.windowIndex) to 1
+        end try
+        return "ok"
+        """
+        let script = """
+        with timeout of 3 seconds
+            tell application id "\(bundleID)"
+                \(statements)
+            end tell
+        end timeout
+        """
+        return runScript(script) == "ok"
+    }
+
+    private static func escape(_ value: String) -> String {
+        value.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    /// 运行一段 osascript；脚本内部 3 秒超时，进程级 5 秒强杀，任何失败返回 nil。
+    private static func runScript(_ source: String) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", source]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return nil }
+        let timeout = DispatchWorkItem { if process.isRunning { kill(process.processIdentifier, SIGKILL) } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 5, execute: timeout)
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        timeout.cancel()
+        guard process.terminationStatus == 0 else { return nil }
+        return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

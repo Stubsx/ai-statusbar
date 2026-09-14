@@ -177,4 +177,57 @@ final class KimiWebNavigationTests: XCTestCase {
             XCTAssertEqual(state.activities.first?.phase, finished ? "ended" : nil)
         }
     }
+
+    // MARK: - 浏览器标签页复用（方案 B：同源导航复用 + 自动回落）
+
+    private func tab(_ window: Int, _ index: Int, _ url: String) -> BrowserTabAddress {
+        BrowserTabAddress(windowIndex: window, tabIndex: index, url: url)
+    }
+
+    func testTabReuseParsingSkipsMalformedLines() {
+        let output = [
+            "1\t2\thttp://127.0.0.1:58627/sessions/a",
+            "broken",
+            "2\t1\t",
+            "0\t1\thttp://127.0.0.1:58627/x",
+            "3\t1\tmissing value",
+        ].joined(separator: "\n")
+        XCTAssertEqual(BrowserTabReuse.parseTabs(output),
+                       [tab(1, 2, "http://127.0.0.1:58627/sessions/a")])
+        XCTAssertEqual(BrowserTabReuse.parseTabs(""), [])
+    }
+
+    func testTabReuseNavigatesFrontmostSameOriginTab() {
+        let target = URL(string: "http://127.0.0.1:58627/sessions/target")!
+        let older = tab(1, 3, "http://127.0.0.1:58627/sessions/older")
+        let plan = BrowserTabReuse.plan(tabs: [tab(2, 1, "http://127.0.0.1:58627/sessions/back"),
+                                               older], target: target)
+        XCTAssertEqual(plan, .navigate(older, to: "http://127.0.0.1:58627/sessions/target"))
+    }
+
+    func testTabReusePrefersExactTabOverSameOriginNavigation() {
+        let target = URL(string: "http://127.0.0.1:58627/sessions/target")!
+        let exact = tab(3, 1, target.absoluteString)
+        XCTAssertEqual(BrowserTabReuse.plan(tabs: [tab(1, 1, "http://127.0.0.1:58627/sessions/other"),
+                                                   exact], target: target),
+                       .focus(exact))
+    }
+
+    func testTabReuseRejectsPrefixPortsAndForeignOrigins() {
+        let target = URL(string: "http://127.0.0.1:58627/sessions/target")!
+        XCTAssertEqual(BrowserTabReuse.plan(tabs: [
+            tab(1, 1, "http://127.0.0.1:5863/sessions/target"),   // 端口只是前缀
+            tab(1, 2, "https://127.0.0.1:58627/sessions/target"),  // 协议不同
+            tab(1, 3, "http://localhost:58627/sessions/target"),   // 主机名不同
+            tab(1, 4, "not a url"),
+        ], target: target), .newTab)
+    }
+
+    func testTabReuseOriginTargetFocusesWithoutNavigatingBack() {
+        let origin = URL(string: "http://127.0.0.1:58627")!
+        let open = tab(1, 1, "http://127.0.0.1:58627/sessions/older")
+        XCTAssertEqual(BrowserTabReuse.plan(tabs: [open], target: origin), .focus(open))
+        XCTAssertEqual(BrowserTabReuse.plan(tabs: [tab(1, 1, "http://127.0.0.1:5863/")],
+                                           target: origin), .newTab)
+    }
 }

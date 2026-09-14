@@ -38,6 +38,8 @@ final class SettingsStore: ObservableObject {
     @Published var onlineQuota = true { didSet { save() } }
     /// 解密新版 Kimi（3.2.4+）safeStorage 加密的登录凭证以读取月度额度；默认关闭
     @Published var kimiTokenDecrypt = false { didSet { save() } }
+    /// 跳转 Kimi 网页时复用已打开的同源标签页（需浏览器自动化授权，失败回退新开）
+    @Published var kimiWebTabReuse = true { didSet { save() } }
     /// 用量同步：多设备通过共享目录汇总用量/活跃；空目录 = iCloud Drive 默认目录
     @Published var usageSyncEnabled = false { didSet { save() } }
     @Published var usageSyncDir = "" { didSet { save() } }
@@ -103,6 +105,7 @@ final class SettingsStore: ObservableObject {
         }
         if let v = obj["online_quota"] as? Bool { onlineQuota = v }
         if let v = obj["kimi_token_decrypt"] as? Bool { kimiTokenDecrypt = v }
+        if let v = obj["kimi_web_tab_reuse"] as? Bool { kimiWebTabReuse = v }
         if let s = obj["usage_sync"] as? [String: Any] {
             if let v = s["enabled"] as? Bool { usageSyncEnabled = v }
             if let v = s["dir"] as? String { usageSyncDir = v }
@@ -129,6 +132,7 @@ final class SettingsStore: ObservableObject {
             "pet_scale": petScale,
             "online_quota": onlineQuota,
             "kimi_token_decrypt": kimiTokenDecrypt,
+            "kimi_web_tab_reuse": kimiWebTabReuse,
             "usage_sync": ["enabled": usageSyncEnabled, "dir": usageSyncDir],
             "number_unit": numberUnit,
             "experience": (try? JSONSerialization.jsonObject(with: JSONEncoder().encode(experience))) ?? [:],
@@ -194,7 +198,7 @@ final class StatusStore: ObservableObject {
                     self.kimiAuthorizationMessage = "已取消授权，Kimi 凭证解密保持关闭。"
                 } else if exitStatus == 0 {
                     self.settings.kimiTokenDecrypt = true
-                    self.kimiAuthorizationMessage = "本次读取成功。后台仅使用已有权限；权限不足时显示提示，不再弹窗。"
+                    self.kimiAuthorizationMessage = "本次读取成功，授权已长期保存：重建或重装灵眸不再失效，后台不会弹窗。"
                     self.refresh()
                 } else if exitStatus == 124 {
                     self.kimiAuthorizationMessage = "授权等待已超时，解密保持关闭。需要时可手动重试。"
@@ -210,6 +214,13 @@ final class StatusStore: ObservableObject {
     func cancelKimiAuthorization() {
         kimiAuthorizationCancelled = true
         if let process = kimiAuthorizationProcess { CollectorProcessWatchdog.stop(process) }
+    }
+
+    /// 关闭"读取 Kimi 月度额度"时删除授权时备份的解密口令副本。
+    /// 路径与 LingmouCollectorCore/KimiSafeStorage.keyCachePath 保持一致。
+    func clearKimiKeyCache() {
+        try? FileManager.default.removeItem(
+            atPath: NSHomeDirectory() + "/.ai-statusbar/kimi-safe-storage.key")
     }
     /// 任务完成事件序号：通知和桌宠共用同一套去抖后完成判定。
     @Published var completedEventSerial = 0
@@ -243,7 +254,11 @@ final class StatusStore: ObservableObject {
     private var settingsChanges: AnyCancellable?
 
     var attentionEvents: [TaskRecord] {
-        recentEvents.filter(\.needsAttention).sorted {
+        // The badge counts the same visible conversations as the panel, not
+        // every historical turn. Running conversations supersede old results.
+        let visibleIDs = Set(harnessGroups.flatMap(\.conversations).filter(\.needsAttention)
+            .compactMap { $0.eventIDs.first })
+        return recentEvents.filter { visibleIDs.contains($0.id) }.sorted {
             $0.priority == $1.priority ? $0.timestamp > $1.timestamp : $0.priority < $1.priority
         }
     }
@@ -273,17 +288,30 @@ final class StatusStore: ObservableObject {
         eventOpener(ToolDestination(toolKey: record.toolKey, sessionId: record.sessionId))
     }
 
+    var harnessGroups: [HarnessConversationGroup] {
+        HarnessConversations.groups(tools: data?.tools ?? [], events: recentEvents)
+    }
+
+    func openConversation(_ conversation: HarnessConversation) {
+        // A grouped row represents every recorded turn in this conversation.
+        // Only acknowledge the events it displayed; a newer arriving event stays unread.
+        acknowledgeEvents(conversation.eventIDs)
+        eventOpener(ToolDestination(toolKey: conversation.toolKey, sessionId: conversation.sessionId))
+    }
+
     func openNotification(_ info: [AnyHashable: Any], showHistory: () -> Void) {
         let ids = info["event_ids"] as? [String] ?? []
         let record = ids.count == 1 ? recentEvents.first { $0.id == ids[0] } : nil
-        acknowledgeEvents(ids)
         if let key = info["tool"] as? String {
+            if ids.count == 1 { acknowledgeEvents(ids) }
             // Old notifications can recover their session from the journal. Quota and
             // multi-event notifications must not guess which conversation to open.
             let sessionId = ids.count == 1
                 ? (info["session_id"] as? String ?? (record?.toolKey == key ? record?.sessionId : nil)) : nil
             eventOpener(ToolDestination(toolKey: key, sessionId: sessionId))
         } else {
+            // Opening the list is not opening its results. Keep batch reminders
+            // visible until the user follows each conversation's destination.
             showHistory()
         }
     }
@@ -440,7 +468,8 @@ final class StatusStore: ObservableObject {
         let events = journal.observe(decoded.tools, now: now)
         recentEvents = journal.records
         historyError = journal.storageError
-        let ended = events.filter { $0.phase == "ended" }
+        let endedIDs = Set(events.filter { $0.phase == "ended" }.map(\.id))
+        let ended = attentionEvents.filter { endedIDs.contains($0.id) }
         if !ended.isEmpty {
             completedEventMessage = ended.count == 1
                 ? "\(ended[0].toolName) 本轮已结束" : "\(ended.count) 个任务本轮已结束"

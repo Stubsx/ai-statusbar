@@ -81,7 +81,10 @@ struct LocalCollectors {
             let columns = try? database.columns(in: "conversations"),
             Set(["conversation_key", "title", "updated_at_ms"]).isSubset(of: columns)
         else {
-            if files.manager.fileExists(atPath: databasePath) {
+            // 会话库归 Kimi App 维护：App 未运行时残留 WAL 或退出瞬间的锁会让只读
+            // 打开暂时失败，属于预期状态，不上报错误（前端按未运行隐藏该项）；
+            // App 在线却读不到才提示用户排查。
+            if appOn, files.manager.fileExists(atPath: databasePath) {
                 result.sourceError = "会话数据库不可读或格式不兼容"
             }
             return result
@@ -99,7 +102,7 @@ struct LocalCollectors {
             ORDER BY updated_at_ms DESC
             """)
         else {
-            result.sourceError = "无法查询会话数据库"
+            if appOn { result.sourceError = "无法查询会话数据库" }
             return result
         }
         let window = TimeInterval(max(settings.busySeconds(for: "kimi-work"), 1_800))

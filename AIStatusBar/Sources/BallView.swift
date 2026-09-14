@@ -32,7 +32,6 @@ struct FloatingBallView: View {
     @State private var gaze = CGSize.zero
     @State private var eyeOpenness: CGFloat = 1
     @State private var celebratingSerial = 0
-    @State private var celebratingCount = 0
 
     private var liveMood: PetMood {
         PetMood.current(data: store.data, error: store.collectorError)
@@ -66,12 +65,10 @@ struct FloatingBallView: View {
             }
             .onChange(of: store.completedEventSerial) { serial in
                 guard serial > 0 else { return }
-                celebratingCount = store.completedEventCount
                 celebratingSerial = serial
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
                     if celebratingSerial == serial {
                         celebratingSerial = 0
-                        celebratingCount = 0
                     }
                 }
             }
@@ -85,7 +82,8 @@ struct FloatingBallView: View {
     private var bubbleState: StatusBubbleState {
         StatusBubbleState(mood: liveMood, attentionCount: store.attentionEvents.count,
                           urgentAttentionCount: store.attentionEvents.filter { $0.phase != "ended" }.count,
-                          completedCount: celebratingCount)
+                          completedCount: celebratingSerial > 0
+                            ? store.attentionEvents.filter { $0.phase == "ended" }.count : 0)
     }
 }
 

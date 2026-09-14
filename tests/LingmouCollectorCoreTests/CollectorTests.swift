@@ -765,6 +765,30 @@ final class CollectorTests: XCTestCase {
         XCTAssertEqual(state.busy.map(\.title), ["旧版会话"])
     }
 
+    /// App 未运行时会话库打不开（残留 WAL / 退出瞬间的锁）不上报错误，
+    /// 面板按未运行隐藏；App 在线才把读取失败提示给用户。
+    func testKimiWorkUnreadableDatabaseOnlyErrorsWhenAppRunning() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let database = home.appendingPathComponent(
+            "Library/Application Support/kimi-desktop/daimon-share/daimon/agents/main/sessions/hosted-logical/conversations.sqlite"
+        )
+        try FileManager.default.createDirectory(
+            at: database.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("not a sqlite database".utf8).write(to: database)
+
+        let offline = kimiWorkCollectors(home: home, now: now, processes: processSupport([]))
+            .kimiWork()
+        XCTAssertFalse(offline.processOn)
+        XCTAssertNil(offline.sourceError)
+
+        let online = kimiWorkCollectors(home: home, now: now, processes: processSupport(["Kimi"]))
+            .kimiWork()
+        XCTAssertTrue(online.processOn)
+        XCTAssertEqual(online.sourceError, "会话数据库不可读或格式不兼容")
+    }
+
     /// Kimi 3.2.4+ safeStorage 加密的 token-store：未开启解密时给出中性提示，不再误报“登录已过期”。
     func testEncryptedKimiTokenStoreDegradesToNoticeWithoutDecrypt() throws {
         let home = try temporaryDirectory()
@@ -877,6 +901,39 @@ final class CollectorTests: XCTestCase {
         XCTAssertEqual(quota["kimi-work"]??.notice, QuotaCollector.kimiDecryptFailedNotice)
         for _ in 0..<5 { _ = collector.collect() }
         XCTAssertEqual(reads, 1, "A denied read must be cached across repeated collection")
+    }
+
+    /// 钥匙串拒绝（重建 App 后 ACL 失效）时回退到授权备份的口令，照常解密不提示。
+    func testEncryptedKimiTokenStoreFallsBackToCachedKey() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        try write(
+            "{\"encryption\":\"safeStorage.v1\",\"data\":\"\(try encryptedV10Payload("{\"tokens\":{\"access_token\":\"desktop-token\"}}", password: "test-key"))\"}",
+            to: home.appendingPathComponent(
+                "Library/Application Support/kimi-desktop/bridge-store/token-store.json"))
+        KimiSafeStorage.cachePassword(Data("test-key".utf8), homeDirectory: home.path)
+        var collector = QuotaCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: 2_000_000_000),
+            settings: CollectorSettings(onlineQuota: true, kimiTokenDecrypt: true),
+            files: FileSupport(),
+            requestOverride: { request in
+                if request.url?.path.contains("GetSubscriptionStats") == true {
+                    return [
+                        "subscriptionBalance": [
+                            "amountUsedRatio": 0.5,
+                            "kimiCodeUsedRatio": 0.1,
+                            "expireTime": "2033-05-18T03:33:20Z",
+                        ]
+                    ]
+                }
+                return ["subscription": ["goods": ["title": "Allegro"]]]
+            },
+            kimiKeychainOverride: { _, _ in nil })
+        let quota = collector.collect()
+        let kimiWork = try XCTUnwrap(quota["kimi-work"] ?? nil)
+        XCTAssertEqual(kimiWork.windows.map(\.usedPercent), [50])
+        XCTAssertEqual(kimiWork.plan, "Allegro")
+        XCTAssertNil(kimiWork.notice)
     }
 
     func testManualAuthorizationInvalidatesBothFailureCaches() throws {

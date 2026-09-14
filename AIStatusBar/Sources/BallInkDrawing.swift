@@ -52,7 +52,8 @@ enum BallInkDrawing {
         return t * t * (3 - 2 * t)
     }
 
-    private static func render(size: Int = 384, phase: Double = 0, palette: Palette = .ink) -> CGImage? {
+    // 图标导出工具也使用此入口，以原生分辨率复用晴蓝色层，避免放大运行时纹理。
+    static func render(size: Int = 384, phase: Double = 0, palette: Palette = .ink) -> CGImage? {
         // 圆周参数在首尾完全相接，循环不重新播种噪声。
         let angle = phase * 2 * Double.pi
         let drift = sin(angle)

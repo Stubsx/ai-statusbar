@@ -13,6 +13,7 @@ struct SettingsView: View {
     @State private var showOnlineQuotaAlert = false
     @State private var showKimiDecryptAlert = false
     @State private var showAdaptiveAlert = false
+    @State private var clearHistoryConfirmation = false
     @State private var perToolBusyExpanded = false
     @State private var advancedExpanded = false
     @StateObject private var maintenance = MaintenanceStore()
@@ -196,6 +197,11 @@ struct SettingsView: View {
                 ])
             }
             divider
+            settingRow("跳转 Kimi 网页时复用标签页",
+                       detail: "已打开同源页面就切到该标签并跳到目标会话，不再重复开新标签。首次使用会请求浏览器自动化授权；拒绝或失败时照常新开标签页") {
+                toggle($settings.kimiWebTabReuse)
+            }
+            divider
             settingRow("在 Dock 中显示图标", detail: "默认仅驻留菜单栏") {
                 toggle($settings.showDockIcon)
             }
@@ -228,7 +234,7 @@ struct SettingsView: View {
                     Button("取消", role: .cancel) {}
                     Button("连接并开启") { store.authorizeKimiCredentials() }
                 } message: {
-                    Text("灵眸需要读取钥匙串“kimi-desktop Safe Storage”来解密 Kimi 登录凭证。本次连接最多等待 60 秒；拒绝或超时后不会自动重试。“始终允许”可让系统记住授权。之后后台只使用已有权限，权限失效时显示提示。口令只用于本机解密，不会外传。")
+                    Text("灵眸需要读取钥匙串“kimi-desktop Safe Storage”来解密 Kimi 登录凭证。本次连接最多等待 60 秒；拒绝或超时后不会自动重试。授权成功后会把解密口令以仅当前用户可读的文件备份在本机（~/.ai-statusbar），之后重建或重装灵眸都不会再掉授权，关闭本开关则立即删除该文件。口令只用于本机解密，不会外传；Kimi 桌面端重置密钥后需重新连接一次。")
                 }
                 if store.isAuthorizingKimi {
                     settingRow("等待钥匙串授权", detail: store.kimiAuthorizationMessage ?? "") {
@@ -245,6 +251,17 @@ struct SettingsView: View {
             }
             if settings.usageSyncEnabled {
                 syncDetail
+            }
+            divider
+            settingRow("会话记录", detail: "本机保留 7 天 / 200 条，显示在各 Harness 下") {
+                Button("清空…") { clearHistoryConfirmation = true }
+                    .disabled(store.recentEvents.isEmpty && store.historyError == nil)
+            }
+            .alert("清空会话记录？", isPresented: $clearHistoryConfirmation) {
+                Button("取消", role: .cancel) {}
+                Button("清空", role: .destructive) { store.clearHistory() }
+            } message: {
+                Text("仅清除灵眸本机记录，不影响原工具的对话。运行中和仍在等待的会话会保留，旧事件不会再次推送。")
             }
         }
     }
@@ -724,7 +741,7 @@ struct SettingsView: View {
             get: { settings.kimiTokenDecrypt },
             set: { enabled in
                 if enabled { showKimiDecryptAlert = true }
-                else { settings.kimiTokenDecrypt = false; store.refresh() }
+                else { settings.kimiTokenDecrypt = false; store.clearKimiKeyCache(); store.refresh() }
             }
         )
     }
