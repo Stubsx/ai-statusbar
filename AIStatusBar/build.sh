@@ -23,7 +23,8 @@ chmod 755 "$APP/Contents/Resources/lingmou-collector"
 
 for arch in arm64 x86_64; do
   swiftc -O -target "${arch}-apple-macosx12.0" -o ".build/AIStatusBar-${arch}" \
-    Sources/*.swift ../Sources/LingmouCollectorCore/ActivityModels.swift ../Sources/LingmouCollectorCore/EventFeed.swift
+    Sources/*.swift ../Sources/LingmouCollectorCore/ActivityModels.swift ../Sources/LingmouCollectorCore/EventFeed.swift \
+    ../Sources/LingmouCollectorCore/KimiWebNavigation.swift
 done
 lipo -create .build/AIStatusBar-arm64 .build/AIStatusBar-x86_64 -output "$APP/Contents/MacOS/AIStatusBar"
 rm -rf .build

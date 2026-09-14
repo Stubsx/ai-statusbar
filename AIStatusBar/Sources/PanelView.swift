@@ -18,6 +18,7 @@ struct PanelView: View {
     @AppStorage("usageBreakdown") private var usageBreakdown = "tools"
     @State private var historyTool = "all"
     @State private var clearHistoryConfirmation = false
+    @State private var kimiWebAvailable = false
 
     /// 当前展示的用量数据：开启同步且选择"全部"时用合并视图，否则本机
     private var usageForDisplay: UsageData? {
@@ -137,7 +138,9 @@ struct PanelView: View {
             }
             Divider().opacity(0.5)
             if tab == "status" {
-                summaryView
+                FittedPanelScrollView {
+                    summaryView.padding(.trailing, 2)
+                }
             } else {
                 FittedPanelScrollView {
                     VStack(alignment: .leading, spacing: 10) {
@@ -165,6 +168,18 @@ struct PanelView: View {
         .frame(width: tab == "status" ? 300 : (tab == "details" ? 380 : 340))
         .modifier(ConditionalGlass(bare: bare))
         .onAppear { applyLevel() }
+        .task(id: store.lastCollectedAt) {
+            guard store.data?.tools.contains(where: { $0.key == "kimi" && $0.state != "off" }) == true else {
+                kimiWebAvailable = false
+                return
+            }
+            let available = await Task.detached(priority: .utility) {
+                !KimiWebInstance.discover(home: FileManager.default.homeDirectoryForCurrentUser
+                    .appendingPathComponent(".kimi-code")).isEmpty
+            }.value
+            guard !Task.isCancelled else { return }
+            kimiWebAvailable = available
+        }
         .onChange(of: tab) { _ in
             DispatchQueue.main.async {
                 NotificationCenter.default.post(name: .statusUpdated, object: nil)
@@ -185,7 +200,7 @@ struct PanelView: View {
         store.attentionEvents.isEmpty && store.collectorError == nil ? 4 : 3
     }
 
-    /// 默认只是状态速览；任务再多也不把浮窗撑成长看板。
+    /// 会话按工具紧凑分组；展开后仍受外层滚动区域限高。
     private var summaryView: some View {
         VStack(alignment: .leading, spacing: 8) {
             if let error = store.collectorError {
@@ -221,27 +236,8 @@ struct PanelView: View {
             }
             if visibleTools.isEmpty { emptyStatus }
             ForEach(Array(visibleTools.prefix(summaryToolLimit)), id: \.key) { tool in
-                let sessionId = tool.state == "busy" ? (tool.activeItems ?? tool.busyItems).first?.id : nil
-                Button { NotificationRouter.openDestination(forToolKey: tool.key, sessionId: sessionId) } label: {
-                    HStack(spacing: 8) {
-                        Circle().fill(tool.health?.state == "error" ? .orange : color(for: tool.state))
-                            .frame(width: 6, height: 6)
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack {
-                                Text(tool.name).font(.system(size: 12, weight: .medium))
-                                Spacer(minLength: 6)
-                                Text(tool.health?.state == "error" ? "读取异常" :
-                                     (tool.state == "busy" ? "\(tool.busyCount) 个运行中" : label(for: tool.state)))
-                                    .font(.system(size: 10)).foregroundColor(.secondary)
-                            }
-                            if tool.state == "busy", let item = (tool.activeItems ?? tool.busyItems).first {
-                                Text(store.displayTitle(item.title)).font(.system(size: 11)).foregroundColor(.secondary)
-                                    .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                        }
-                        Image(systemName: "arrow.up.right").font(.system(size: 9)).foregroundColor(.secondary)
-                    }.padding(.vertical, 4).contentShape(Rectangle())
-                }.buttonStyle(.plain).help(NotificationRouter.destinationLabel(forToolKey: tool.key, sessionId: sessionId))
+                StatusToolSection(tool: tool, kimiWebAvailable: kimiWebAvailable,
+                                  displayTitle: { store.displayTitle($0) })
             }
             if visibleTools.count > summaryToolLimit {
                 Button("还有 \(visibleTools.count - summaryToolLimit) 个工具 · 查看全部") { tab = "details" }
@@ -269,45 +265,10 @@ struct PanelView: View {
             }
             if visibleTools.isEmpty { emptyStatus }
             ForEach(visibleTools, id: \.key) { tool in
-                VStack(alignment: .leading, spacing: 5) {
-                    HStack(spacing: 7) {
-                        Circle().fill(tool.health?.state == "error" ? .orange : color(for: tool.state)).frame(width: 6, height: 6)
-                        Text(tool.name).font(.system(size: 12, weight: .semibold))
-                        Spacer()
-                        Text(tool.state == "busy" ? "\(tool.busyCount) 个任务运行中" : label(for: tool.state))
-                            .font(.system(size: 10)).foregroundColor(.secondary)
-                        Button { NotificationRouter.openDestination(forToolKey: tool.key) } label: {
-                            Image(systemName: "arrow.up.right").font(.system(size: 10, weight: .semibold))
-                        }.buttonStyle(.borderless).help(NotificationRouter.destinationLabel(forToolKey: tool.key))
-                    }
-                    let items = tool.activeItems ?? tool.busyItems
-                    ForEach(items, id: \.id) { item in
-                        taskLink(title: item.title, toolKey: tool.key, sessionId: item.id)
-                    }
-                    if items.isEmpty, let title = tool.latestTitle {
-                        taskLink(title: "最近：\(title)", toolKey: tool.key, sessionId: tool.latestSessionId, secondary: true)
-                    }
-                    if tool.health?.state == "error" {
-                        Text(tool.health?.message ?? "部分数据不可读").font(.system(size: 10)).foregroundColor(.orange)
-                    }
-                }
-                .padding(.vertical, 3)
+                StatusToolSection(tool: tool, kimiWebAvailable: kimiWebAvailable, detailed: true,
+                                  displayTitle: { store.displayTitle($0) })
             }
         }
-    }
-
-    private func taskLink(title: String, toolKey: String, sessionId: String?, secondary: Bool = false) -> some View {
-        Button { NotificationRouter.openDestination(forToolKey: toolKey, sessionId: sessionId) } label: {
-            HStack(alignment: .top, spacing: 7) {
-                Image(systemName: secondary ? "clock" : "play.fill").font(.system(size: 8)).padding(.top, 3)
-                Text(store.displayTitle(title)).font(.system(size: 11))
-                    .lineLimit(4).frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .foregroundColor(secondary ? .secondary : .primary)
-            .padding(.leading, 13).padding(.vertical, 3).contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help("\(store.displayTitle(title))\n\(NotificationRouter.destinationLabel(forToolKey: toolKey, sessionId: sessionId))")
     }
 
     private var historyView: some View {

@@ -9,7 +9,8 @@ struct LocalCollectors {
     func kimi() -> RawToolState {
         let count = processes.count(named: "kimi") + processes.count(named: "kimi-code")
             + additionalKimiWebProcesses()
-        var result = RawToolState(processOn: count > 0, detail: "\(count) 个进程")
+        let processOn = count > 0
+        var result = RawToolState(processOn: processOn, detail: "\(count) 个进程")
         let root = environment.path(".kimi-code", "sessions")
         let stateFiles = files.files(atDepth: 3, under: root) { $0.hasSuffix("/state.json") }
         let window = TimeInterval(max(settings.busySeconds(for: "kimi"), 1_800))
@@ -32,10 +33,10 @@ struct LocalCollectors {
             guard let modified = wireFiles.compactMap(files.modificationTime).max() else {
                 continue
             }
-            updateLatest(&result, title: title, timestamp: modified)
+            let id = URL(fileURLWithPath: directory).lastPathComponent
+            updateLatest(&result, title: title, timestamp: modified, sessionId: id)
             guard environment.now - modified <= window else { continue }
-            applyKimiSignals(wireFiles, id: URL(fileURLWithPath: directory).lastPathComponent,
-                             title: title, processOn: count > 0, to: &result)
+            applyKimiSignals(wireFiles, id: id, title: title, processOn: processOn, to: &result)
         }
         return result
     }
@@ -725,10 +726,11 @@ struct LocalCollectors {
         return result
     }
 
-    private func updateLatest(_ result: inout RawToolState, title: String, timestamp: TimeInterval)
+    private func updateLatest(_ result: inout RawToolState, title: String, timestamp: TimeInterval,
+                              sessionId: String? = nil)
     {
         if result.latest.map({ timestamp > $0.timestamp }) ?? true {
-            result.latest = LatestItem(title: title, timestamp: timestamp)
+            result.latest = LatestItem(title: title, timestamp: timestamp, sessionId: sessionId)
         }
         result.activity = max(result.activity, timestamp)
     }

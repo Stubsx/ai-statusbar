@@ -16,7 +16,23 @@ func renderExperience() throws {
     for key in ["codex-cli", "claude", "kimi"] {
         assert(NotificationRouter.conversationURL(forToolKey: key, sessionId: codexID) == nil)
     }
+    assert(NotificationRouter.supportsSessionNavigation(forToolKey: "codex-ide", sessionId: codexID))
+    assert(!NotificationRouter.supportsSessionNavigation(forToolKey: "codex-ide", sessionId: "invalid"))
+    assert(NotificationRouter.supportsSessionNavigation(forToolKey: "kimi", sessionId: "web-session", kimiWebAvailable: true))
+    assert(!NotificationRouter.supportsSessionNavigation(forToolKey: "kimi", sessionId: "web-session"))
+    assert(!NotificationRouter.supportsSessionNavigation(forToolKey: "kimi", sessionId: "../bad", kimiWebAvailable: true))
+    for key in ["kimi-work", "claude", "codex-cli", "hermes", "zcode", "dsh", "unknown"] {
+        assert(!NotificationRouter.supportsSessionNavigation(forToolKey: key, sessionId: codexID, kimiWebAvailable: true))
+    }
+    assert(!NotificationRouter.supportsApplicationNavigation(forToolKey: "unknown"))
     print("PASS: Codex conversation links validate IDs and preserve CLI host routing")
+    let chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    assert(NotificationRouter.defaultChromiumProfilePID([(11, chrome), (22, chrome + " --headless --user-data-dir=/tmp/fixture")]) == 11)
+    assert(NotificationRouter.defaultChromiumProfilePID([(11, chrome), (22, chrome + " --headless=new")]) == 11)
+    assert(NotificationRouter.defaultChromiumProfilePID([(11, chrome)]) == nil)
+    assert(NotificationRouter.defaultChromiumProfilePID([(11, chrome + " --user-data-dir=/tmp/custom"), (22, chrome + " --headless")]) == nil)
+    assert(NotificationRouter.defaultChromiumProfilePID([(11, chrome), (12, chrome), (22, chrome + " --headless")]) == nil)
+    print("PASS: browser routing avoids headless Chromium without guessing custom profiles")
     // Process names and interpreter wrappers must route to the same host without
     // treating task text or a desktop app's internal server as a separate CLI.
     let routes: [(String, String, [String], Bool)] = [
@@ -131,8 +147,12 @@ func renderExperience() throws {
        "capabilities":{"event_phases":["ended"],"usage":true,"quota":false,"navigation":"host"}}
     ],"usage":{"date":"2026-09-11","tools":{"codex":{"input":125000,"output":31000,"cache":480000}},"models":{"sample-model":{"input":125000,"output":31000,"cache":480000}},"total":{"input":125000,"output":31000,"cache":480000}}}
     """
+    let sessionIDs = (1...7).map { "01234567-89ab-4cde-8fab-0123456789a\($0)" }
+    let sessionJSON = sessionIDs.enumerated().reduce(json) { value, entry in
+        value.replacingOccurrences(of: "\"s\(entry.offset + 1)\"", with: "\"\(entry.element)\"")
+    }
     let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
-    store.data = try decoder.decode(StatusData.self, from: Data(json.utf8))
+    store.data = try decoder.decode(StatusData.self, from: Data(sessionJSON.utf8))
     store.lastCollectedAt = now
     store.recentEvents = [
         TaskRecord(id: "wait", toolKey: "codex-ide", toolName: "Codex App", sessionId: "wait-session", title: "选择本次导出的报告范围", phase: "waiting_input", timestamp: now - 20, evidence: "explicit", acknowledged: false, resolved: false),
@@ -149,7 +169,7 @@ func renderExperience() throws {
                                     openTool: Selector(("openTool:")), openConnections: Selector(("openConnections")),
                                     displayTitle: { store.displayTitle($0) })
     let destinations = menuItems(toolMenu).compactMap { $0.representedObject as? ToolDestination }
-    assert(Set(destinations.compactMap(\.sessionId)) == Set((1...7).map { "s\($0)" }),
+    assert(Set(destinations.compactMap(\.sessionId)) == Set(sessionIDs),
            "Overflow must use activeItems, not the one-item busyItems preview")
     assert(destinations.allSatisfy { $0.toolKey == "codex-ide" })
     settings.experience.privacyMode = true
@@ -207,6 +227,49 @@ func renderExperience() throws {
         try data.write(to: output.appendingPathComponent(name + ".png"))
         print("SNAPSHOT: \(name) · \(Int(size.width)) × \(Int(size.height)) pt")
         return size
+    }
+    // Isolated session fixtures cover both navigation capabilities and privacy.
+    var kimiTool = ToolStatus(key: "kimi", letter: "K", name: "Kimi Code / Web", state: "busy",
+                              busyCount: 2, busyItems: [], detail: "", latestTitle: nil, latestAge: nil, quota: nil)
+    kimiTool.activeItems = [BusyItem(id: "kimi-web-one", title: "检查状态页的会话跳转"),
+                           BusyItem(id: "kimi-web-two", title: "整理本周项目进度")]
+    let hostTool = ToolStatus(key: "claude", letter: "L", name: "Claude Code", state: "busy",
+                              busyCount: 1, busyItems: [BusyItem(id: "host-only", title: "核对构建输出")],
+                              detail: "", latestTitle: nil, latestAge: nil, quota: nil)
+    func sessionSections(webAvailable: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach([store.data!.tools[0], kimiTool, hostTool], id: \.key) { tool in
+                StatusToolSection(tool: tool, kimiWebAvailable: webAvailable,
+                                  displayTitle: { settings.experience.privacyMode ? "任务标题已隐藏" : $0 },
+                                  openDestination: { print("SESSION_ROUTE: \($0.toolKey) / \($0.sessionId ?? "application")") })
+            }
+        }.padding(14).frame(width: 300)
+    }
+    for scheme in [ColorScheme.light, .dark] {
+        try save("session-list-" + (scheme == .light ? "light" : "dark"),
+                 content: sessionSections(webAvailable: true)
+                    .background(scheme == .light ? Color.white : Color(red: 0.09, green: 0.11, blue: 0.16)), scheme: scheme)
+    }
+    settings.experience.privacyMode = true
+    try save("session-list-private", content: sessionSections(webAvailable: true).background(Color.white), scheme: .light)
+    settings.experience.privacyMode = false
+    try save("session-list-host-only", content: sessionSections(webAvailable: false).background(Color.white), scheme: .light)
+    // Optional visible fixture for real pointer/keyboard checks; routes are captured
+    // locally so checking a sample row cannot open an unrelated real conversation.
+    if CommandLine.arguments.contains("--interactive-sessions") {
+        NSApp.setActivationPolicy(.regular)
+        let hosted = NSHostingView(rootView: sessionSections(webAvailable: true).background(Color.white))
+        let window = NSWindow(contentRect: NSRect(x: 200, y: 200, width: 300, height: 500),
+                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.title = "状态会话交互验证"
+        window.acceptsMouseMovedEvents = true
+        window.isReleasedWhenClosed = false
+        window.contentView = hosted
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.run()
+        window.orderOut(nil)
+        window.close()
     }
     // A fresh collector snapshot must not make an old quota appear current.
     let staleStore = StatusStore(collectorPath: nil, settings: settings, storageDirectory: temporary.appendingPathComponent("stale"))
@@ -352,7 +415,7 @@ func renderExperience() throws {
         defaults.set(true, forKey: "panelExpanded")
         let size = try save(name, content: PanelView(store: store).defaultAppStorage(defaults)
             .background(scheme == .light ? Color.white : Color(red: 0.09, green: 0.11, blue: 0.16)), scheme: scheme)
-        if tab == "status" { assert(size.width == 300 && size.height < 300) }
+        if tab == "status" { assert(size.width == 300 && size.height <= 420) }
     }
     let overviewStore = StatusStore(collectorPath: nil, settings: settings,
                                    storageDirectory: temporary.appendingPathComponent("overview"))
@@ -381,7 +444,7 @@ func renderExperience() throws {
         overviewStore.lastCollectedAt = scenario == "error" ? now - 100 : now
         let size = try save("status-" + scenario, content: PanelView(store: overviewStore)
             .defaultAppStorage(overviewDefaults).background(Color.white), scheme: .light)
-        assert(size.width == 300 && size.height <= 340, "Summary must stay small, even with 240 active tasks")
+        assert(size.width == 300 && size.height <= 420, "Summary must stay bounded, even with 240 active tasks")
     }
     settings.experience.privacyMode = false
     for tab in ["general", "connections", "notify", "data", "welcome"] {
@@ -452,6 +515,6 @@ func renderExperience() throws {
     assert(keyboardPanel.performKeyEquivalent(with: escape) && overviewDefaults.string(forKey: "panelTab") == "status")
     keyboardPanel.close()
     print("PASS: 8 native panel keyboard shortcuts and fitted sizing after navigation")
-    print("PASS: rendered 24 isolated native experience snapshots, event reading, bounded summaries, light/dark, task details, privacy, settings and attention badge")
+    print("PASS: rendered isolated native experience snapshots, session links, event reading, bounded summaries, light/dark, task details, privacy, settings and attention badge")
 }
 if #available(macOS 13, *) { try MainActor.assumeIsolated { try renderExperience() } }

@@ -17,5 +17,6 @@ done
     "${TASK_SOURCES[@]}" \
     "$TASK_ROOT/Sources/LingmouCollectorCore/ActivityModels.swift" \
     "$TASK_ROOT/Sources/LingmouCollectorCore/EventFeed.swift" \
+    "$TASK_ROOT/Sources/LingmouCollectorCore/KimiWebNavigation.swift" \
     "$TASK_ROOT/tests/ExperienceVisualTests/main.swift" -o "$TASK_APP/Contents/MacOS/experience-visuals"
 "$TASK_APP/Contents/MacOS/experience-visuals" "$TASK_OUTPUT"

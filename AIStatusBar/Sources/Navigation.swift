@@ -5,9 +5,21 @@ struct ToolDestination {
     var sessionId: String? = nil
 }
 
-/// Codex local conversations have an official deep link; other tools retain host-level routing.
+/// Conversation-aware routes share the same entry point as task rows and notifications.
 enum NotificationRouter {
     private static let hostedCodexMarks = ["ChatGPT.app/", "Codex.app/", "app-server", "mcp-server"]
+    private static var resolvingKimi = false
+
+    /// Rendering must never probe local servers or infer a session route from an app route.
+    static func supportsSessionNavigation(forToolKey key: String, sessionId: String?,
+                                          kimiWebAvailable: Bool = false) -> Bool {
+        if conversationURL(forToolKey: key, sessionId: sessionId) != nil { return true }
+        return key == "kimi" && kimiWebAvailable && sessionId.map(KimiWebInstance.validID) == true
+    }
+
+    static func supportsApplicationNavigation(forToolKey key: String) -> Bool {
+        ["codex-ide", "codex-cli", "kimi", "kimi-work", "claude", "hermes", "zcode", "dsh"].contains(key)
+    }
 
     static func destinationLabel(forToolKey key: String, sessionId: String? = nil) -> String {
         if conversationURL(forToolKey: key, sessionId: sessionId) != nil { return "打开这条 Codex 对话" }
@@ -16,7 +28,8 @@ enum NotificationRouter {
         case "kimi-work": return "打开 Kimi 应用"
         case "zcode": return "打开 ZCode 应用或宿主"
         case "hermes": return "打开 Hermes 应用或宿主"
-        case "codex-cli", "kimi", "claude": return "打开宿主终端或编辑器"
+        case "kimi": return sessionId == nil ? "打开 Kimi 网页或宿主" : "打开对应 Kimi 会话或宿主"
+        case "codex-cli", "claude": return "打开宿主终端或编辑器"
         case "dsh": return "打开 DSH 页面"
         default: return "暂不支持自动打开"
         }
@@ -49,7 +62,7 @@ enum NotificationRouter {
                 if openHost(of: "zcode-cli", reportMissing: false) { return }
                 openApplication(bundleID: "dev.zcode.app", path: "/Applications/ZCode.app")
             case "codex-cli": _ = openHost(of: "codex", excluding: hostedCodexMarks)
-            case "kimi": _ = openHost(of: "kimi")
+            case "kimi": openKimi(sessionId: sessionId)
             case "claude": _ = openHost(of: "claude", excluding: ["Claude.app/"])
             case "hermes":
                 if activateRunningApp(bundleID: "com.nousresearch.hermes", named: ["Hermes"]) { return }
@@ -62,6 +75,118 @@ enum NotificationRouter {
                 explain("这个工具暂不支持自动打开", detail: "请回到原工具查看对应任务。")
             }
         }
+    }
+
+    private static func openKimi(sessionId: String?) {
+        guard !resolvingKimi else { return }
+        resolvingKimi = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let resolution = KimiWebResolver().resolve(sessionId: sessionId)
+            DispatchQueue.main.async {
+                resolvingKimi = false
+                if let destination = resolution.direct {
+                    openKimiPage(destination.url)
+                    return
+                }
+                if resolution.candidates.isEmpty && !resolution.unavailable {
+                    _ = openHost(of: "kimi")
+                    return
+                }
+                let alert = NSAlert()
+                alert.messageText = "选择 Kimi 会话的打开位置"
+                if resolution.candidates.isEmpty {
+                    alert.informativeText = "本机 Kimi 网页服务暂不可用、未授权或无法读取这条会话。请检查原网页服务，或回到宿主终端。"
+                } else if resolution.candidates.contains(where: \.confirmed) {
+                    alert.informativeText = "这条会话在多个网页服务中打开，请选择要查看的位置。"
+                } else {
+                    alert.informativeText = sessionId == nil
+                        ? "可打开本机 Kimi 网页，或回到宿主终端。"
+                        : "尚未确认这条会话的原位置。可在网页查看已有记录，或回到宿主终端。"
+                }
+                for candidate in resolution.candidates {
+                    alert.addButton(withTitle: "\(sessionId == nil ? "打开网页" : "在网页查看") · \(candidate.instance.port)")
+                }
+                alert.addButton(withTitle: "打开宿主终端")
+                alert.addButton(withTitle: "取消")
+                NSApp.activate(ignoringOtherApps: true)
+                let index = alert.runModal().rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
+                if resolution.candidates.indices.contains(index) {
+                    openKimiPage(resolution.candidates[index].url)
+                } else if index == resolution.candidates.count {
+                    _ = openHost(of: "kimi")
+                }
+            }
+        }
+    }
+
+    private static func openKimiPage(_ url: URL) {
+        guard let browser = NSWorkspace.shared.urlForApplication(toOpen: url) else {
+            explain("无法打开 Kimi 会话", detail: "请先配置默认浏览器。")
+            return
+        }
+        if openInDefaultChromiumProfile(url, browser: browser) { return }
+        if #available(macOS 14, *), let bundleID = Bundle(url: browser)?.bundleIdentifier {
+            NSApp.yieldActivation(toApplicationWithBundleIdentifier: bundleID)
+        }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        configuration.createsNewApplicationInstance = false
+        configuration.allowsRunningApplicationSubstitution = false
+        NSWorkspace.shared.open([url], withApplicationAt: browser, configuration: configuration) { app, error in
+            if error != nil || app == nil {
+                DispatchQueue.main.async {
+                    explain("无法打开 Kimi 会话", detail: "请检查默认浏览器和本机 Kimi 网页服务。")
+                }
+            }
+        }
+    }
+
+    /// Launch Services can select a headless Chrome instance created by developer
+    /// tools. Chromium's normal executable forwards URLs to its existing default
+    /// profile through ProcessSingleton, without Apple Events automation access.
+    private static func openInDefaultChromiumProfile(_ url: URL, browser: URL) -> Bool {
+        guard let bundle = Bundle(url: browser),
+              let bundleID = bundle.bundleIdentifier,
+              ["com.google.Chrome", "com.microsoft.edgemac", "org.chromium.Chromium"].contains(bundleID),
+              let executable = bundle.executableURL else { return false }
+        let apps = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+        guard apps.count > 1 else { return false }
+        let pids = Set(apps.map(\.processIdentifier))
+        let lines = psLines().filter { pids.contains($0.pid) }.map { (pid: $0.pid, args: $0.args) }
+        guard let pid = defaultChromiumProfilePID(lines), let app = apps.first(where: { $0.processIdentifier == pid }) else {
+            return false
+        }
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = [url.absoluteString]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        process.terminationHandler = { task in
+            if task.terminationStatus != 0 {
+                DispatchQueue.main.async {
+                    explain("无法打开 Kimi 会话", detail: "请从默认浏览器打开本机 Kimi 网页后重试。")
+                }
+            }
+        }
+        do { try process.run() } catch { return false }
+        app.unhide()
+        _ = requestActivation(app)
+        return true
+    }
+
+    static func defaultChromiumProfilePID(_ lines: [(pid: Int32, args: String)]) -> Int32? {
+        func flags(_ args: String) -> [Substring] { args.split(whereSeparator: \.isWhitespace) }
+        func headless(_ args: String) -> Bool {
+            flags(args).contains { $0 == "--headless" || $0.hasPrefix("--headless=") }
+        }
+        guard lines.contains(where: { headless($0.args) }) else { return nil }
+        let visible = lines.filter { !headless($0.args) }
+        guard visible.count == 1,
+              !flags(visible[0].args).contains(where: {
+                  $0 == "--user-data-dir" || $0.hasPrefix("--user-data-dir=")
+                      || $0 == "--profile-directory" || $0.hasPrefix("--profile-directory=")
+              }) else { return nil }
+        return visible[0].pid
     }
 
     private static func openCodexConversation(_ url: URL) {
@@ -147,11 +272,14 @@ enum NotificationRouter {
     /// Multiple CLI processes in one GUI app still cannot identify that app's terminal window.
     private static func openHost(of name: String, excluding: [String] = [], reportMissing: Bool = true) -> Bool {
         let lines = psLines()
+        let kimiWebPIDs: Set<Int32> = name == "kimi" ? Set(KimiWebInstance.discover(
+            home: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kimi-code")
+        ).map(\.pid)) : []
         let appByPID = Dictionary(NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }
             .map { ($0.processIdentifier, $0) }, uniquingKeysWith: { first, _ in first })
         let parents = Dictionary(lines.map { ($0.pid, $0.ppid) }, uniquingKeysWith: { first, _ in first })
         var hosts: [pid_t: Int] = [:]
-        for line in lines where matches(line.args, name: name, excluding: excluding) {
+        for line in lines where matches(line.args, name: name, excluding: excluding) || kimiWebPIDs.contains(line.pid) {
             var cursor = line.ppid
             var seen = Set<pid_t>()
             while cursor > 1 && seen.insert(cursor).inserted {
