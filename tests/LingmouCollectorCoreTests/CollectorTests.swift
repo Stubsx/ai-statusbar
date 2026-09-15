@@ -266,6 +266,94 @@ final class CollectorTests: XCTestCase {
         XCTAssertFalse(collector.collect().ide.busy.isEmpty)
     }
 
+    /// 压缩续段文件（rollout-…-<线程id>_<新rolloutid>.jsonl）从文件名推不出线程 id，
+    /// 必须以 session_meta 里的 id 归并：同一线程只出现一次，标题来自线程索引，
+    /// 而不是多出一条“(未命名会话)”。
+    func testCodexCompactionSegmentsMergeIntoSingleThread() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let original = home.appendingPathComponent(
+            ".codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-12345678-1234-1234-1234-123456789abc.jsonl"
+        )
+        let segment = home.appendingPathComponent(
+            ".codex/sessions/2026/01/01/rollout-2026-01-01T01-00-00-12345678-1234-1234-1234-123456789abc_87654321-4321-4321-4321-cba987654321.jsonl"
+        )
+        let index = home.appendingPathComponent(".codex/session_index.jsonl")
+        try write(
+            """
+            {"id":"12345678-1234-1234-1234-123456789abc","thread_name":"衣橱小程序","updated_at":"2033-05-18T03:33:20Z"}
+            """ + "\n", to: index)
+        try write(
+            """
+            {"type":"session_meta","payload":{"id":"12345678-1234-1234-1234-123456789abc","source":"vscode"}}
+            {"type":"event_msg","payload":{"type":"turn_aborted"}}
+            """ + "\n", to: original)
+        try write(
+            """
+            {"type":"session_meta","payload":{"id":"12345678-1234-1234-1234-123456789abc","source":"vscode"}}
+            {"type":"event_msg","payload":{"type":"task_started"}}
+            """ + "\n", to: segment)
+        for (url, mtime) in [(original, now - 100), (segment, now)] {
+            try FileManager.default.setAttributes(
+                [.modificationDate: Date(timeIntervalSince1970: mtime)], ofItemAtPath: url.path)
+        }
+        let process = ProcessSupport { executable, arguments, _ in
+            executable == "/bin/ps" && arguments.contains("args=")
+                ? "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT\n" : ""
+        }
+        let collector = CodexCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            settings: CollectorSettings(),
+            files: FileSupport(),
+            processes: process
+        )
+        XCTAssertEqual(
+            collector.collect().ide.busy,
+            [BusyItem(id: "12345678-1234-1234-1234-123456789abc", title: "衣橱小程序")])
+    }
+
+    /// 压缩后的新分段还没有任何任务事件（用户尚未开新一轮）时，
+    /// 沿用上一分段的结束/中断状态，不能让会话从最近列表里消失。
+    func testCodexFreshSegmentKeepsPreviousSegmentState() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let original = home.appendingPathComponent(
+            ".codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-12345678-1234-1234-1234-123456789abc.jsonl"
+        )
+        let segment = home.appendingPathComponent(
+            ".codex/sessions/2026/01/01/rollout-2026-01-01T01-00-00-12345678-1234-1234-1234-123456789abc_87654321-4321-4321-4321-cba987654321.jsonl"
+        )
+        try write(
+            """
+            {"type":"session_meta","payload":{"id":"12345678-1234-1234-1234-123456789abc","source":"vscode"}}
+            {"type":"event_msg","payload":{"type":"task_complete"}}
+            """ + "\n", to: original)
+        try write(
+            """
+            {"type":"session_meta","payload":{"id":"12345678-1234-1234-1234-123456789abc","source":"vscode"}}
+            {"type":"turn_context","payload":{}}
+            """ + "\n", to: segment)
+        for (url, mtime) in [(original, now - 100), (segment, now)] {
+            try FileManager.default.setAttributes(
+                [.modificationDate: Date(timeIntervalSince1970: mtime)], ofItemAtPath: url.path)
+        }
+        let process = ProcessSupport { executable, arguments, _ in
+            executable == "/bin/ps" && arguments.contains("args=")
+                ? "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT\n" : ""
+        }
+        let collector = CodexCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            settings: CollectorSettings(),
+            files: FileSupport(),
+            processes: process
+        )
+        let result = collector.collect()
+        XCTAssertTrue(result.ide.busy.isEmpty)
+        XCTAssertEqual(result.ide.activities.map(\.phase), ["ended"])
+    }
+
     func testCodexCliCountIgnoresIdeManagedServerProcesses() throws {
         let home = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: home) }
@@ -1365,6 +1453,111 @@ final class CollectorTests: XCTestCase {
         XCTAssertEqual(
             collectors(dshProcess).dsh().busy,
             [BusyItem(id: "session-busy", title: "DSH 忙碌会话")])
+    }
+
+    /// 新版投影缓存按会话分文件存放（session_projcache/sessions/session-*.json，
+    /// record.rows / record.identity），busy 新鲜度按各自文件 mtime 判定；
+    /// 进程匹配也要覆盖 ~/.local/bin/dsh 这类不含 .bin 的安装路径。
+    func testDshPerSessionProjcacheLayout() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        func projection(title: String, openStep: String, lastPromptAt: Int64,
+                        turnBoundary: String = "") -> String {
+            """
+            {"version":5,"record":{"identity":{"createdAt":1999999000000,"cwd":"/tmp/proj"},"rows":{
+                "title":{"val":"\(title)"},
+                "sessionStats":{"val":{"openStep":\(openStep),"pendingCalls":{}}},
+                "sessionListMetadata":{"val":{"lastPromptAt":\(lastPromptAt)}}\(turnBoundary)}}}
+            """
+        }
+        let busyFile = home.appendingPathComponent(
+            ".dsh/storages/session_projcache/sessions/session-busy.json")
+        let doneFile = home.appendingPathComponent(
+            ".dsh/storages/session_projcache/sessions/session-done.json")
+        try write(projection(title: "DSH 忙碌会话", openStep: "2", lastPromptAt: 2_000_000_000_000),
+                  to: busyFile)
+        try write(
+            projection(
+                title: "DSH 已完成会话", openStep: "null", lastPromptAt: 1_999_999_900_000,
+                turnBoundary:
+                    #" ,"turnBoundary":{"val":{"openTurnStartSeq":null,"lastStepStartSeq":10,"lastStepBoundary":{"kind":"end","seq":20},"lastTurn":1}}"#
+            ),
+            to: doneFile)
+        try touch(busyFile, at: now)
+        try touch(doneFile, at: now)
+        let dshProcess = processSupport([
+            "node /home/x/.local/bin/dsh web"
+        ])
+        func collectors(_ processes: ProcessSupport) -> LocalCollectors {
+            LocalCollectors(
+                environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+                settings: CollectorSettings(), files: FileSupport(), processes: processes)
+        }
+        let busy = collectors(dshProcess).dsh()
+        XCTAssertTrue(busy.processOn)
+        XCTAssertEqual(busy.busy, [BusyItem(id: "session-busy", title: "DSH 忙碌会话")])
+        XCTAssertEqual(busy.latest?.title, "DSH 忙碌会话")
+        // 活动事件：忙碌会话报 working，完成会话报 ended（id 带边界 seq，重复采集不重复通知）
+        XCTAssertEqual(
+            busy.activities.filter { $0.phase == "working" }.map(\.sessionId), ["session-busy"])
+        let ended = busy.activities.filter { $0.phase == "ended" }
+        XCTAssertEqual(ended.map(\.id), ["session-done:ended:20"])
+        XCTAssertEqual(ended.first?.updatedAt, now)
+        XCTAssertEqual(collectors(dshProcess).dsh().activities.filter { $0.phase == "ended" }.map(\.id),
+                       ["session-done:ended:20"], "同一边界 seq 的 ended 事件 id 必须稳定")
+        // 进程不在 → 无 busy（哪怕 openStep 残留）
+        XCTAssertTrue(collectors(processSupport([])).dsh().busy.isEmpty)
+        // 忙碌会话的投影文件陈旧（另一会话仍新鲜）→ 按会话新鲜度不判 busy
+        try touch(busyFile, at: now - 3_600)
+        XCTAssertTrue(collectors(dshProcess).dsh().busy.isEmpty)
+        // 备份路径：投影陈旧但事件流文件在窗口内有写入 → 仍判 busy
+        let sessionFile = home.appendingPathComponent(
+            ".dsh/sessions/--tmp-proj--/session-busy/session.jsonl.zstd")
+        try write("placeholder\n", to: sessionFile)
+        try touch(sessionFile, at: now)
+        XCTAssertEqual(
+            collectors(dshProcess).dsh().busy,
+            [BusyItem(id: "session-busy", title: "DSH 忙碌会话")])
+    }
+
+    /// 用量快照差分同样支持按会话分文件的新版投影缓存。
+    func testDshUsagePerSessionProjcacheLayout() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let timestamp = try XCTUnwrap(DateSupport.timestamp("2033-05-18T03:33:20Z"))
+        try write(
+            """
+            agent-default-model:
+              provider: hczq
+              model: DeepSeek-V4-Flash
+            """,
+            to: home.appendingPathComponent(".dsh/settings.yaml"))
+        let sessionFile = home.appendingPathComponent(
+            ".dsh/storages/session_projcache/sessions/session-1.json")
+        func totals(_ input: Int, _ output: Int, _ cached: Int) -> String {
+            """
+            {"version":5,"record":{"identity":{"createdAt":1999999000000,"cwd":"/tmp/proj"},"rows":{
+                "tokenUsage":{"val":{"totals":{"uncachedInputTokens":\(input),"outputTokens":\(output),"cacheReadTokens":\(cached)}}},
+                "sessionListMetadata":{"val":{"lastPromptAt":2000000000000}}}}}
+            """
+        }
+        try write(totals(100, 20, 40), to: sessionFile)
+        var collector = UsageCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: timestamp),
+            files: FileSupport()
+        )
+        let first = try XCTUnwrap(collector.collect())
+        XCTAssertEqual(first.tools["dsh"], UsageEntry(input: 100, output: 20, cache: 40))
+        // 增量入账：totals 涨到 150/30/50 后只记差值
+        try write(totals(150, 30, 50), to: sessionFile)
+        collector = UsageCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: timestamp),
+            files: FileSupport()
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(collector.collect()).tools["dsh"],
+            UsageEntry(input: 150, output: 30, cache: 50))
     }
 
     func testDshUsageSnapshotDiff() throws {

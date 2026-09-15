@@ -22,6 +22,8 @@ open "AIStatusBar/灵眸.app"
 
 The first three commands validate collector output, tests, privacy checks, and Swift compilation. `build.sh` compiles universal `arm64`/`x86_64` app and collector binaries, embeds the collector, and signs both with the configured identity. Local builds prefer the stable self-signed `Lingmou Local` identity and fall back to ad-hoc signing; public releases must use a Developer ID identity and Apple notarization. macOS TCC grants (screen recording, notifications) follow the signing certificate, so never mix identities across machines — unify via `scripts/import-signing-identity.sh` with a `.p12` exported from the primary build machine. `build-dmg.sh` rebuilds and creates a versioned installer in `dist/`.
 
+After each completed work stage, run `./scripts/install-local.sh` to rebuild, replace `/Applications/灵眸.app`, and relaunch it, so the user always runs the latest build without being asked. It rebuilds first and never touches the running instance when the build fails.
+
 ## Coding Style & Naming Conventions
 
 Use four-space indentation and Swift conventions (`PascalCase` types, `camelCase` properties and methods). Preserve encoded JSON field names because they are a shared API between the Swift core, native App, SwiftBar, and JSX. Keep collectors defensive: missing databases, malformed JSONL, or unavailable processes should degrade to empty/idle data instead of crashing. Do not edit files inside `灵眸.app` directly; rebuild them from source.

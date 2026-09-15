@@ -534,10 +534,12 @@ struct UsageCollector {
         }
     }
 
-    /// DSH 用量：读 session_projcache.json 投影缓存里每会话的 tokenUsage.totals
-    /// （会话级累计值），快照差分入账。projcache 无 per-session 模型，
-    /// 模型 id 从会话事件流（session.jsonl.zstd）尾部的 finish 块解析，
-    /// 依赖外部 zstd 二进制；不可用时回退 settings.yaml 的 agent-default-model。
+    /// DSH 用量：读投影缓存里每会话的 tokenUsage.totals（会话级累计值），快照差分入账。
+    /// 新版缓存按会话分文件存放在 session_projcache/sessions/session-*.json
+    /// （record.rows），旧版是单一 session_projcache.json。
+    /// projcache 无 per-session 模型，模型 id 从会话事件流（session.jsonl.zstd）
+    /// 尾部的 finish 块解析，依赖外部 zstd 二进制；不可用时回退 settings.yaml 的
+    /// agent-default-model。
     private func collectDsh(database: SQLiteDatabase) {
         do {
             try database.execute(
@@ -545,11 +547,34 @@ struct UsageCollector {
                 CREATE TABLE IF NOT EXISTS dsh_snap(
                     pk TEXT PRIMARY KEY, input INT, output INT, cache INT)
                 """)
-            let cachePath = environment.path(".dsh", "storages", "session_projcache.json")
-            guard let root = files.read(cachePath).flatMap(JSONValue.object),
-                let tables = root["tables"] as? JSONObject,
-                let sessions = tables["sessions"] as? JSONObject
-            else { return }
+            var sessions: [(id: String, rows: JSONObject)] = []
+            let cacheDirectory = environment.path(".dsh", "storages", "session_projcache", "sessions")
+            let projectionFiles = files.files(atDepth: 1, under: cacheDirectory) {
+                $0.hasSuffix(".json")
+            }
+            if !projectionFiles.isEmpty {
+                for path in projectionFiles {
+                    let id = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+                    guard let root = files.read(path).flatMap(JSONValue.object),
+                        let record = root["record"] as? JSONObject,
+                        let rows = record["rows"] as? JSONObject
+                    else { continue }
+                    sessions.append((id, rows))
+                }
+            } else {
+                let cachePath = environment.path(".dsh", "storages", "session_projcache.json")
+                guard let root = files.read(cachePath).flatMap(JSONValue.object),
+                    let tables = root["tables"] as? JSONObject,
+                    let table = tables["sessions"] as? JSONObject
+                else { return }
+                for (id, entry) in table {
+                    guard let entry = entry as? JSONObject,
+                        let rows = entry["rows"] as? JSONObject
+                    else { continue }
+                    sessions.append((id, rows))
+                }
+            }
+            guard !sessions.isEmpty else { return }
             // 会话路径映射只有出现用量增量的会话才用得上；全量枚举 sessions 树
             // 每轮都做太贵，延迟到首个增量会话再扫一次（每轮最多一次）。
             var sessionPathsCache: [String]?
@@ -567,10 +592,8 @@ struct UsageCollector {
             let calendar = Calendar.current
             let todayStart = calendar.startOfDay(for: Date(timeIntervalSince1970: environment.now))
                 .timeIntervalSince1970
-            for (id, entry) in sessions {
-                guard let entry = entry as? JSONObject,
-                    let rows = entry["rows"] as? JSONObject,
-                    let usage = (rows["tokenUsage"] as? JSONObject)?["val"] as? JSONObject,
+            for (id, rows) in sessions {
+                guard let usage = (rows["tokenUsage"] as? JSONObject)?["val"] as? JSONObject,
                     let totals = usage["totals"] as? JSONObject
                 else { continue }
                 let input = JSONValue.int(totals["uncachedInputTokens"]) ?? 0

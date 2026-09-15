@@ -285,9 +285,14 @@ final class ProcessSupport {
 
     /// 整行子串匹配：进程首 token 不是目标名时使用（如 node 托管的 `dsh web`）。
     func count(matching substring: String, excluding excluded: [String] = []) -> Int {
+        count(matchingAny: [substring], excluding: excluded)
+    }
+
+    /// 多个候选子串命中其一即计一次（同一行不重复计数）。
+    func count(matchingAny substrings: [String], excluding excluded: [String] = []) -> Int {
         cachedArgumentLines()
             .reduce(into: 0) { count, line in
-                guard line.contains(substring),
+                guard substrings.contains(where: line.contains),
                     !excluded.contains(where: line.contains)
                 else { return }
                 count += 1

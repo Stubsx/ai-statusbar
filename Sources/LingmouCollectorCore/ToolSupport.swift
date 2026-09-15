@@ -18,7 +18,7 @@ public enum ToolSupport {
         case "kimi-work":
             return ToolCapabilities(eventPhases: ["ended"], quota: true)
         case "dsh":
-            return ToolCapabilities(navigation: "web")
+            return ToolCapabilities(eventPhases: ["ended"], navigation: "web")
         default:
             return ToolCapabilities(usage: false, navigation: "unsupported")
         }

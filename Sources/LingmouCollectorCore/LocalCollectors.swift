@@ -270,51 +270,104 @@ struct LocalCollectors {
     }
 
     func dsh() -> RawToolState {
-        let count = processes.count(matching: ".bin/dsh")
+        // 兼容两种安装路径：npx 的 node_modules/.bin/dsh 与直装的 */bin/dsh（如 ~/.local/bin/dsh）
+        let count = processes.count(matchingAny: [".bin/dsh", "/bin/dsh"])
         var result = RawToolState(processOn: count > 0, detail: count > 0 ? "Web 在线" : "无进程")
         let window = TimeInterval(settings.busySeconds(for: "dsh"))
         // 投影缓存：dsh web 端实时维护的会话投影（标题/进行中的 step/待回工具调用），
         // 与 session.jsonl.zstd 事件流同步落盘，免解压即可拿到 busy 信号。
-        let cachePath = environment.path(".dsh", "storages", "session_projcache.json")
-        let cacheModified = files.modificationTime(cachePath)
-        let cacheFresh = cacheModified.map { environment.now - $0 <= window } ?? false
+        // 新版按会话分文件存放在 session_projcache/sessions/session-*.json
+        // （record.rows / record.identity）；旧版是单一 session_projcache.json。
         var titles: [String: String] = [:]
-        if let root = files.read(cachePath).flatMap(JSONValue.object),
-            let tables = root["tables"] as? JSONObject,
-            let sessions = tables["sessions"] as? JSONObject
-        {
-            for (id, entry) in sessions {
-                guard let entry = entry as? JSONObject else { continue }
-                let rows = entry["rows"] as? JSONObject ?? [:]
-                let identity = entry["identity"] as? JSONObject ?? [:]
-                func rowValue(_ key: String) -> Any? {
-                    (rows[key] as? JSONObject)?["val"]
+        var projectionFresh: [String: Bool] = [:]
+        var cacheModified: TimeInterval?
+        var parsedAny = false
+        func applySession(id: String, rows: JSONObject, identity: JSONObject, modified: TimeInterval?) {
+            parsedAny = true
+            func rowValue(_ key: String) -> Any? {
+                (rows[key] as? JSONObject)?["val"]
+            }
+            let title =
+                JSONValue.string(rowValue("title")).flatMap({ $0.isEmpty ? nil : $0 })
+                ?? JSONValue.string(identity["cwd"]).flatMap {
+                    URL(fileURLWithPath: $0).lastPathComponent.nonempty
+                } ?? "(未命名会话)"
+            titles[id] = title
+            let metadata = rowValue("sessionListMetadata") as? JSONObject ?? [:]
+            let milliseconds =
+                JSONValue.double(metadata["lastPromptAt"])
+                ?? JSONValue.double(identity["createdAt"])
+            if let milliseconds {
+                updateLatest(&result, title: title, timestamp: milliseconds / 1_000)
+            }
+            let stats = rowValue("sessionStats") as? JSONObject ?? [:]
+            let openStep =
+                stats["openStep"] != nil && !(stats["openStep"] is NSNull)
+            let pendingCalls = (stats["pendingCalls"] as? JSONObject)?.isEmpty == false
+            let fresh = modified.map { environment.now - $0 <= window } ?? false
+            projectionFresh[id] = fresh
+            // 进程退出可能留下永久 openStep：仅当该会话投影在窗口期内才采信
+            if result.processOn, fresh, openStep || pendingCalls {
+                result.busy.append(BusyItem(id: id, title: title))
+                if let modified {
+                    result.activities.append(TaskActivity(
+                        id: "\(id):working:\(modified)", sessionId: id, title: title,
+                        phase: "working", updatedAt: modified))
                 }
-                let title =
-                    JSONValue.string(rowValue("title")).flatMap({ $0.isEmpty ? nil : $0 })
-                    ?? JSONValue.string(identity["cwd"]).flatMap {
-                        URL(fileURLWithPath: $0).lastPathComponent.nonempty
-                    } ?? "(未命名会话)"
-                titles[id] = title
-                let metadata = rowValue("sessionListMetadata") as? JSONObject ?? [:]
-                let milliseconds =
-                    JSONValue.double(metadata["lastPromptAt"])
-                    ?? JSONValue.double(identity["createdAt"])
-                if let milliseconds {
-                    updateLatest(&result, title: title, timestamp: milliseconds / 1_000)
-                }
-                let stats = rowValue("sessionStats") as? JSONObject ?? [:]
-                let openStep =
-                    stats["openStep"] != nil && !(stats["openStep"] is NSNull)
-                let pendingCalls = (stats["pendingCalls"] as? JSONObject)?.isEmpty == false
-                // 进程退出可能留下永久 openStep：仅当缓存本身在窗口期内才采信
-                if result.processOn, cacheFresh, openStep || pendingCalls {
-                    result.busy.append(BusyItem(id: id, title: title))
+            } else {
+                // 完成事件：turnBoundary.lastStepBoundary.kind == "end" 且没有进行中的
+                // step。投影没有结束时间戳，updatedAt 用文件 mtime；id 带边界 seq，
+                // 同一轮结束只产生一条记录，后续无关写入不会重复通知。
+                let boundary = rowValue("turnBoundary") as? JSONObject ?? [:]
+                let lastBoundary = boundary["lastStepBoundary"] as? JSONObject
+                if JSONValue.string(lastBoundary?["kind"]) == "end",
+                    JSONValue.int(boundary["lastTurn"]) ?? 0 > 0
+                {
+                    let seq = JSONValue.int(lastBoundary?["seq"]) ?? 0
+                    let endedAt = modified ?? (milliseconds.map { $0 / 1_000 } ?? environment.now)
+                    result.activities.append(TaskActivity(
+                        id: "\(id):ended:\(seq)", sessionId: id, title: title,
+                        phase: "ended", updatedAt: endedAt))
                 }
             }
         }
-        else if files.manager.fileExists(atPath: cachePath) {
-            result.sourceError = "会话投影缓存不可读或格式不兼容"
+        let cacheDirectory = environment.path(".dsh", "storages", "session_projcache", "sessions")
+        let projectionFiles = files.files(atDepth: 1, under: cacheDirectory) {
+            $0.hasSuffix(".json")
+        }
+        if !projectionFiles.isEmpty {
+            for path in projectionFiles {
+                let modified = files.modificationTime(path)
+                if let modified { cacheModified = max(cacheModified ?? 0, modified) }
+                let id = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+                guard let root = files.read(path).flatMap(JSONValue.object),
+                    let record = root["record"] as? JSONObject,
+                    let rows = record["rows"] as? JSONObject
+                else { continue }
+                applySession(id: id, rows: rows,
+                             identity: record["identity"] as? JSONObject ?? [:],
+                             modified: modified)
+            }
+            if !parsedAny {
+                result.sourceError = "会话投影缓存不可读或格式不兼容"
+            }
+        } else {
+            let cachePath = environment.path(".dsh", "storages", "session_projcache.json")
+            cacheModified = files.modificationTime(cachePath)
+            if let root = files.read(cachePath).flatMap(JSONValue.object),
+                let tables = root["tables"] as? JSONObject,
+                let sessions = tables["sessions"] as? JSONObject
+            {
+                for (id, entry) in sessions {
+                    guard let entry = entry as? JSONObject else { continue }
+                    applySession(id: id, rows: entry["rows"] as? JSONObject ?? [:],
+                                 identity: entry["identity"] as? JSONObject ?? [:],
+                                 modified: cacheModified)
+                }
+            }
+            else if files.manager.fileExists(atPath: cachePath) {
+                result.sourceError = "会话投影缓存不可读或格式不兼容"
+            }
         }
         // projcache 滞后/缺失时的备份：事件流文件在 busy 窗口内有写入即视为进行中
         let sessionFiles = files.files(atDepth: 3, under: environment.path(".dsh", "sessions")) {
@@ -325,10 +378,15 @@ struct LocalCollectors {
             guard let modified = files.modificationTime(path) else { continue }
             result.activity = max(result.activity, modified)
             let id = URL(fileURLWithPath: path).deletingLastPathComponent().lastPathComponent
-            if !cacheFresh, result.processOn, environment.now - modified <= window,
+            if !(projectionFresh[id] ?? false), result.processOn,
+                environment.now - modified <= window,
                 knownBusy.insert(id).inserted
             {
-                result.busy.append(BusyItem(id: id, title: titles[id] ?? "(进行中会话)"))
+                let title = titles[id] ?? "(进行中会话)"
+                result.busy.append(BusyItem(id: id, title: title))
+                result.activities.append(TaskActivity(
+                    id: "\(id):working:\(modified)", sessionId: id, title: title,
+                    phase: "working", updatedAt: modified))
             }
         }
         if let cacheModified {

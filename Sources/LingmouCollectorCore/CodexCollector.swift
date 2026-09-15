@@ -35,29 +35,40 @@ struct CodexCollector {
         let threads = loadThreads()
         let sessionsRoot = environment.path(".codex", "sessions")
         let sessionFiles = files.files(atDepth: 4, under: sessionsRoot) { $0.hasSuffix(".jsonl") }
+        // 同一线程可能有多个 rollout 分段：压缩后续写的新文件名是
+        // rollout-…-<线程id>_<新rolloutid>.jsonl，从文件名推不出线程 id。
+        // 以 session_meta 头部里的线程 id 归并，避免一个会话显示成多条“(未命名会话)”。
+        var groups: [String: [SessionFile]] = [:]
         for path in sessionFiles {
             guard let modified = files.modificationTime(path), environment.now - modified < 86_400
             else {
                 continue
             }
-            let id = sessionID(from: path)
+            let header = sessionHeader(path)
+            let id = header.id.flatMap { $0.isEmpty ? nil : $0 } ?? sessionID(from: path)
+            groups[id, default: []].append(SessionFile(path: path, modified: modified, kind: header.kind))
+        }
+        for (id, segments) in groups {
+            let sorted = segments.sorted { $0.modified > $1.modified }
+            guard let newest = sorted.first else { continue }
             let stored = threads[id]
-            let info = ThreadInfo(title: stored?.title ?? "(未命名会话)", updated: stored?.updated ?? modified,
-                                  kind: sessionKind(path) ?? stored?.kind ?? "ide")
-            let timestamp = info.updated > 0 ? info.updated : modified
+            let info = ThreadInfo(
+                title: stored?.title ?? "(未命名会话)", updated: stored?.updated ?? newest.modified,
+                kind: sorted.lazy.compactMap(\.kind).first ?? stored?.kind ?? "ide")
+            let timestamp = info.updated > 0 ? info.updated : newest.modified
             let latest = LatestItem(title: info.title, timestamp: timestamp, sessionId: id)
-            let signal = sessionSignal(path: path, sessionID: id, title: info.title,
+            let signal = sessionSignal(segments: sorted, sessionID: id, title: info.title,
                                        processAlive: info.kind == "cli" ? cliCount > 0 : appCount > 0,
-                                       modified: modified, cache: cache)
+                                       cache: cache)
             if info.kind == "cli" {
-                update(&result.cli, latest: latest, modified: modified)
+                update(&result.cli, latest: latest, modified: newest.modified)
                 if let activity = signal.activity { result.cli.activities.append(activity) }
                 if signal.unreadable { result.cli.sourceError = "部分会话日志不可读取" }
                 if signal.busy {
                     result.cli.busy.append(BusyItem(id: id, title: info.title))
                 }
             } else {
-                update(&result.ide, latest: latest, modified: modified)
+                update(&result.ide, latest: latest, modified: newest.modified)
                 if let activity = signal.activity { result.ide.activities.append(activity) }
                 if signal.unreadable { result.ide.sourceError = "部分会话日志不可读取" }
                 if signal.busy {
@@ -105,18 +116,30 @@ struct CodexCollector {
         }
     }
 
-    /// The session header identifies the actual source even while the thread DB is
-    /// migrating, locked, or a different CLI/App schema was most recently touched.
-    private func sessionKind(_ path: String) -> String? {
-        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+    private struct SessionFile {
+        let path: String
+        let modified: TimeInterval
+        let kind: String?
+    }
+
+    /// The session header identifies the actual thread and source even while the
+    /// thread DB is migrating, locked, or a different CLI/App schema was most
+    /// recently touched. Compaction continuation files are named
+    /// rollout-…-<线程id>_<新rolloutid>.jsonl, so the thread id can only come
+    /// from the header, not the filename.
+    private func sessionHeader(_ path: String) -> (id: String?, kind: String?) {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return (nil, nil) }
         defer { try? handle.close() }
         let data = (try? handle.read(upToCount: 65_536)) ?? Data()
         guard let line = String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline).first,
               let object = JSONValue.object(from: String(line)),
               JSONValue.string(object["type"]) == "session_meta",
-              let payload = object["payload"] as? JSONObject,
-              let source = JSONValue.string(payload["source"]) else { return nil }
-        return ["cli", "exec"].contains(source) ? "cli" : "ide"
+              let payload = object["payload"] as? JSONObject else { return (nil, nil) }
+        let id = JSONValue.string(payload["id"]) ?? JSONValue.string(payload["session_id"])
+        let kind = JSONValue.string(payload["source"]).map {
+            ["cli", "exec"].contains($0) ? "cli" : "ide"
+        }
+        return (id, kind)
     }
 
     private func sessionID(from path: String) -> String {
@@ -131,15 +154,31 @@ struct CodexCollector {
         state.activity = max(state.activity, modified, latest.timestamp)
     }
 
+    /// 分段按修改时间倒序传入。压缩后的新分段可能还没有任何任务事件
+    ///（用户尚未开新一轮），此时沿用上一分段的结束/中断状态；
+    /// 只有最新分段带有任务事件或挂起调用时才以它为准。
     private func sessionSignal(
-        path: String, sessionID: String, title: String, processAlive: Bool, modified: TimeInterval,
+        segments: [SessionFile], sessionID: String, title: String, processAlive: Bool,
         cache: SourceStateCache
     ) -> (busy: Bool, activity: TaskActivity?, unreadable: Bool) {
-        guard files.manager.isReadableFile(atPath: path) else { return (false, nil, true) }
-        let parsed: ParsedSignal = cache.value(at: path) {
-            parseSignal(path: path, modified: modified)
+        for (index, segment) in segments.enumerated() {
+            guard files.manager.isReadableFile(atPath: segment.path) else { return (false, nil, true) }
+            let parsed: ParsedSignal = cache.value(at: segment.path) {
+                parseSignal(path: segment.path, modified: segment.modified)
+            }
+            if parsed.unreadable { return (false, nil, true) }
+            let decisive = parsed.lastTask != nil || !parsed.pending.isEmpty
+            if !decisive, index + 1 < segments.count { continue }
+            return finalizeSignal(parsed, sessionID: sessionID, title: title,
+                                  processAlive: processAlive, modified: segment.modified)
         }
-        if parsed.unreadable { return (false, nil, true) }
+        return (false, nil, false)
+    }
+
+    private func finalizeSignal(
+        _ parsed: ParsedSignal, sessionID: String, title: String, processAlive: Bool,
+        modified: TimeInterval
+    ) -> (busy: Bool, activity: TaskActivity?, unreadable: Bool) {
         let lastTask = parsed.lastTask, lifecycleTime = parsed.lifecycleTime, pending = parsed.pending
         func activity(_ phase: String, _ time: TimeInterval, token: String = "") -> TaskActivity {
             TaskActivity(id: "\(sessionID):\(phase):\(time):\(token)", sessionId: sessionID,
