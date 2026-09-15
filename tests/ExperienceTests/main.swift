@@ -210,21 +210,21 @@ do {
                                  windowMinutes: 300, components: nil)
     let cachedCode = tool(key: "kimi", quota: reading(age: 3_600, windows: [codeWindow]))
     let codeSnapshot = QuotaPresentation(tool: cachedCode, now: now)
-    check(codeSnapshot.isHistorical && !codeSnapshot.isCurrent && codeSnapshot.windows.first?.usedPercent == 95,
-          "Kimi Code retains its previous quota as history between messages")
-    check(codeSnapshot.lastSuccessAt == now - 3_600, "Historical quota keeps its real update time")
+    check(!codeSnapshot.isCurrent && codeSnapshot.windows.isEmpty,
+          "Stale Kimi quota expires like every other tool instead of lingering as a snapshot")
+    check(codeSnapshot.lastSuccessAt == now - 3_600, "Expired quota keeps its real update time")
     let expiredCode = QuotaPresentation(tool: tool(key: "kimi", quota: reading(windows: [expired])), now: now)
-    check(expiredCode.isHistorical && expiredCode.windows.count == 1,
-          "An old Kimi window remains dated history instead of claiming current quota")
+    check(!expiredCode.isCurrent && expiredCode.windows.isEmpty,
+          "A reset Kimi window cannot claim current quota")
     check(QuotaPresentation(tool: tool(key: "kimi", quota: reading(windows: [codeWindow])), now: now).isCurrent,
-          "A new Kimi reading replaces the historical snapshot")
-    check(!QuotaPresentation(tool: tool(key: "kimi", quota: reading(windows: [])), now: now).isHistorical,
-          "An empty response cannot fabricate a historical reading")
-    check(!QuotaPresentation(tool: tool(key: "kimi", quota: reading(age: -120)), now: now).isHistorical,
-          "Historical display cannot accept invalid future timestamps")
+          "A fresh Kimi reading shows as current quota")
+    check(QuotaPresentation(tool: tool(key: "kimi", quota: reading(windows: [])), now: now).windows.isEmpty,
+          "An empty response cannot fabricate a quota reading")
+    check(!QuotaPresentation(tool: tool(key: "kimi", quota: reading(age: -120)), now: now).isCurrent,
+          "Quota display cannot accept invalid future timestamps")
     let codeMonitor = QuotaMonitor(directory: directory.appendingPathComponent("code-snapshots"))
     check(codeMonitor.observe([cachedCode], threshold: 20, recovery: true, now: now).isEmpty,
-          "A historical Kimi snapshot must never trigger a quota alert")
+          "Expired Kimi quota must never trigger a quota alert")
 }
 
 let preferences = try JSONDecoder().decode(ExperiencePreferences.self, from: Data(#"{"quotaAlerts":true}"#.utf8))

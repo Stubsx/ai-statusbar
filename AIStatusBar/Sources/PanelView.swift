@@ -314,9 +314,7 @@ struct PanelView: View {
                                         .background(Capsule().fill(Color.primary.opacity(0.08)))
                                 }
                                 Spacer()
-                                if presentation.isHistorical {
-                                    Text("历史快照").font(.system(size: 10)).foregroundColor(.secondary)
-                                } else if presentation.windows.isEmpty {
+                                if presentation.windows.isEmpty {
                                     Button("读取设置") {
                                         (NSApp.delegate as? AppDelegate)?.showSettings(tab: "connections")
                                     }
@@ -327,13 +325,13 @@ struct PanelView: View {
                             if !presentation.windows.isEmpty {
                                 let age = ExperienceFormat.age(presentation.lastSuccessAt ?? 0,
                                                                now: context.date.timeIntervalSince1970)
-                                Text(presentation.isHistorical ? "上次更新 · \(age) · 发送消息后更新" : "更新于 \(age)")
+                                Text("更新于 \(age)")
                                     .font(.system(size: 10)).foregroundColor(.secondary)
                                 ForEach(presentation.windows, id: \.label) { window in
-                                    if !presentation.isHistorical, window.kind == "month", !(window.components ?? []).isEmpty {
+                                    if window.kind == "month", !(window.components ?? []).isEmpty {
                                         monthlyQuotaRow(window)
                                     } else {
-                                        quotaRow(window, historical: presentation.isHistorical)
+                                        quotaRow(window)
                                     }
                                 }
                             } else {
@@ -360,14 +358,14 @@ struct PanelView: View {
         }
     }
 
-    private func quotaRow(_ w: QuotaWindow, historical: Bool = false) -> some View {
+    private func quotaRow(_ w: QuotaWindow) -> some View {
         let used = min(max(w.usedPercent, 0), 100) / 100
-        let elapsed = historical ? nil : timeElapsedFraction(w)
+        let elapsed = timeElapsedFraction(w)
         return VStack(alignment: .leading, spacing: 3) {
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     Capsule().fill(Color.primary.opacity(0.08))
-                    Capsule().fill(historical ? Color.secondary.opacity(0.45) : quotaColor(w.usedPercent))
+                    Capsule().fill(quotaColor(w.usedPercent))
                         .frame(width: max(4, geo.size.width * CGFloat(used)))
                     if let elapsed {
                         timeCursor(elapsed, width: geo.size.width)
@@ -375,8 +373,7 @@ struct PanelView: View {
                 }
             }
             .frame(height: 6)
-            Text(historical ? "\(w.label) · 当时已用 \(Int(w.usedPercent.rounded()))%"
-                 : "\(w.label) · 已用 \(Int(w.usedPercent.rounded()))% · \(quotaResetText(w.resetsAt))")
+            Text("\(w.label) · 已用 \(Int(w.usedPercent.rounded()))% · \(quotaResetText(w.resetsAt))")
                 .font(.system(size: 10).monospacedDigit())
                 .foregroundColor(.secondary)
         }

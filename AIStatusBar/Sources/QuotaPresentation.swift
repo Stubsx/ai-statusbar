@@ -1,13 +1,11 @@
 import Foundation
 
-/// Kimi Code can retain a clearly dated snapshot between messages. Other tools
-/// only display current quota; a historical reading never becomes current again.
+/// All tools only display current quota; a stale reading never becomes current again.
 struct QuotaPresentation {
     let windows: [QuotaWindow]
     let lastSuccessAt: TimeInterval?
     let unavailableReason: String
     let isCurrent: Bool
-    var isHistorical: Bool { !isCurrent && !windows.isEmpty }
 
     init(tool: ToolStatus, now: TimeInterval) {
         let quota = tool.quota
@@ -24,13 +22,7 @@ struct QuotaPresentation {
         let fresh = validTimestamp && now - timestamp <= maxAge && notice.isEmpty
             && !["stale", "unavailable", "login_required", "disabled"].contains(tool.health?.quotaState ?? "")
         let currentWindows = validWindows.filter { $0.resetsAt == 0 || TimeInterval($0.resetsAt) > now }
-        if tool.key == "kimi", validTimestamp, notice.isEmpty,
-           !["unavailable", "login_required", "disabled"].contains(tool.health?.quotaState ?? "") {
-            windows = validWindows
-            isCurrent = fresh && !windows.isEmpty && currentWindows.count == windows.count
-        } else {
-            windows = fresh ? currentWindows : []
-            isCurrent = !windows.isEmpty
-        }
+        windows = fresh ? currentWindows : []
+        isCurrent = !windows.isEmpty
     }
 }

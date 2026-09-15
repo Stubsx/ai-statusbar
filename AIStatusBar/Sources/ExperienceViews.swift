@@ -43,8 +43,7 @@ enum ExperienceFormat {
         return formatter.string(from: Date(timeIntervalSince1970: timestamp))
     }
 
-    static func quotaState(_ state: String?, historical: Bool = false) -> String {
-        if historical { return "上次配额记录 · 发送消息后更新" }
+    static func quotaState(_ state: String?) -> String {
         switch state {
         case "ready": return "配额读取正常"
         case "local": return "来自本地记录"
@@ -96,7 +95,6 @@ struct ConnectionDiagnosticsView: View {
                 Label(error, systemImage: "internaldrive").foregroundColor(.orange)
             }
             ForEach(store.data?.tools ?? [], id: \.key) { tool in
-                let quota = QuotaPresentation(tool: tool, now: Date().timeIntervalSince1970)
                 VStack(alignment: .leading, spacing: 7) {
                     HStack {
                         Text(tool.name).font(.system(size: 13, weight: .semibold))
@@ -110,7 +108,7 @@ struct ConnectionDiagnosticsView: View {
                         .font(.system(size: 11)).foregroundColor(.secondary)
                     Text("任务事件：\(phaseDescription(tool.capabilities?.eventPhases ?? []))")
                         .font(.system(size: 10)).foregroundColor(.secondary)
-                    Text("\(NotificationRouter.destinationLabel(forToolKey: tool.key)) · \(ExperienceFormat.quotaState(tool.health?.quotaState, historical: quota.isHistorical))")
+                    Text("\(NotificationRouter.destinationLabel(forToolKey: tool.key)) · \(ExperienceFormat.quotaState(tool.health?.quotaState))")
                         .font(.system(size: 10)).foregroundColor(.secondary)
                     if let timestamp = tool.health?.sourceUpdatedAt {
                         Text("最近本地活动：\(ExperienceFormat.age(timestamp))")
