@@ -1,7 +1,10 @@
 #!/bin/bash
-# 发版：构建并公证 DMG、推送 tag、创建 GitHub Release。
+# 发版：构建 DMG、推送 tag、创建 GitHub Release。
 # 日常 commit 只会替换本地 /Applications/灵眸.app（见 install-local.sh）；
 # 只有发版时通过本脚本才会打 DMG，避免 dist/ 累积无用安装包。
+# 默认使用 build.sh 的固定自签名身份（Lingmou Local），不要求 Developer ID；
+# 如需 Apple 公证分发，自行设置 SIGN_IDENTITY="Developer ID Application: ..."
+# 和 NOTARY_PROFILE，build-dmg.sh 会自动启用 DMG 签名与公证。
 # 用法: ./scripts/release.sh <tag>   例如 ./scripts/release.sh v1.0.1
 set -euo pipefail
 ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
@@ -25,10 +28,10 @@ if [[ "$BRANCH" != "main" ]]; then
   echo "错误：只能从 main 分支发布，当前为 ${BRANCH:-detached HEAD}" >&2
   exit 1
 fi
-if [[ "${SIGN_IDENTITY:-}" != "Developer ID Application:"* || -z "${NOTARY_PROFILE:-}" ]]; then
-  echo "错误：公开发布必须设置 Developer ID SIGN_IDENTITY 和 NOTARY_PROFILE" >&2
-  echo "如只需本地未公证 DMG，请改用 ./scripts/build-dmg.sh" >&2
-  exit 1
+if [[ "${SIGN_IDENTITY:-}" == "Developer ID Application:"* && -n "${NOTARY_PROFILE:-}" ]]; then
+  echo "提示：检测到 Developer ID 与 NOTARY_PROFILE，DMG 将签名并送 Apple 公证"
+else
+  echo "提示：使用固定自签名身份（Lingmou Local）构建，DMG 不公证"
 fi
 if ! gh auth status >/dev/null 2>&1; then
   echo "错误：GitHub CLI 尚未登录，请先运行 gh auth login" >&2
