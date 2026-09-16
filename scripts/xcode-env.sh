@@ -29,7 +29,6 @@ lingmou_find_developer_dir() {
     /Applications/Xcode*.app/Contents/Developer
     /Volumes/*/Applications/Xcode*.app/Contents/Developer
     /Volumes/*/应用程序/Xcode*.app/Contents/Developer
-    /Library/Developer/CommandLineTools
   )
   shopt -u nullglob
 
@@ -50,7 +49,11 @@ if _lingmou_resolved_developer_dir=$(lingmou_find_developer_dir); then
   fi
 else
   echo "错误：找不到可用的 Xcode 开发工具。" >&2
-  echo "请安装 Xcode/Command Line Tools，挂载包含 Xcode.app 的外置磁盘，或设置 DEVELOPER_DIR。" >&2
+  if [[ -d /Applications/Xcode.app ]]; then
+    echo "检测到 Xcode.app 但不可用；若提示许可协议，请先执行：sudo xcodebuild -license accept" >&2
+  else
+    echo "请安装 Xcode，挂载包含 Xcode.app 的外置磁盘，或设置 DEVELOPER_DIR。" >&2
+  fi
   return 1 2>/dev/null || exit 1
 fi
 unset _lingmou_original_developer_dir _lingmou_resolved_developer_dir
