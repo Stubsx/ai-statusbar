@@ -10,13 +10,13 @@ struct SettingsView: View {
     @ObservedObject var store: StatusStore  // 同步来源状态来自最新一次采集
     @ObservedObject var settings: SettingsStore
     @ObservedObject var catalog: PetCatalog
+    @ObservedObject var maintenance: MaintenanceStore  // 登录项与更新；与通知/菜单入口共享
     @State private var showOnlineQuotaAlert = false
     @State private var showKimiDecryptAlert = false
     @State private var showAdaptiveAlert = false
     @State private var clearHistoryConfirmation = false
     @State private var perToolBusyExpanded = false
     @State private var advancedExpanded = false
-    @StateObject private var maintenance = MaintenanceStore()
     /// 系统级通知授权状态（设置窗口打开通知页时查询，用于提示"被系统拒绝"的情况）
     @State private var notifyAuth: UNAuthorizationStatus = .notDetermined
     @AppStorage("desktopPresentationMode") private var desktopPresentationMode = "card"
@@ -342,9 +342,37 @@ struct SettingsView: View {
                 settingRow("系统登录项") { Button("打开") { maintenance.openLoginSettings() } }
             }
             divider
+            settingRow("自动检查更新", detail: "启动灵眸时后台查询一次新版本；发现更新会提醒，安装仍需你确认") {
+                Toggle("", isOn: $settings.autoUpdateCheck)
+                    .labelsHidden().toggleStyle(.switch)
+            }
             settingRow("检查更新", detail: maintenance.updateMessage) {
                 Button(maintenance.checking ? "检查中…" : "检查") { maintenance.checkUpdates() }
                     .disabled(maintenance.checking)
+            }
+            if let release = maintenance.update {
+                if let phase = maintenance.installPhase {
+                    settingRow("正在更新 \(release.tag)", detail: {
+                        switch phase {
+                        case .downloading: return String(format: "下载安装包 %.0f%%", maintenance.installProgress * 100)
+                        case .verifying: return "校验安装包…"
+                        case .installing: return "替换完成后自动重启灵眸"
+                        }
+                    }()) {
+                        if phase == .downloading {
+                            ProgressView(value: maintenance.installProgress)
+                        }
+                    }
+                } else {
+                    settingRow("发现新版本 \(release.tag)", detail: "下载并校验安装包后自动替换重启") {
+                        Button("立即更新") { maintenance.installUpdate() }
+                    }
+                }
+                if let error = maintenance.installError {
+                    settingRow("更新失败", detail: error) {
+                        Button("重试") { maintenance.installUpdate() }
+                    }
+                }
             }
             if let url = maintenance.releaseURL {
                 settingRow("正式发布与下载", detail: "从项目 GitHub 发布页获取安装包") {

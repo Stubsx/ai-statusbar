@@ -23,6 +23,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     private var glassView: NSView?  // macOS 26+ 的 NSGlassEffectView（用 NSView 声明避开可用性注解）
     private var store: StatusStore!
     private let settings = SettingsStore()
+    /// 登录项与更新维护：设置窗口与通知/菜单入口共享同一份状态
+    private let maintenance = MaintenanceStore()
     /// 素材库目录跟随设置（默认本机 ~/.ai-statusbar/Pets，可指到 iCloud Drive 文件夹）。
     private lazy var petCatalog = PetCatalog(
         userPetsDirectory: PetCatalog.effectiveUserPetsDirectory(configuredPath: settings.petLibraryDir)
@@ -82,6 +84,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         applyDesktopPresentationMode()
         store.start()
         if !settings.experience.onboardingCompleted { showSettings(tab: "welcome") }
+        // 启动自动检查更新：延迟 8 秒避开启动高峰，静默失败；发现新版本会发一次提醒
+        if settings.autoUpdateCheck {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+                guard let self, self.settings.autoUpdateCheck, self.maintenance.installPhase == nil else { return }
+                self.maintenance.checkUpdates(notify: true)
+            }
+        }
         NotificationCenter.default.addObserver(self, selector: #selector(onStatusUpdated),
                                                name: .statusUpdated, object: nil)
         // 防止 macOS 把后台菜单栏 app 的定时器节流（App Nap），保住 3 秒背景采样
@@ -103,6 +112,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             let info = response.notification.request.content.userInfo
             DispatchQueue.main.async { [weak self] in
                 defer { completionHandler() }
+                // 更新提醒：打开设置并直接开始下载安装
+                if info["lingmou_update"] != nil {
+                    self?.showSettings(tab: "general")
+                    self?.maintenance.installUpdate()
+                    return
+                }
                 self?.store.openNotification(info) { [weak self] in self?.showTaskPanel(tab: "status") }
             }
         } else {
@@ -509,6 +524,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         settingsItem.target = self
         settingsItem.image = symbol("gearshape", template: true)
         menu.addItem(settingsItem)
+        if let update = maintenance.update {
+            let updating = maintenance.installPhase != nil
+            let item = NSMenuItem(title: updating ? "正在更新灵眸…" : "更新到 \(update.tag)…",
+                                  action: updating ? nil : #selector(openUpdateSettings),
+                                  keyEquivalent: "")
+            item.target = self
+            item.image = symbol("arrow.up.circle", template: true)
+            menu.addItem(item)
+        }
         let refresh = NSMenuItem(title: "刷新状态", action: #selector(doRefresh), keyEquivalent: "r")
         refresh.target = self
         refresh.image = symbol("arrow.clockwise", template: true)
@@ -1214,7 +1238,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             w.titlebarAppearsTransparent = true
             w.titleVisibility = .hidden
             w.isMovableByWindowBackground = true
-            w.contentView = NSHostingView(rootView: SettingsView(store: store, settings: settings, catalog: petCatalog))
+            w.contentView = NSHostingView(rootView: SettingsView(store: store, settings: settings,
+                                                                 catalog: petCatalog, maintenance: maintenance))
             w.isReleasedWhenClosed = false
             w.center()
             settingsWindow = w
@@ -1227,6 +1252,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         UserDefaults.standard.set(tab, forKey: "settingsTab")
         openSettings()
     }
+
+    @objc private func openUpdateSettings() { showSettings(tab: "general") }
 
     @objc private func openTaskCenter() { showTaskPanel() }
     @objc private func openTool(_ sender: NSMenuItem) {

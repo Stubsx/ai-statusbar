@@ -45,6 +45,8 @@ final class SettingsStore: ObservableObject {
     @Published var usageSyncDir = "" { didSet { save() } }
     /// 用量数字单位：metric=K/M/B，wan=万/亿
     @Published var numberUnit = "metric" { didSet { save() } }
+    /// 启动时后台检查一次新版本；发现更新会提醒，安装仍需用户确认
+    @Published var autoUpdateCheck = true { didSet { save() } }
     @Published var experience = ExperiencePreferences() {
         didSet {
             save()
@@ -111,6 +113,7 @@ final class SettingsStore: ObservableObject {
             if let v = s["dir"] as? String { usageSyncDir = v }
         }
         if let v = obj["number_unit"] as? String, ["metric", "wan"].contains(v) { numberUnit = v }
+        if let v = obj["auto_update_check"] as? Bool { autoUpdateCheck = v }
         if let value = obj["experience"], let data = try? JSONSerialization.data(withJSONObject: value),
            let preferences = try? JSONDecoder().decode(ExperiencePreferences.self, from: data) {
             experience = preferences
@@ -135,6 +138,7 @@ final class SettingsStore: ObservableObject {
             "kimi_web_tab_reuse": kimiWebTabReuse,
             "usage_sync": ["enabled": usageSyncEnabled, "dir": usageSyncDir],
             "number_unit": numberUnit,
+            "auto_update_check": autoUpdateCheck,
             "experience": (try? JSONSerialization.jsonObject(with: JSONEncoder().encode(experience))) ?? [:],
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: .prettyPrinted) else { return }
