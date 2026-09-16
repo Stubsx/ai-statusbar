@@ -60,14 +60,26 @@ enum JSONValue {
 }
 
 enum DateSupport {
+    // Log tails contain many timestamps. Recreating a formatter for every row
+    // also rebuilds its ICU parser. Reuse both formats and serialize access.
+    private static let timestampLock = NSLock()
+    private static let fractionalTimestamp: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+    private static let ordinaryTimestamp: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+
     static func timestamp(_ value: Any?) -> TimeInterval? {
         guard let text = JSONValue.string(value), !text.isEmpty else { return nil }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: text) { return date.timeIntervalSince1970 }
-        let ordinary = ISO8601DateFormatter()
-        ordinary.formatOptions = [.withInternetDateTime]
-        return ordinary.date(from: text)?.timeIntervalSince1970
+        timestampLock.lock()
+        defer { timestampLock.unlock() }
+        if let date = fractionalTimestamp.date(from: text) { return date.timeIntervalSince1970 }
+        return ordinaryTimestamp.date(from: text)?.timeIntervalSince1970
     }
 
     static func localDay(_ timestamp: TimeInterval) -> String {

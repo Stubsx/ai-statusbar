@@ -1,6 +1,131 @@
 import Cocoa
 import SwiftUI
 
+/// Keep the existing SwiftUI drawing static; only its native container rotates.
+/// SwiftUI repeatForever otherwise keeps the hosting layout active on every frame.
+struct BallOrbitRotation<Content: View>: View {
+    let duration: TimeInterval
+    let reduceMotion: Bool
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        if reduceMotion {
+            content()
+        } else {
+            BallOrbitHost(content: content(), duration: duration)
+        }
+    }
+}
+
+private struct BallOrbitHost<Content: View>: NSViewRepresentable {
+    let content: Content
+    let duration: TimeInterval
+
+    func makeNSView(context: Context) -> BallOrbitView {
+        let hosted = NSHostingView(rootView: content)
+        if #available(macOS 13.0, *) { hosted.sizingOptions = [] }
+        return BallOrbitView(content: hosted, duration: duration)
+    }
+
+    func updateNSView(_ view: BallOrbitView, context: Context) {
+        (view.content as? NSHostingView<Content>)?.rootView = content
+    }
+
+    static func dismantleNSView(_ view: BallOrbitView, coordinator: ()) { view.stop() }
+}
+
+final class BallOrbitView: NSView {
+    let content: NSView
+    private let rotor = NSView()
+    private var clock: BallInkFlowClock
+    private var visibilityObserver: NSObjectProtocol?
+    private var animationSize = CGSize.zero
+
+    init(content: NSView, duration: TimeInterval) {
+        self.content = content
+        clock = BallInkFlowClock(duration: duration)
+        super.init(frame: .zero)
+        wantsLayer = true
+        rotor.wantsLayer = true
+        rotor.layer = CALayer()
+        addSubview(rotor)
+        rotor.addSubview(content)
+    }
+
+    required init?(coder: NSCoder) { return nil }
+    override var isFlipped: Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        rotor.frame = bounds
+        content.frame = rotor.bounds
+        CATransaction.commit()
+        updatePlayback()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        stop()
+        guard let window else { return }
+        visibilityObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main
+        ) { [weak self] _ in self?.updatePlayback() }
+        updatePlayback()
+    }
+
+    override func viewDidHide() { super.viewDidHide(); updatePlayback() }
+    override func viewDidUnhide() { super.viewDidUnhide(); updatePlayback() }
+
+    private func updatePlayback() {
+        guard let window, window.isVisible, window.occlusionState.contains(.visible),
+              !isHiddenOrHasHiddenAncestor else { pause(); return }
+        guard bounds.width > 0, bounds.height > 0, let layer = rotor.layer else { return }
+        guard layer.animation(forKey: "ball-orbit") == nil || animationSize != bounds.size else { return }
+        let now = CACurrentMediaTime()
+        clock.resume(at: now)
+        // AppKit owns backing-layer anchorPoint (0,0), so changing it is undone
+        // on the next layout. Rotate around the center in the transform itself.
+        let animation = CAKeyframeAnimation(keyPath: "transform")
+        animation.values = (0...120).map { frame in
+            NSValue(caTransform3D: rotation(phase: Double(frame) / 120))
+        }
+        animation.calculationMode = .linear
+        animation.duration = clock.duration
+        animation.repeatCount = .infinity
+        animation.beginTime = layer.convertTime(now, from: nil) - clock.phase(at: now) * clock.duration
+        layer.add(animation, forKey: "ball-orbit")
+        animationSize = bounds.size
+    }
+
+    private func rotation(phase: Double) -> CATransform3D {
+        var transform = CATransform3DMakeTranslation(bounds.midX, bounds.midY, 0)
+        transform = CATransform3DRotate(transform, phase * .pi * 2, 0, 0, 1)
+        return CATransform3DTranslate(transform, -bounds.midX, -bounds.midY, 0)
+    }
+
+    private func pause() {
+        clock.pause(at: CACurrentMediaTime())
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        rotor.layer?.transform = rotation(phase: clock.phase(at: CACurrentMediaTime()))
+        rotor.layer?.removeAnimation(forKey: "ball-orbit")
+        CATransaction.commit()
+    }
+
+    func stop() {
+        pause()
+        if let visibilityObserver {
+            NotificationCenter.default.removeObserver(visibilityObserver)
+            self.visibilityObserver = nil
+        }
+    }
+
+    deinit { stop() }
+}
+
 /// 原生层播放程序生成的墨层帧，不通过 SwiftUI 时间线逐帧触发布局。
 struct BallInkFlow: NSViewRepresentable {
     let working: Bool

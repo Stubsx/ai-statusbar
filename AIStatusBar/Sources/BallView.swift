@@ -221,9 +221,14 @@ private struct BallWashBody: View {
 private struct BallInkOrbit: View {
     let reduceMotion: Bool
     @Environment(\.colorScheme) private var colorScheme
-    @State private var turning = false
 
     var body: some View {
+        BallOrbitRotation(duration: 3.6, reduceMotion: reduceMotion) { artwork }
+            .frame(width: 58, height: 58)
+            .allowsHitTesting(false)
+    }
+
+    private var artwork: some View {
         ZStack {
             ForEach(0..<3) { band in
                 BallInkArc(band: band)
@@ -236,11 +241,6 @@ private struct BallInkOrbit: View {
             }
         }
         .frame(width: 58, height: 58)
-        .rotationEffect(.degrees(turning && !reduceMotion ? 360 : 0))
-        .onAppear { turning = true }
-        .animation(reduceMotion ? nil : .linear(duration: 3.6).repeatForever(autoreverses: false),
-                   value: turning)
-        .allowsHitTesting(false)
     }
 }
 
@@ -329,9 +329,14 @@ enum BallBlinkTiming {
 private struct BallOrbitGlow: View {
     let color: Color
     let reduceMotion: Bool
-    @State private var turning = false
 
     var body: some View {
+        BallOrbitRotation(duration: 2.8, reduceMotion: reduceMotion) { artwork }
+            .frame(width: 54, height: 54)
+            .allowsHitTesting(false)
+    }
+
+    private var artwork: some View {
         ZStack {
             ring(lineWidth: 5.2)
                 .blur(radius: 2.4)
@@ -340,13 +345,6 @@ private struct BallOrbitGlow: View {
                 .opacity(0.95)
         }
         .frame(width: 54, height: 54)
-        .rotationEffect(.degrees(turning && !reduceMotion ? 360 : 0))
-        .onAppear { turning = true }
-        .animation(
-            reduceMotion ? nil : .linear(duration: 2.8).repeatForever(autoreverses: false),
-            value: turning
-        )
-        .allowsHitTesting(false)
     }
 
     private func ring(lineWidth: CGFloat) -> some View {
@@ -409,6 +407,7 @@ private struct BallMouseTracker: NSViewRepresentable {
 final class BallMouseTrackingView: NSView {
     var onGaze: ((CGSize) -> Void)?
     var onBlink: ((CGFloat) -> Void)?
+    var mouseLocation: () -> NSPoint = { NSEvent.mouseLocation }
     var reduceMotion = false
     private var timer: Timer?
     private var visibilityObserver: NSObjectProtocol?
@@ -452,29 +451,44 @@ final class BallMouseTrackingView: NSView {
         guard timer == nil else { return }
         blinkStart = nil
         nextBlink = ProcessInfo.processInfo.systemUptime + Double.random(in: 2.5...5.5)
-        let timer = Timer(timeInterval: 1 / 30, repeats: true) { [weak self] _ in self?.sample() }
-        timer.tolerance = 0.008
+        scheduleSample(after: 0)
+    }
+
+    /// 静止时只探测指针，移动收敛与眨眼期间才用 30fps；仍无需全局事件权限。
+    private func scheduleSample(after delay: TimeInterval) {
+        let timer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
+            self?.timer = nil
+            self?.sample()
+        }
+        timer.tolerance = delay >= 0.2 ? 0.025 : 0.008
         self.timer = timer
         RunLoop.main.add(timer, forMode: .common)
     }
 
     private func sample() {
-        guard let window, window.isVisible, !isHiddenOrHasHiddenAncestor else {
+        guard let window, window.isVisible, window.occlusionState.contains(.visible),
+              !isHiddenOrHasHiddenAncestor else {
             updatePolling()
             return
         }
         // 屏幕 -> 窗口 -> flipped 视图坐标，支持负坐标和不同缩放的多显示器。
         sampleBlink()
-        let local = convert(window.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)
+        let local = convert(window.convertPoint(fromScreen: mouseLocation()), from: nil)
         let target = BallGazeGeometry.offset(cursor: local, center: CGPoint(x: bounds.midX, y: bounds.midY))
         let follow: CGFloat = reduceMotion ? 1 : 0.26
         let next = CGSize(
             width: current.width + (target.width - current.width) * follow,
             height: current.height + (target.height - current.height) * follow
         )
-        guard hypot(next.width - current.width, next.height - current.height) > 0.008 else { return }
-        current = next
-        onGaze?(next)
+        let moving = hypot(next.width - current.width, next.height - current.height) > 0.008
+        if moving {
+            current = next
+            onGaze?(next)
+        }
+        let untilBlink = reduceMotion ? TimeInterval.infinity
+            : max(1 / 30, nextBlink - ProcessInfo.processInfo.systemUptime)
+        let delay = !reduceMotion && (moving || blinkStart != nil) ? 1 / 30 : min(0.25, untilBlink)
+        scheduleSample(after: delay)
     }
 
     private func sampleBlink() {

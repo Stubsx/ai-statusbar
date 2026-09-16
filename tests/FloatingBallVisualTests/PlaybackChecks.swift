@@ -33,6 +33,7 @@ private final class FloatingBallPlaybackDelegate: NSObject, NSApplicationDelegat
 
         var stage = 0
         var hashes = Set<UInt64>()
+        var angles = Set<Int>()
         var restingFrame: Data?
         let deadline = Date().addingTimeInterval(35)
         Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { timer in
@@ -42,10 +43,23 @@ private final class FloatingBallPlaybackDelegate: NSObject, NSApplicationDelegat
                 let paint = native?.layer?.sublayers?.first
                 let animation = paint?.animation(forKey: "ink-flow")
                 let displayedWidth = paint?.contents.map { ($0 as! CGImage).width }
+                let orbit = self.orbitView(in: hosted)
+                let rotor = orbit?.subviews.first?.layer
                 switch stage {
                 case 0, 2, 3, 5:
                     guard animation != nil,
                           let contents = paint?.presentation()?.contents else { return }
+                    guard rotor?.animation(forKey: "ball-orbit") != nil,
+                          let transform = rotor?.presentation()?.transform else {
+                        self.fail("Working orbit must animate in its native layer")
+                    }
+                    angles.insert(Int(atan2(transform.m12, transform.m11) * 1_000))
+                    guard orbit?.hitTest(.zero) == nil,
+                          let bounds = rotor?.bounds,
+                          abs(bounds.midX * transform.m11 + bounds.midY * transform.m21 + transform.m41 - bounds.midX) < 0.5,
+                          abs(bounds.midX * transform.m12 + bounds.midY * transform.m22 + transform.m42 - bounds.midY) < 0.5 else {
+                        self.fail("Orbit must rotate around its center and pass pointer input through")
+                    }
                     let expectedDuration = (stage == 3 ? BallInkDrawing.Palette.ink : .blue).flowDuration(working: true)
                     guard animation?.duration == expectedDuration else { self.fail("Wrong palette playback speed") }
                     let image = contents as! CGImage
@@ -60,8 +74,9 @@ private final class FloatingBallPlaybackDelegate: NSObject, NSApplicationDelegat
                     var hash: UInt64 = 14695981039346656037
                     for byte in bytes { hash = (hash ^ UInt64(byte)) &* 1099511628211 }
                     hashes.insert(hash)
-                    guard hashes.count >= 3 else { return }
+                    guard hashes.count >= 3, angles.count >= 3 else { return }
                     hashes.removeAll()
+                    angles.removeAll()
                     if stage == 0 {
                         print("PASS: transparent floating panel presents changing blue frames")
                         hosted.rootView = artwork(.blue, hovered: true)
@@ -84,6 +99,7 @@ private final class FloatingBallPlaybackDelegate: NSObject, NSApplicationDelegat
                     }
                 case 1:
                     guard animation == nil else { self.fail("Hidden panel kept playing") }
+                    guard rotor?.animation(forKey: "ball-orbit") == nil else { self.fail("Hidden orbit kept playing") }
                     guard displayedWidth == 160 else { self.fail("Hidden drawing lost its cached frame") }
                     window.orderFront(nil)
                     stage = 2
@@ -102,11 +118,12 @@ private final class FloatingBallPlaybackDelegate: NSObject, NSApplicationDelegat
                     stage = 4
                 default:
                     guard native == nil else { self.fail("Reduce Motion kept the animated native view") }
+                    guard orbit == nil else { self.fail("Reduce Motion kept the animated orbit") }
                     timer.invalidate()
                     window.orderOut(nil)
                     window.close()
                     print("PASS: Reduce Motion uses the static drawing")
-                    NSApplication.shared.terminate(nil)
+                    self.checkPointerPolling()
                 }
             }
         }
@@ -115,6 +132,58 @@ private final class FloatingBallPlaybackDelegate: NSObject, NSApplicationDelegat
     private func flowView(in view: NSView) -> BallInkFlowView? {
         if let view = view as? BallInkFlowView { return view }
         return view.subviews.lazy.compactMap { self.flowView(in: $0) }.first
+    }
+
+    private func orbitView(in view: NSView) -> BallOrbitView? {
+        if let view = view as? BallOrbitView { return view }
+        return view.subviews.lazy.compactMap { self.orbitView(in: $0) }.first
+    }
+
+    private func checkPointerPolling() {
+        let tracker = BallMouseTrackingView(frame: NSRect(x: 0, y: 0, width: 64, height: 64))
+        let window = NSPanel(contentRect: NSRect(x: 100, y: 100, width: 64, height: 64),
+                             styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.level = .floating
+        window.contentView = tracker
+        var reads = 0
+        var gazeUpdates = 0
+        var offset: CGFloat = 0
+        tracker.mouseLocation = {
+            reads += 1
+            let point = tracker.convert(NSPoint(x: 32 + offset, y: 32), to: nil)
+            return window.convertPoint(toScreen: point)
+        }
+        tracker.onGaze = { _ in gazeUpdates += 1 }
+        window.orderFront(nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            assert((2...8).contains(reads), "Stationary gaze should poll around 4Hz, not 30Hz: \(reads)")
+            offset = 400
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                assert(gazeUpdates >= 4, "Pointer movement must still smoothly follow at 30fps")
+                tracker.reduceMotion = true
+                let beforeReduced = reads
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                    assert(reads - beforeReduced <= 8, "Reduce Motion must use low-frequency polling")
+                    window.orderOut(nil)
+                    let beforeHidden = reads
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        assert(reads == beforeHidden, "Hidden pointer tracker must not wake")
+                        window.orderFront(nil)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                            assert(reads > beforeHidden, "Pointer tracking must resume on show")
+                            tracker.stop()
+                            // Break the fixture-only ownership cycle.
+                            tracker.mouseLocation = { .zero }
+                            window.orderOut(nil)
+                            window.close()
+                            print("PASS: idle pointer polls at 4Hz, moving gaze stays smooth; reduced motion and hide/resume")
+                            NSApplication.shared.terminate(nil)
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private func fail(_ message: String) -> Never {

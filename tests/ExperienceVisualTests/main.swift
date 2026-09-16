@@ -154,6 +154,39 @@ func renderExperience() throws {
     assert(!SourceChangeMonitor.isStatusSource("/fixture/.ai-statusbar/collector-cache.json"))
     print("PASS: native filesystem events detect atomic session writes without collector feedback loops")
     let settings = SettingsStore(path: temporary.appendingPathComponent("settings.json").path, systemEffects: false)
+    // A source event just before the old periodic tick must reset the fallback,
+    // while the fallback must still scan later in the absence of further writes.
+    let schedulingDirectory = temporary.appendingPathComponent("scheduling")
+    let schedulingSessions = schedulingDirectory.appendingPathComponent(".codex/sessions")
+    try FileManager.default.createDirectory(at: schedulingSessions, withIntermediateDirectories: true)
+    let fakeCollector = schedulingDirectory.appendingPathComponent("collector.sh")
+    try """
+    #!/bin/sh
+    [ "$1" = "--metrics-only" ] && exit 0
+    cd "$(dirname "$0")"
+    echo scan >> calls
+    echo '{"updated_at":"test","tools":[]}'
+    """.write(to: fakeCollector, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fakeCollector.path)
+    var schedulingStore: StatusStore? = StatusStore(collectorPath: fakeCollector.path, settings: settings,
+                                                    storageDirectory: schedulingDirectory.appendingPathComponent("history"))
+    let schedulingStart = Date()
+    schedulingStore?.start(home: schedulingDirectory.path)
+    RunLoop.current.run(until: schedulingStart.addingTimeInterval(4.2))
+    func scanCount() -> Int {
+        ((try? String(contentsOf: schedulingDirectory.appendingPathComponent("calls"))) ?? "")
+            .split(separator: "\n").count
+    }
+    let beforeSourceScan = scanCount()
+    assert(beforeSourceScan >= 1)
+    try Data("changed".utf8).write(to: schedulingSessions.appendingPathComponent("test.jsonl"))
+    RunLoop.current.run(until: schedulingStart.addingTimeInterval(5.8))
+    assert(scanCount() == beforeSourceScan + 1, "Source scan must replace the imminent fallback scan")
+    let afterSourceScan = scanCount()
+    RunLoop.current.run(until: schedulingStart.addingTimeInterval(10.5))
+    assert(scanCount() > afterSourceScan, "Reset fallback must still detect process exits without file events")
+    schedulingStore = nil
+    print("PASS: filesystem refresh resets fallback without redundant scans or losing the next fallback")
     let store = StatusStore(collectorPath: nil, settings: settings, storageDirectory: temporary)
     let catalog = PetCatalog(userPetsDirectory: temporary.appendingPathComponent("Pets"))
     let now = Date().timeIntervalSince1970
@@ -587,7 +620,8 @@ func renderExperience() throws {
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         defaults.set(tab, forKey: "settingsTab")
-        try save("settings-" + tab, content: SettingsView(store: store, settings: settings, catalog: catalog)
+        try save("settings-" + tab, content: SettingsView(store: store, settings: settings, catalog: catalog,
+                                                       maintenance: MaintenanceStore())
             .defaultAppStorage(defaults).frame(height: 740).background(Color.white), scheme: .light)
     }
     settings.experience.privacyMode = true

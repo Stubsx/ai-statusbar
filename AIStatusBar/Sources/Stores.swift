@@ -360,19 +360,27 @@ final class StatusStore: ObservableObject {
         }
     }
 
-    func start() {
+    func start(home: String = NSHomeDirectory()) {
         timer?.invalidate()
         metricsTimer?.invalidate()
-        sourceMonitor = SourceChangeMonitor { [weak self] in self?.scheduleRefresh() }
+        sourceMonitor = SourceChangeMonitor(home: home) { [weak self] in self?.scheduleRefresh() }
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            self?.refreshStatus()
-        }
-        timer?.tolerance = 0.1
         metricsTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.refreshMetrics()
         }
         metricsTimer?.tolerance = 2
+    }
+
+    /// Every actual scan resets the fallback deadline. A fixed repeating timer
+    /// could launch another scan immediately after a filesystem-triggered one.
+    private func armStatusFallback() {
+        timer?.invalidate()
+        let timer = Timer(timeInterval: 5, repeats: false) { [weak self] _ in
+            self?.scheduleRefresh()
+        }
+        timer.tolerance = 0.1
+        self.timer = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     private func scheduleRefresh() {
@@ -426,14 +434,18 @@ final class StatusStore: ObservableObject {
             journal.invalidate()
             return
         }
-            isRefreshing = true
-            lastRefreshStarted = Date()
-            DispatchQueue.global(qos: .userInitiated).async {
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: path)
-                // Fast local state retains independently refreshed quota and usage.
-                // Other frontends reuse the same complete JSON snapshot.
-                p.arguments = ["--json", "--status-only"]
+        // Manual refresh and source events share one pending slot.
+        pendingRefresh?.cancel()
+        pendingRefresh = nil
+        armStatusFallback()
+        isRefreshing = true
+        lastRefreshStarted = Date()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: path)
+            // Fast local state retains independently refreshed quota and usage.
+            // Other frontends reuse the same complete JSON snapshot.
+            p.arguments = ["--json", "--status-only"]
             let pipe = Pipe()
             p.standardOutput = pipe
             p.standardError = FileHandle.nullDevice

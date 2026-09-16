@@ -93,10 +93,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         }
         NotificationCenter.default.addObserver(self, selector: #selector(onStatusUpdated),
                                                name: .statusUpdated, object: nil)
-        // 防止 macOS 把后台菜单栏 app 的定时器节流（App Nap），保住 3 秒背景采样
+        // 保持任务监测及时，但常驻组件不能阻止用户的 Mac 自动休眠。
         activityToken = ProcessInfo.processInfo.beginActivity(
-            options: [.userInitiated, .suddenTerminationDisabled, .automaticTerminationDisabled],
-            reason: "面板背景采样定时器")
+            options: [.userInitiatedAllowingIdleSystemSleep, .suddenTerminationDisabled, .automaticTerminationDisabled],
+            reason: "监测本地 AI 任务状态")
     }
 
     // MARK: 通知点击路由
@@ -144,7 +144,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         guard store.data != nil else { return }
 
         // 过渡期间不争抢窗口尺寸；最后一次数据在动画完成后统一测量。
-        if panelTransitioning || desktopAnchorMoving {
+        if !panel.isVisible || panelTransitioning || desktopAnchorMoving {
             panelSizeUpdatePending = true
         } else {
             updatePanelSize()
@@ -648,6 +648,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         let appearanceTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
             self?.applyPanelAppearanceMode()
         }
+        appearanceTimer.tolerance = 0.3
         RunLoop.main.add(appearanceTimer, forMode: .common)
         // 事件驱动补采样：前台 app 切换 / 切 Space 时背景内容大概率变了，即时重检
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -666,6 +667,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         let fullscreenTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             self?.updateFullscreenAutoHide()
         }
+        fullscreenTimer.tolerance = 0.5
         RunLoop.main.add(fullscreenTimer, forMode: .common)
         // 设置改动（外观模式切换）立即生效，不等下个 3 秒周期
         NotificationCenter.default.addObserver(
@@ -1084,6 +1086,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             ballPanel.orderOut(nil)
             petPanel.orderFront(nil)
             if !panelTransitioning && petDetailsExpanded {
+                if panelSizeUpdatePending { updatePanelSize() }
                 if modeChanged { positionDetailsPanelNextToPet() }
                 panel.orderFront(nil)
             } else if !panelTransitioning {
@@ -1101,7 +1104,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             if modeChanged { cardExpanded = false }
             updateCardAutoCollapseTimer()
             if !panelTransitioning {
-                if cardExpanded { panel.orderFront(nil) } else { panel.orderOut(nil) }
+                if cardExpanded {
+                    if panelSizeUpdatePending { updatePanelSize() }
+                    panel.orderFront(nil)
+                } else { panel.orderOut(nil) }
             }
             ballPanel.orderFront(nil)
         }
@@ -1206,6 +1212,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if let activityToken { ProcessInfo.processInfo.endActivity(activityToken) }
         store.cancelKimiAuthorization()
         finishDesktopMovement(reposition: false)
     }

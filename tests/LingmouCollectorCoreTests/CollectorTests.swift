@@ -5,6 +5,16 @@ import XCTest
 @testable import LingmouCollectorCore
 
 final class CollectorTests: XCTestCase {
+    func testTimestampReuseAcrossFormatsAndConcurrentReaders() {
+        DispatchQueue.concurrentPerform(iterations: 100) { _ in
+            XCTAssertEqual(DateSupport.timestamp("1970-01-01T00:00:01Z"), 1)
+            XCTAssertEqual(DateSupport.timestamp("1970-01-01T08:00:01.250+08:00"), 1.25)
+            XCTAssertEqual(DateSupport.timestamp("1969-12-31T19:00:01-05:00"), 1)
+            XCTAssertNil(DateSupport.timestamp("malformed"))
+            XCTAssertNil(DateSupport.timestamp(nil))
+        }
+    }
+
     private func temporaryDirectory() throws -> URL {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             UUID().uuidString, isDirectory: true)
