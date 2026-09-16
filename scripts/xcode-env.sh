@@ -5,8 +5,10 @@
 lingmou_xcode_is_usable() {
   local developer_dir="${1:-}"
   [[ -n "$developer_dir" && -d "$developer_dir" ]] || return 1
+  # --show-sdk-path 在 Xcode 与 Command Line Tools 下都可用；
+  # --show-sdk-platform-path 只有完整 Xcode 才有，会误拒 CLT。
   DEVELOPER_DIR="$developer_dir" /usr/bin/xcrun --sdk macosx \
-    --show-sdk-platform-path >/dev/null 2>&1
+    --show-sdk-path >/dev/null 2>&1
 }
 
 lingmou_find_developer_dir() {
@@ -27,6 +29,7 @@ lingmou_find_developer_dir() {
     /Applications/Xcode*.app/Contents/Developer
     /Volumes/*/Applications/Xcode*.app/Contents/Developer
     /Volumes/*/应用程序/Xcode*.app/Contents/Developer
+    /Library/Developer/CommandLineTools
   )
   shopt -u nullglob
 
@@ -43,7 +46,7 @@ _lingmou_original_developer_dir="${DEVELOPER_DIR:-}"
 if _lingmou_resolved_developer_dir=$(lingmou_find_developer_dir); then
   export DEVELOPER_DIR="$_lingmou_resolved_developer_dir"
   if [[ "$DEVELOPER_DIR" != "$_lingmou_original_developer_dir" ]]; then
-    echo "提示：使用 Xcode 开发工具：${DEVELOPER_DIR%/Contents/Developer}" >&2
+    echo "提示：使用开发工具链：${DEVELOPER_DIR%/Contents/Developer}" >&2
   fi
 else
   echo "错误：找不到可用的 Xcode 开发工具。" >&2
