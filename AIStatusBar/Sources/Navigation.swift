@@ -68,8 +68,10 @@ enum NotificationRouter {
             case "kimi": openKimi(sessionId: sessionId)
             case "claude": _ = openHost(of: "claude", excluding: ["Claude.app/"])
             case "hermes":
-                if activateRunningApp(bundleID: "com.nousresearch.hermes", named: ["Hermes"]) { return }
-                _ = openHost(of: "hermes")
+                // named 兜底必须留空：/Applications/Hermes.app 是同名安装器，不是桌面端。
+                if activateRunningApp(bundleID: "com.nousresearch.hermes", named: []) { return }
+                if openHost(of: "hermes", reportMissing: false) { return }
+                openApplication(bundleID: "com.nousresearch.hermes", path: hermesDesktopAppPath())
             case "dsh":
                 if !NSWorkspace.shared.open(URL(string: "http://127.0.0.1:3080/")!) {
                     explain("无法打开 DSH 页面", detail: "请确认本机 DSH Web 服务和默认浏览器可用。")
@@ -283,6 +285,19 @@ enum NotificationRouter {
                 }
             }
         }
+    }
+
+    /// Hermes Desktop 不装在 /Applications：hermes-agent 把按架构发布的 app
+    /// 放在 ~/.hermes 下，/Applications/Hermes.app 只是同名安装器。
+    private static func hermesDesktopAppPath() -> String {
+        let release = NSHomeDirectory() + "/.hermes/hermes-agent/apps/desktop/release"
+        let macDirs = (try? FileManager.default.contentsOfDirectory(atPath: release))?
+            .filter { $0.hasPrefix("mac-") }.sorted() ?? []
+        for dir in macDirs
+        where FileManager.default.fileExists(atPath: release + "/" + dir + "/Hermes.app") {
+            return release + "/" + dir + "/Hermes.app"
+        }
+        return release + "/mac-arm64/Hermes.app"
     }
 
     /// Multiple CLI processes in one GUI app still cannot identify that app's terminal window.
