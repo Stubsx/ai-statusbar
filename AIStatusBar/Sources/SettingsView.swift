@@ -22,6 +22,7 @@ struct SettingsView: View {
     @AppStorage("desktopPresentationMode") private var desktopPresentationMode = "card"
     @AppStorage("panelAppearanceMode") private var appearanceMode = "system"
     @AppStorage("floatingBallAppearance") private var ballAppearance = "blue"
+    @AppStorage("lowEnergyMode") private var lowEnergyMode = false
     @AppStorage("settingsTab") private var settingsTab = "general"
 
     private func chooseSyncDirectory() {
@@ -169,6 +170,10 @@ struct SettingsView: View {
                         .accessibilityHidden(true)
                     modePicker($ballAppearance, options: FloatingBallAppearance.allCases.map { ($0.title, $0.rawValue) })
                 }
+            }
+            divider
+            settingRow("低能耗模式", detail: "停止浮球液体流动与光环旋转，保留眼睛跟随和眨眼") {
+                toggle($lowEnergyMode)
             }
             divider
             settingRow("面板配色", detail: "背景自适应按面板下方明暗自动反差") {

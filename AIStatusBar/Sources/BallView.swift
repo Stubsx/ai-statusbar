@@ -28,9 +28,8 @@ struct FloatingBallView: View {
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage("floatingBallAppearance") private var appearance = "blue"
+    @AppStorage("lowEnergyMode") private var lowEnergyMode = false
     @State private var hovered = false
-    @State private var gaze = CGSize.zero
-    @State private var eyeOpenness: CGFloat = 1
     @State private var celebratingSerial = 0
 
     private var liveMood: PetMood {
@@ -44,17 +43,10 @@ struct FloatingBallView: View {
     }
 
     var body: some View {
-        FloatingBallStatusArtwork(mood: mood, state: bubbleState, gaze: gaze,
-                                  hovered: hovered, reduceMotion: reduceMotion, eyeOpenness: eyeOpenness,
-                                  appearance: FloatingBallAppearance(rawValue: appearance) ?? .blue)
-            .background(alignment: .bottomLeading) {
-                BallMouseTracker(reduceMotion: reduceMotion, onGaze: { gaze = $0 }, onBlink: { eyeOpenness = $0 })
-                    .frame(width: 64, height: 64)
-                    .frame(width: FloatingBallStatusArtwork.anchorSize.width,
-                           height: FloatingBallStatusArtwork.anchorSize.height, alignment: .bottom)
-                    .allowsHitTesting(false)
-                    .accessibilityHidden(true)
-            }
+        FloatingBallStatusArtwork(mood: mood, state: bubbleState,
+                                  hovered: hovered, reduceMotion: reduceMotion,
+                                  appearance: FloatingBallAppearance(rawValue: appearance) ?? .blue,
+                                  lowEnergyMode: lowEnergyMode, tracksPointer: true)
             .contentShape(Rectangle())
             .onTapGesture(perform: onToggle)
             .onHover { inside in
@@ -100,6 +92,8 @@ struct FloatingBallStatusArtwork: View {
     var reduceMotion = false
     var eyeOpenness: CGFloat = 1
     var appearance: FloatingBallAppearance = .blue
+    var lowEnergyMode = false
+    var tracksPointer = false
 
     private var anchorState: StatusBubbleState {
         state.runningCount > 0 ? StatusBubbleState(mood: .working(taskCount: state.runningCount)) : state
@@ -107,7 +101,8 @@ struct FloatingBallStatusArtwork: View {
 
     var body: some View {
         FloatingBallArtwork(mood: mood, gaze: gaze, hovered: hovered,
-                            reduceMotion: reduceMotion, eyeOpenness: eyeOpenness, appearance: appearance)
+                            reduceMotion: reduceMotion, eyeOpenness: eyeOpenness, appearance: appearance,
+                            lowEnergyMode: lowEnergyMode, tracksPointer: tracksPointer)
             .frame(width: Self.anchorSize.width, height: Self.anchorSize.height, alignment: .bottom)
             .overlay(alignment: .topTrailing) {
                 if state.isVisible(expanded: false) {
@@ -136,10 +131,13 @@ struct FloatingBallArtwork: View {
     let reduceMotion: Bool
     var eyeOpenness: CGFloat = 1
     var appearance: FloatingBallAppearance = .blue
+    var lowEnergyMode = false
+    var tracksPointer = false
     /// 导出动效预览时指定一帧，常规显示由原生动画层播放。
     var washFrame: CGImage? = nil
 
     private var palette: BallInkDrawing.Palette { appearance == .ink ? .ink : .blue }
+    private var staticEffects: Bool { reduceMotion || lowEnergyMode }
 
     private var working: Bool {
         if case .working = mood { return true }
@@ -158,11 +156,11 @@ struct FloatingBallArtwork: View {
         ZStack {
             if working {
                 if appearance.isMonochrome {
-                    BallInkOrbit(reduceMotion: reduceMotion)
-                        .id(reduceMotion)
+                    BallInkOrbit(reduceMotion: staticEffects)
+                        .id(staticEffects)
                 } else {
-                    BallOrbitGlow(color: accent, reduceMotion: reduceMotion)
-                        .id(reduceMotion)
+                    BallOrbitGlow(color: accent, reduceMotion: staticEffects)
+                        .id(staticEffects)
                 }
             }
 
@@ -170,7 +168,7 @@ struct FloatingBallArtwork: View {
                 Group {
                     if let washFrame {
                         BallWashBody(image: washFrame, palette: palette)
-                    } else if reduceMotion {
+                    } else if staticEffects {
                         BallWashBody(image: palette.still, palette: palette)
                     } else {
                         BallInkFlow(working: working, palette: palette, resting: mood == .sleeping)
@@ -179,14 +177,10 @@ struct FloatingBallArtwork: View {
                 }
                 .frame(width: 56, height: 56)
 
-                // 将眼睛贴在球面上投影：远侧眼睛变窄、眼距压缩，斜看时连线随头部转动。
-                ForEach([-1, 1], id: \.self) { side in
-                    let eye = BallFaceGeometry.eye(side: side, gaze: gaze)
-                    Capsule()
-                        .fill(.white)
-                        .frame(width: 5.8 * eye.widthScale, height: max(1.4, 10.8 * eyeOpenness * eye.heightScale))
-                        .rotationEffect(.radians(eye.tilt))
-                        .offset(x: eye.center.x, y: eye.center.y)
+                if tracksPointer {
+                    BallTrackingFace(reduceMotion: reduceMotion)
+                } else {
+                    BallFaceArtwork(gaze: gaze, eyeOpenness: eyeOpenness)
                 }
             }
             .frame(width: 48, height: 48)
@@ -196,9 +190,46 @@ struct FloatingBallArtwork: View {
         }
         .frame(width: 64, height: 64)
         .scaleEffect(hovered && !reduceMotion ? 1.035 : 1)
-        .animation(reduceMotion ? nil : .easeInOut(duration: 0.22), value: mood)
+        .animation(staticEffects ? nil : .easeInOut(duration: 0.22), value: mood)
     }
 
+}
+
+/// 视线与眨眼只更新脸部，避免每一帧重建球体纹理、工作环和状态胶囊。
+private struct BallTrackingFace: View {
+    let reduceMotion: Bool
+    @State private var gaze = CGSize.zero
+    @State private var eyeOpenness: CGFloat = 1
+
+    var body: some View {
+        BallFaceArtwork(gaze: gaze, eyeOpenness: eyeOpenness)
+            .background {
+                BallMouseTracker(reduceMotion: reduceMotion,
+                                 onGaze: { gaze = $0 }, onBlink: { eyeOpenness = $0 })
+            }
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+    }
+}
+
+private struct BallFaceArtwork: View {
+    let gaze: CGSize
+    let eyeOpenness: CGFloat
+
+    var body: some View {
+        ZStack {
+            // 将眼睛贴在球面上投影：远侧眼睛变窄，斜看时连线随头部转动。
+            ForEach([-1, 1], id: \.self) { side in
+                let eye = BallFaceGeometry.eye(side: side, gaze: gaze)
+                Capsule()
+                    .fill(.white)
+                    .frame(width: 5.8 * eye.widthScale, height: max(1.4, 10.8 * eyeOpenness * eye.heightScale))
+                    .rotationEffect(.radians(eye.tilt))
+                    .offset(x: eye.center.x, y: eye.center.y)
+            }
+        }
+        .frame(width: 48, height: 48)
+    }
 }
 
 /// 纹理由 Swift 在内存中绘制，晕染收在固定圆形轮廓内，画布保留透明余量。
@@ -368,6 +399,13 @@ private struct BallOrbitGlow: View {
 
 /// 鼠标向量 -> 最大 5pt 的眼睛位移。远距离平滑饱和，不会越出球面。
 enum BallGazeGeometry {
+    /// 按经过的时间平滑收敛，帧率变化时保持相同的跟随速度。
+    static func follow(current: CGSize, target: CGSize, elapsed: TimeInterval) -> CGSize {
+        let fraction = CGFloat(1 - exp(-max(0, elapsed) / 0.11))
+        return CGSize(width: current.width + (target.width - current.width) * fraction,
+                      height: current.height + (target.height - current.height) * fraction)
+    }
+
     static func offset(cursor: CGPoint, center: CGPoint) -> CGSize {
         let dx = cursor.x - center.x
         let dy = cursor.y - center.y
@@ -411,10 +449,12 @@ final class BallMouseTrackingView: NSView {
     var reduceMotion = false
     private var timer: Timer?
     private var visibilityObserver: NSObjectProtocol?
+    private var visibilityObservation: NSKeyValueObservation?
     private var current = CGSize.zero
     private var nextBlink = TimeInterval.infinity
     private var blinkStart: TimeInterval?
     private var lastOpenness: CGFloat = 1
+    private var lastSampleTime: TimeInterval?
 
     override var isFlipped: Bool { true }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
@@ -423,6 +463,7 @@ final class BallMouseTrackingView: NSView {
         super.viewDidMoveToWindow()
         stop()
         guard let window else { return }
+        visibilityObservation = window.observe(\.isVisible) { [weak self] _, _ in self?.updatePolling() }
         visibilityObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didChangeOcclusionStateNotification,
             object: window, queue: .main
@@ -454,13 +495,13 @@ final class BallMouseTrackingView: NSView {
         scheduleSample(after: 0)
     }
 
-    /// 静止时只探测指针，移动收敛与眨眼期间才用 30fps；仍无需全局事件权限。
+    /// 静止时保持 4Hz 探测；仅脸部移动与眨眼期间用 60fps，仍无需全局事件权限。
     private func scheduleSample(after delay: TimeInterval) {
         let timer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
             self?.timer = nil
             self?.sample()
         }
-        timer.tolerance = delay >= 0.2 ? 0.025 : 0.008
+        timer.tolerance = delay >= 0.2 ? 0.025 : 0.001
         self.timer = timer
         RunLoop.main.add(timer, forMode: .common)
     }
@@ -475,19 +516,19 @@ final class BallMouseTrackingView: NSView {
         sampleBlink()
         let local = convert(window.convertPoint(fromScreen: mouseLocation()), from: nil)
         let target = BallGazeGeometry.offset(cursor: local, center: CGPoint(x: bounds.midX, y: bounds.midY))
-        let follow: CGFloat = reduceMotion ? 1 : 0.26
-        let next = CGSize(
-            width: current.width + (target.width - current.width) * follow,
-            height: current.height + (target.height - current.height) * follow
-        )
-        let moving = hypot(next.width - current.width, next.height - current.height) > 0.008
+        let now = ProcessInfo.processInfo.systemUptime
+        // 静止后的首次采样不跨过整个间隔，避免直接跳到指针方向。
+        let elapsed = min(1 / 30, lastSampleTime.map { now - $0 } ?? 1 / 60)
+        lastSampleTime = now
+        let next = reduceMotion ? target : BallGazeGeometry.follow(current: current, target: target, elapsed: elapsed)
+        let moving = hypot(target.width - current.width, target.height - current.height) > 0.03
         if moving {
             current = next
             onGaze?(next)
         }
         let untilBlink = reduceMotion ? TimeInterval.infinity
-            : max(1 / 30, nextBlink - ProcessInfo.processInfo.systemUptime)
-        let delay = !reduceMotion && (moving || blinkStart != nil) ? 1 / 30 : min(0.25, untilBlink)
+            : max(1 / 60, nextBlink - now)
+        let delay = !reduceMotion && (moving || blinkStart != nil) ? 1 / 60 : min(0.25, untilBlink)
         scheduleSample(after: delay)
     }
 
@@ -516,6 +557,8 @@ final class BallMouseTrackingView: NSView {
     func stop() {
         timer?.invalidate()
         timer = nil
+        lastSampleTime = nil
+        visibilityObservation = nil
         if let visibilityObserver {
             NotificationCenter.default.removeObserver(visibilityObserver)
             self.visibilityObserver = nil

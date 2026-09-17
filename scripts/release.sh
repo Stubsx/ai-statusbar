@@ -6,11 +6,21 @@
 # 如需 Apple 公证分发，自行设置 SIGN_IDENTITY="Developer ID Application: ..."
 # 和 NOTARY_PROFILE，build-dmg.sh 会自动启用 DMG 签名与公证。
 # 用法: ./scripts/release.sh <tag>   例如 ./scripts/release.sh v1.0.1
+# 发布前必须提交 docs/releases/<tag>.md，说明相对上一正式版本的变化。
 set -euo pipefail
 ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 TAG="${1:?用法: $0 <tag>，例如 v1.0.1}"
 if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "错误：tag 必须是 vX.Y.Z 格式" >&2
+  exit 1
+fi
+NOTES_FILE="$ROOT/docs/releases/$TAG.md"
+if [[ ! -s "$NOTES_FILE" ]] || ! grep -Eq '^[-*][[:space:]]+[^[:space:]]' "$NOTES_FILE"; then
+  echo "错误：请先编写 docs/releases/$TAG.md，至少包含一条相对上一正式版本的具体更新；不能仅有标题或比较链接" >&2
+  exit 1
+fi
+if ! git -C "$ROOT" ls-files --error-unmatch "docs/releases/$TAG.md" >/dev/null 2>&1; then
+  echo "错误：版本更新说明必须先纳入 Git 并提交" >&2
   exit 1
 fi
 for tool in gh shasum; do
@@ -92,6 +102,6 @@ REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 gh release create "$TAG" "$DMG" "${DMG}.sha256" \
   --repo "$REPO" \
   --verify-tag \
-  --generate-notes \
+  --notes-file "$NOTES_FILE" \
   --title "灵眸 $TAG"
 echo "✅ GitHub Release 发布完成: $TAG"

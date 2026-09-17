@@ -7,13 +7,15 @@ private final class FloatingBallPlaybackDelegate: NSObject, NSApplicationDelegat
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard let screen = NSScreen.main else { fail("No display available for native playback check") }
         func artwork(_ appearance: FloatingBallAppearance, reduceMotion: Bool = false,
-                     sleeping: Bool = false, hovered: Bool = false) -> FloatingBallStatusArtwork {
+                     sleeping: Bool = false, hovered: Bool = false,
+                     lowEnergyMode: Bool = false) -> FloatingBallStatusArtwork {
             let mood: PetMood = sleeping ? .sleeping : .working(taskCount: 2)
             return FloatingBallStatusArtwork(mood: mood,
                 state: StatusBubbleState(mood: mood),
-                hovered: hovered, reduceMotion: reduceMotion, appearance: appearance)
+                hovered: hovered, reduceMotion: reduceMotion, appearance: appearance,
+                lowEnergyMode: lowEnergyMode, tracksPointer: true)
         }
-        let hosted = NSHostingView(rootView: artwork(.blue))
+        let hosted = NSHostingView(rootView: artwork(.blue, lowEnergyMode: true))
         hosted.wantsLayer = true
         hosted.layer?.backgroundColor = NSColor.clear.cgColor
         hosted.sizingOptions = []
@@ -28,25 +30,37 @@ private final class FloatingBallPlaybackDelegate: NSObject, NSApplicationDelegat
         window.backgroundColor = .clear
         window.hasShadow = false
         window.level = .floating
+        window.hidesOnDeactivate = false
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.contentView = hosted
         window.orderFront(nil)
 
-        var stage = 0
+        var stage = -1
         var hashes = Set<UInt64>()
         var angles = Set<Int>()
         var restingFrame: Data?
+        var lowEnergyTracker: BallMouseTrackingView?
         let deadline = Date().addingTimeInterval(35)
         Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { timer in
             MainActor.assumeIsolated {
-                guard Date() < deadline else { self.fail("Native playback timed out at stage \(stage)") }
                 let native = self.flowView(in: hosted)
                 let paint = native?.layer?.sublayers?.first
                 let animation = paint?.animation(forKey: "ink-flow")
                 let displayedWidth = paint?.contents.map { ($0 as! CGImage).width }
                 let orbit = self.orbitView(in: hosted)
                 let rotor = orbit?.subviews.first?.layer
+                guard Date() < deadline else {
+                    self.fail("Native playback timed out at stage \(stage): flow=\(native != nil), "
+                        + "animation=\(animation != nil), presentation=\(paint?.presentation()?.contents != nil), "
+                        + "frames=\(hashes.count), angles=\(angles.count), visible=\(window.occlusionState.contains(.visible))")
+                }
                 switch stage {
-                case 0, 2, 3, 5:
+                case -1:
+                    guard native == nil, orbit == nil else { self.fail("Low-energy startup created animation views") }
+                    print("PASS: low-energy startup skips flow and orbit playback")
+                    hosted.rootView = artwork(.blue)
+                    stage = 0
+                case 0, 2, 3, 5, 11:
                     guard animation != nil,
                           let contents = paint?.presentation()?.contents else { return }
                     guard rotor?.animation(forKey: "ball-orbit") != nil,
@@ -92,13 +106,20 @@ private final class FloatingBallPlaybackDelegate: NSObject, NSApplicationDelegat
                         print("PASS: hidden panel resumes changing frames")
                         hosted.rootView = artwork(.ink)
                         stage = 3
-                    } else {
+                    } else if stage == 3 {
                         print("PASS: appearance switch presents changing ink frames")
                         hosted.rootView = artwork(.ink, sleeping: true)
                         stage = 7
+                    } else {
+                        print("PASS: disabling low-energy mode restores native playback")
+                        hosted.rootView = artwork(.ink, reduceMotion: true)
+                        stage = 4
                     }
                 case 1:
-                    guard animation == nil else { self.fail("Hidden panel kept playing") }
+                    guard animation == nil else {
+                        self.fail("Hidden panel kept playing: visible=\(window.isVisible), "
+                            + "occluded=\(!window.occlusionState.contains(.visible)), attached=\(native?.window === window)")
+                    }
                     guard rotor?.animation(forKey: "ball-orbit") == nil else { self.fail("Hidden orbit kept playing") }
                     guard displayedWidth == 160 else { self.fail("Hidden drawing lost its cached frame") }
                     window.orderFront(nil)
@@ -114,8 +135,23 @@ private final class FloatingBallPlaybackDelegate: NSObject, NSApplicationDelegat
                           let data = (contents as! CGImage).dataProvider?.data,
                           data as Data == restingFrame else { self.fail("Hover disturbed a resting wash") }
                     print("PASS: resting wash stays still when hovered")
-                    hosted.rootView = artwork(.ink, reduceMotion: true)
-                    stage = 4
+                    hosted.rootView = artwork(.ink, lowEnergyMode: true)
+                    stage = 9
+                case 9, 10:
+                    guard native == nil, orbit == nil else { self.fail("Low-energy mode kept an animation view") }
+                    guard let tracker = self.pointerView(in: hosted), !tracker.reduceMotion else {
+                        self.fail("Low-energy mode must retain pointer following and blinking")
+                    }
+                    if stage == 9 {
+                        lowEnergyTracker = tracker
+                        hosted.rootView = artwork(.blue, hovered: true, lowEnergyMode: true)
+                        stage = 10
+                    } else {
+                        guard lowEnergyTracker === tracker else { self.fail("Style change reset live eye tracking") }
+                        print("PASS: low-energy mode stops both palettes and orbits, preserving live eyes")
+                        hosted.rootView = artwork(.blue)
+                        stage = 11
+                    }
                 default:
                     guard native == nil else { self.fail("Reduce Motion kept the animated native view") }
                     guard orbit == nil else { self.fail("Reduce Motion kept the animated orbit") }
@@ -139,12 +175,19 @@ private final class FloatingBallPlaybackDelegate: NSObject, NSApplicationDelegat
         return view.subviews.lazy.compactMap { self.orbitView(in: $0) }.first
     }
 
+    private func pointerView(in view: NSView) -> BallMouseTrackingView? {
+        if let view = view as? BallMouseTrackingView { return view }
+        return view.subviews.lazy.compactMap { self.pointerView(in: $0) }.first
+    }
+
     private func checkPointerPolling() {
         let tracker = BallMouseTrackingView(frame: NSRect(x: 0, y: 0, width: 64, height: 64))
         let window = NSPanel(contentRect: NSRect(x: 100, y: 100, width: 64, height: 64),
                              styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.level = .floating
+        window.hidesOnDeactivate = false
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.contentView = tracker
         var reads = 0
         var gazeUpdates = 0
@@ -160,7 +203,7 @@ private final class FloatingBallPlaybackDelegate: NSObject, NSApplicationDelegat
             assert((2...8).contains(reads), "Stationary gaze should poll around 4Hz, not 30Hz: \(reads)")
             offset = 400
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                assert(gazeUpdates >= 4, "Pointer movement must still smoothly follow at 30fps")
+                assert(gazeUpdates >= 12, "Active gaze must get enough updates for smooth following")
                 tracker.reduceMotion = true
                 let beforeReduced = reads
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {

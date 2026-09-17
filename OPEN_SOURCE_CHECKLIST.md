@@ -15,20 +15,21 @@
 
 - [ ] 工作区干净，CI 全部通过。
 - [ ] 使用符合 `vX.Y.Z` 的新版本号。
-- [ ] 用 Developer ID Application 身份签名 App 和 DMG。
-- [ ] 使用 Apple notarytool 公证并 stapler 装订。
+- [ ] 按 [版本发布规范](docs/RELEASING.md) 提交 `docs/releases/<tag>.md`，只说明相对上一个正式版本的具体更新；不可复制完整功能介绍或仅保留比较链接。
+- [ ] 使用稳定的 `Lingmou Local` 身份签名；若选择 Developer ID 分发，则签名 App 和 DMG。
+- [ ] 若配置 Apple 公证，使用 notarytool 公证并 stapler 装订；说明中不得宣称未执行的公证。
 - [ ] 在另一台未安装 Python 的 Mac 上验证首次打开、状态刷新、通知和录屏权限。
 - [ ] 检查 DMG 中不包含日志、数据库、设置、证书或其他本地文件。
 - [ ] 创建 GitHub Release，附校验和与变更说明。
+- [ ] 发布后回读正文，确认与已提交的说明一致；核对 tag、安装包版本、DMG 与 SHA-256 附件。
 
 示例发布命令：
 
 ```bash
-SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
-NOTARY_PROFILE="lingmou-notary" \
-./scripts/release.sh v1.0.1
+./scripts/release.sh v1.3.2
 ```
 
-脚本会检查 `main` 已推送到远端，构建并公证 DMG，创建并推送 annotated tag，
-最后创建带 SHA-256 校验文件的 GitHub Release。失败后可用同一 tag 重试；已发布的
+脚本会检查版本说明已提交且非空、`main` 已推送到远端，构建 DMG，创建并推送 annotated tag，
+最后通过 `--notes-file` 创建带更新正文和 SHA-256 校验文件的 GitHub Release。设置 Developer ID 的
+`SIGN_IDENTITY` 与 `NOTARY_PROFILE` 后才会公证 DMG。失败后可用同一 tag 重试；已发布的
 Release 不会被覆盖。

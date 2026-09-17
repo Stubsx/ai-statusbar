@@ -37,6 +37,16 @@ func runChecks() throws {
     let near = BallGazeGeometry.offset(cursor: CGPoint(x: 10, y: 0), center: .zero)
     let far = BallGazeGeometry.offset(cursor: CGPoint(x: 1000, y: 0), center: .zero)
     assert(near.width < far.width)
+    // 帧率改变不能改变跟随速度，也不能越过目标位置。
+    func followedGaze(fps: Int) -> CGSize {
+        var gaze = CGSize.zero
+        for _ in 0..<fps {
+            gaze = BallGazeGeometry.follow(current: gaze, target: far, elapsed: 1 / Double(fps))
+            assert(gaze.width <= far.width)
+        }
+        return gaze
+    }
+    assert(abs(followedGaze(fps: 30).width - followedGaze(fps: 60).width) < 0.000001)
     for t in stride(from: 0.0, through: 0.4, by: 0.001) {
         assert((0...1).contains(BallBlinkTiming.openness(elapsed: t)))
     }

@@ -39,6 +39,7 @@ final class BallOrbitView: NSView {
     private let rotor = NSView()
     private var clock: BallInkFlowClock
     private var visibilityObserver: NSObjectProtocol?
+    private var visibilityObservation: NSKeyValueObservation?
     private var animationSize = CGSize.zero
 
     init(content: NSView, duration: TimeInterval) {
@@ -70,6 +71,8 @@ final class BallOrbitView: NSView {
         super.viewDidMoveToWindow()
         stop()
         guard let window else { return }
+        // 跨空间悬浮窗 orderOut 后遮挡标记可能暂时不变，直接跟踪可见性以立即停播。
+        visibilityObservation = window.observe(\.isVisible) { [weak self] _, _ in self?.updatePlayback() }
         visibilityObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main
         ) { [weak self] _ in self?.updatePlayback() }
@@ -117,6 +120,7 @@ final class BallOrbitView: NSView {
 
     func stop() {
         pause()
+        visibilityObservation = nil
         if let visibilityObserver {
             NotificationCenter.default.removeObserver(visibilityObserver)
             self.visibilityObserver = nil
@@ -153,6 +157,7 @@ final class BallInkFlowView: NSView {
     private var frames: [CGImage] = []
     private var loading = false
     private var visibilityObserver: NSObjectProtocol?
+    private var visibilityObservation: NSKeyValueObservation?
     private var clock: BallInkFlowClock
     private var resting: Bool
 
@@ -186,6 +191,7 @@ final class BallInkFlowView: NSView {
         super.viewDidMoveToWindow()
         stop()
         guard let window else { return }
+        visibilityObservation = window.observe(\.isVisible) { [weak self] _, _ in self?.updatePlayback() }
         visibilityObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didChangeOcclusionStateNotification,
             object: window, queue: .main
@@ -285,6 +291,7 @@ final class BallInkFlowView: NSView {
 
     func stop() {
         pause()
+        visibilityObservation = nil
         if let visibilityObserver {
             NotificationCenter.default.removeObserver(visibilityObserver)
             self.visibilityObserver = nil

@@ -8,6 +8,7 @@
 
 - 在菜单栏和可选桌面卡片中显示工作中、空闲、未运行状态。
 - 看板收起后的浮球支持晴蓝、水墨两种风格，在「设置 → 通用 → 浮球风格」切换；两种风格均由 Swift 程序绘制整齐圆润的轮廓与内部浓淡叠染，不依赖图片素材。晴蓝以天蓝与浅蓝水洗叠色，水墨使用浓墨与枯笔工作环，均保留眨眼、视线跟随和状态数字。色层在内部缓缓流动，轮廓保持稳定，晕染不向外扩散；水墨空闲时 14 秒、工作时 8 秒一循环；晴蓝使用更明显的色层流动，空闲时 10 秒、工作时 6 秒一循环；动画帧在后台生成并缓存，由原生图层播放，隐藏时暂停，休眠时色层静止，开启系统「减少动态效果」时使用静态画面。
+- 「设置 → 通用 → 低能耗模式」可关闭浮球液体流动和工作光环旋转，保留眼睛跟随、眨眼与状态提示；晴蓝、水墨均适用，切换立即生效并记住本机选择。
 - 显示近期任务标题、当日 Token 用量和近十周活跃热力图。
 - 可选用量同步：多台设备共用一个目录（默认 iCloud Drive）汇总用量与活跃，默认展示全部设备、可切回本机。
 - 默认联网查询已登录工具的配额（可在设置中关闭）；接口不可用时自动降级。
@@ -90,15 +91,13 @@ bash scripts/test-experience-visuals.sh
 
 ## 版本与发布
 
-App 的公开版本号来自最近的 `vX.Y.Z` tag，普通 commit 只更新内部构建号，不会改变用户看到的版本。正式发布由维护者在 `main` 已推送、Developer ID 和公证配置就绪后执行：
+App 的公开版本号来自最近的 `vX.Y.Z` tag，普通 commit 只更新内部构建号，不会改变用户看到的版本。每次发布必须先提交 `docs/releases/<tag>.md`，说明相对上一个正式版本的新增、优化和修复，不重复完整功能列表。规范见 [版本发布规范](docs/RELEASING.md)。维护者在 `main` 已推送且 CI 通过后执行：
 
 ```bash
-SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
-NOTARY_PROFILE="lingmou-notary" \
-./scripts/release.sh v1.0.1
+./scripts/release.sh v1.3.2
 ```
 
-脚本会构建 `Lingmou-1.0.1.dmg`、推送 annotated tag，并创建附带 SHA-256 校验文件的 GitHub Release。
+脚本会校验版本说明，构建 DMG、推送 annotated tag，并创建附带更新正文和 SHA-256 校验文件的 GitHub Release。默认使用稳定的 `Lingmou Local` 自签名身份；需要 Developer ID 签名和 Apple 公证时，另外设置 `SIGN_IDENTITY` 与 `NOTARY_PROFILE`。
 
 ## 卸载
 

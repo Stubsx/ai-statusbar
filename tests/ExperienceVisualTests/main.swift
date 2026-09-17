@@ -623,6 +623,12 @@ func renderExperience() throws {
         try save("settings-" + tab, content: SettingsView(store: store, settings: settings, catalog: catalog,
                                                        maintenance: MaintenanceStore())
             .defaultAppStorage(defaults).frame(height: 740).background(Color.white), scheme: .light)
+        if tab == "general" {
+            defaults.set(true, forKey: "lowEnergyMode")
+            try save("settings-low-energy", content: SettingsView(store: store, settings: settings, catalog: catalog,
+                                                                 maintenance: MaintenanceStore())
+                .defaultAppStorage(defaults).frame(height: 740).background(Color.white), scheme: .light)
+        }
     }
     settings.experience.privacyMode = true
     try save("privacy-light", content: PanelView(store: store).defaultAppStorage(overviewDefaults)
@@ -658,6 +664,8 @@ func renderExperience() throws {
     try save("pet-gallery", content: PetGalleryView(settings: settings, catalog: catalog).background(Color.white), scheme: .light)
     let keyboardPanel = TaskPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
     keyboardPanel.isReleasedWhenClosed = false
+    keyboardPanel.hidesOnDeactivate = false
+    keyboardPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
     keyboardPanel.navigationDefaults = overviewDefaults
     assert(keyboardPanel.canBecomeKey, "Status panel must support keyboard focus")
     let keyboardHost = NSHostingView(rootView: PanelView(store: store).defaultAppStorage(overviewDefaults))
