@@ -61,7 +61,7 @@ final class QuotaMonitor {
             let account = tool.key.hasPrefix("codex") ? "codex" : tool.key
             guard !visited.contains(account), let quota = tool.quota, quota.notice == nil,
                   quota.updatedAt > 0, Double(quota.updatedAt) <= now + 60,
-                  now - Double(quota.updatedAt) <= (tool.key == "kimi-work" ? 4_200 : 600),
+                  now - Double(quota.updatedAt) <= QuotaPresentation.freshHorizon(windows: quota.windows),
                   tool.health?.quotaState != "stale", !quota.windows.isEmpty else { continue }
             visited.insert(account)
             for window in quota.windows {

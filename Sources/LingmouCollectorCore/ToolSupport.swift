@@ -37,6 +37,21 @@ public enum ToolSupport {
         }
     }
 
+    /// 配额快照保鲜期按窗口长度分级：月窗一天、周窗十二小时、小时级窗口一小时。
+    /// 部分工具的 token 只在真正发会话时才刷新，固定十分钟阈值会把仍有参考价值
+    /// 的历史快照误标为过期。窗口本身过期（resetsAt 已过）由展示层另行过滤。
+    public static func quotaFreshHorizon(windows: [QuotaWindow]) -> TimeInterval {
+        var horizon: TimeInterval = 3_600
+        for window in windows {
+            switch window.kind {
+            case "month": horizon = max(horizon, 86_400)
+            case "week": horizon = max(horizon, 43_200)
+            default: break
+            }
+        }
+        return horizon
+    }
+
     static func health(for key: String, raw: RawToolState, quota: ToolQuota?,
                        environment: CollectorEnvironment, settings: CollectorSettings) -> ToolHealth {
         let caps = capabilities(for: key)
@@ -61,9 +76,8 @@ public enum ToolSupport {
         if !caps.quota {
             quotaState = "unsupported"
         } else if let quota, !quota.windows.isEmpty {
-            // Kimi 月度接口自身有一小时缓存；其他窗口最多容许十分钟。
-            let horizon: TimeInterval = key == "kimi-work" ? 4_200 : 600
-            quotaState = environment.now - Double(quota.updatedAt) > horizon
+            quotaState = environment.now - Double(quota.updatedAt)
+                    > Self.quotaFreshHorizon(windows: quota.windows)
                 || quota.notice != nil ? "stale" : (settings.onlineQuota ? "ready" : "local")
         } else if !settings.onlineQuota {
             quotaState = "disabled"

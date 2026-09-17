@@ -139,8 +139,14 @@ final class TaskActivityTests: XCTestCase {
         XCTAssertEqual(health.quotaState, "unavailable")
         let stale = ToolQuota(plan: nil, windows: [QuotaWindow(kind: "primary", label: "五小时",
                                                              usedPercent: 80, resetsAt: Int(now + 1_000))],
-                              updatedAt: Int(now - 1_000))
+                              updatedAt: Int(now - 4_000))
         XCTAssertEqual(ToolSupport.health(for: "codex-ide", raw: RawToolState(), quota: stale,
                                           environment: environment, settings: settings).quotaState, "stale")
+        // 分级保鲜期：周窗十二小时内仍算新鲜，不再按固定十分钟误判过期。
+        let recentWeek = ToolQuota(plan: nil, windows: [QuotaWindow(kind: "week", label: "本周",
+                                                                    usedPercent: 40, resetsAt: Int(now + 86_400))],
+                                   updatedAt: Int(now - 3_000))
+        XCTAssertEqual(ToolSupport.health(for: "codex-ide", raw: RawToolState(), quota: recentWeek,
+                                          environment: environment, settings: settings).quotaState, "ready")
     }
 }

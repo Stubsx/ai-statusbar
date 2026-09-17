@@ -314,7 +314,7 @@ struct PanelView: View {
                                         .background(Capsule().fill(Color.primary.opacity(0.08)))
                                 }
                                 Spacer()
-                                if presentation.windows.isEmpty {
+                                if !presentation.isCurrent {
                                     Button("读取设置") {
                                         (NSApp.delegate as? AppDelegate)?.showSettings(tab: "connections")
                                     }
@@ -325,14 +325,26 @@ struct PanelView: View {
                             if !presentation.windows.isEmpty {
                                 let age = ExperienceFormat.age(presentation.lastSuccessAt ?? 0,
                                                                now: context.date.timeIntervalSince1970)
-                                Text("更新于 \(age)")
-                                    .font(.system(size: 10)).foregroundColor(.secondary)
+                                if presentation.isStale {
+                                    Label("快照 · 更新于 \(age)，可能不是最新",
+                                          systemImage: "clock.arrow.circlepath")
+                                        .font(.system(size: 10)).foregroundColor(.orange)
+                                } else {
+                                    Text("更新于 \(age)")
+                                        .font(.system(size: 10)).foregroundColor(.secondary)
+                                }
                                 ForEach(presentation.windows, id: \.label) { window in
                                     if window.kind == "month", !(window.components ?? []).isEmpty {
                                         monthlyQuotaRow(window)
                                     } else {
                                         quotaRow(window)
                                     }
+                                }
+                                .opacity(presentation.isStale ? 0.55 : 1)
+                                if presentation.isStale, !presentation.notice.isEmpty {
+                                    Text(presentation.notice)
+                                        .font(.system(size: 10)).foregroundColor(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
                                 }
                             } else {
                                 Label("当前额度暂不可用", systemImage: "exclamationmark.circle")

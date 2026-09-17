@@ -113,7 +113,8 @@ do {
 
 do {
     let monitor = QuotaMonitor(directory: directory.appendingPathComponent("stale"))
-    check(monitor.observe([tool(quota: quota(99, timestamp: Int(now - 700)))], threshold: 20, recovery: true,
+    // 小时级窗口的分级保鲜期为 1 小时，4_000 秒前的读取才判过期
+    check(monitor.observe([tool(quota: quota(99, timestamp: Int(now - 4_000)))], threshold: 20, recovery: true,
                           now: now).isEmpty, "Stale quota must not alarm")
     check(monitor.observe([tool(quota: quota(99, reset: Int(now - 1)))], threshold: 20, recovery: true,
                           now: now).isEmpty, "Expired window must wait for fresh quota")
@@ -183,23 +184,26 @@ do {
     func reading(age: TimeInterval = 0, notice: String? = nil, windows: [QuotaWindow]? = nil) -> ToolQuota {
         ToolQuota(plan: "Allegro", windows: windows ?? [window], updatedAt: Int(now - age), notice: notice)
     }
+    // 读取失败但窗口未重置的历史快照：展示为降饱和快照，而不是清空
     let unavailable = QuotaPresentation(tool: tool(key: "kimi-work", quota: reading(age: 172_800,
         notice: "凭证读取尚未开启")), now: now)
-    check(!unavailable.isCurrent && unavailable.windows.isEmpty, "Unavailable cached quota cannot show a current percentage")
+    check(!unavailable.isCurrent && unavailable.isStale && !unavailable.windows.isEmpty,
+          "A failed refresh keeps its unexpired snapshot as a dimmed stale reading")
     check(unavailable.lastSuccessAt == now - 172_800, "Keep the actual successful read time when refresh fails")
     let failedAttempt = QuotaPresentation(tool: tool(quota: reading(notice: "需要登录", windows: [])), now: now)
     check(!failedAttempt.isCurrent && failedAttempt.lastSuccessAt == nil, "A failed attempt is not a successful update")
     check(!QuotaPresentation(tool: tool(quota: reading(notice: "无法更新")), now: now).isCurrent,
           "A recent timestamp cannot override an explicit read failure")
-    check(!QuotaPresentation(tool: tool(quota: reading(age: 601)), now: now).isCurrent,
-          "Old quota must expire even when the surrounding status snapshot is fresh")
+    check(!QuotaPresentation(tool: tool(quota: reading(age: 86_500)), now: now).isCurrent,
+          "Monthly readings must expire after their tiered horizon")
     check(QuotaPresentation(tool: tool(key: "kimi-work", quota: reading(age: 3_600)), now: now).isCurrent,
-          "Allow Kimi monthly API's documented one-hour cache")
-    check(!QuotaPresentation(tool: tool(key: "kimi-work", quota: reading(age: 4_201)), now: now).isCurrent,
-          "Monthly readings must expire after the grace period")
+          "Monthly snapshots stay current for a full day")
+    check(QuotaPresentation(tool: tool(key: "kimi-work", quota: reading(age: 4_201)), now: now).isCurrent,
+          "The kimi-work cache exception is replaced by the tiered horizon")
     var staleTool = tool(quota: reading())
     staleTool.health = ToolHealth(state: "ready", message: "", checkedAt: now, quotaState: "stale")
-    check(!QuotaPresentation(tool: staleTool, now: now).isCurrent, "Explicit stale health suppresses cached numbers")
+    check(QuotaPresentation(tool: staleTool, now: now).isCurrent,
+          "Within the tiered horizon a collector stale flag no longer suppresses numbers")
     check(!QuotaPresentation(tool: tool(quota: reading(age: -120)), now: now).isCurrent,
           "A future timestamp cannot make a quota current")
     let expired = QuotaWindow(kind: "primary", label: "五小时", usedPercent: 50, resetsAt: Int(now - 1),
@@ -208,11 +212,11 @@ do {
           "Do not show old percentages from windows that have already reset")
     let codeWindow = QuotaWindow(kind: "5h", label: "5小时", usedPercent: 95, resetsAt: Int(now + 300),
                                  windowMinutes: 300, components: nil)
-    let cachedCode = tool(key: "kimi", quota: reading(age: 3_600, windows: [codeWindow]))
+    let cachedCode = tool(key: "kimi", quota: reading(age: 3_601, windows: [codeWindow]))
     let codeSnapshot = QuotaPresentation(tool: cachedCode, now: now)
-    check(!codeSnapshot.isCurrent && codeSnapshot.windows.isEmpty,
-          "Stale Kimi quota expires like every other tool instead of lingering as a snapshot")
-    check(codeSnapshot.lastSuccessAt == now - 3_600, "Expired quota keeps its real update time")
+    check(!codeSnapshot.isCurrent && codeSnapshot.isStale && !codeSnapshot.windows.isEmpty,
+          "An hourly snapshot past its horizon lingers dimmed until the window resets")
+    check(codeSnapshot.lastSuccessAt == now - 3_601, "Expired quota keeps its real update time")
     let expiredCode = QuotaPresentation(tool: tool(key: "kimi", quota: reading(windows: [expired])), now: now)
     check(!expiredCode.isCurrent && expiredCode.windows.isEmpty,
           "A reset Kimi window cannot claim current quota")
