@@ -9,6 +9,7 @@ swift test
 bash scripts/test-busy-sessions.sh
 bash scripts/test-experience.sh
 bash scripts/test-ecosystem.sh
+bash scripts/test-kimi-desktop-navigation.sh
 swift run lingmou-collector --json \
   | swift -e 'import Foundation; let d=FileHandle.standardInput.readDataToEndOfFile(); guard (try? JSONSerialization.jsonObject(with:d)) != nil else { exit(1) }'
 plutil -lint AIStatusBar/Info.plist
@@ -17,7 +18,7 @@ test -s PRIVACY.md
 swiftc -typecheck -target arm64-apple-macosx12.0 AIStatusBar/Sources/*.swift Sources/LingmouCollectorCore/ActivityModels.swift Sources/LingmouCollectorCore/EventFeed.swift Sources/LingmouCollectorCore/KimiWebNavigation.swift
 /bin/bash -n AIStatusBar/build.sh scripts/build-dmg.sh scripts/install-local.sh scripts/release.sh \
   scripts/xcode-env.sh scripts/with-xcode.sh
-/bin/bash -n scripts/test-busy-sessions.sh scripts/test-experience.sh
+/bin/bash -n scripts/test-busy-sessions.sh scripts/test-experience.sh scripts/test-kimi-desktop-navigation.sh
 /bin/bash -n swiftbar-plugins/ai-cli-status.10s.sh
 
 if rg -n --hidden \

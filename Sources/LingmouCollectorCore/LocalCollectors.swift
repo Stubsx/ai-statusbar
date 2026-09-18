@@ -9,8 +9,12 @@ struct LocalCollectors {
     func kimi() -> RawToolState {
         let count = processes.count(named: "kimi") + processes.count(named: "kimi-code")
             + additionalKimiWebProcesses()
-        let processOn = count > 0
-        var result = RawToolState(processOn: processOn, detail: "\(count) 个进程")
+        // 桌面版在 Electron 内运行模型循环，不一定另起 kimi / kimi-code 进程。
+        // 主程序名包含空格，按完整可执行文件后缀识别，不能把 Helper 或 Kimi Work 算进来。
+        let desktopOn = processes.isAppRunning(executableName: "Kimi Code")
+        let processOn = count > 0 || desktopOn
+        let detail = desktopOn ? "桌面版在线" : "\(count) 个进程"
+        var result = RawToolState(processOn: processOn, detail: detail)
         let root = environment.path(".kimi-code", "sessions")
         let stateFiles = files.files(atDepth: 3, under: root) { $0.hasSuffix("/state.json") }
         let window = TimeInterval(max(settings.busySeconds(for: "kimi"), 1_800))
@@ -69,7 +73,7 @@ struct LocalCollectors {
     }
 
     func kimiWork() -> RawToolState {
-        let appOn = processes.count(named: "Kimi") > 0
+        let appOn = processes.isAppRunning(executableName: "Kimi")
         var result = RawToolState(processOn: appOn, detail: appOn ? "App 在线" : "无进程")
         let support = environment.path("Library", "Application Support", "kimi-desktop")
         let statusesPath = (support as NSString).appendingPathComponent(

@@ -12,12 +12,27 @@ enum NotificationRouter {
     private static var resolvingKimi = false
     /// 由 AppDelegate 注入：跳转 Kimi 网页时是否优先复用已打开的同源标签页。
     static var prefersBrowserTabReuse: () -> Bool = { false }
+    static var prefersKimiDesktopSessionNavigation: () -> Bool = { false }
+    private static let kimiCodeBundleID = "com.kimi.code.desktop"
+    /// Kimi Code 1.0.1 only accepts auth callbacks, not conversation deep links.
+    /// Resolve by bundle ID so Kimi Work and similarly named apps cannot win.
+    static var kimiCodeApplicationURL: () -> URL? = {
+        let running = NSRunningApplication.runningApplications(withBundleIdentifier: kimiCodeBundleID)
+            .first(where: { !$0.isTerminated })?.bundleURL
+        let candidates = [running, URL(fileURLWithPath: "/Applications/Kimi Code.app"),
+                          FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications/Kimi Code.app"),
+                          NSWorkspace.shared.urlForApplication(withBundleIdentifier: kimiCodeBundleID)]
+        return candidates.compactMap { $0 }.first {
+            Bundle(url: $0)?.bundleIdentifier == kimiCodeBundleID
+        }
+    }
 
     /// Rendering must never probe local servers or infer a session route from an app route.
     static func supportsSessionNavigation(forToolKey key: String, sessionId: String?,
                                           kimiWebAvailable: Bool = false) -> Bool {
         if conversationURL(forToolKey: key, sessionId: sessionId) != nil { return true }
-        return key == "kimi" && kimiWebAvailable && sessionId.map(KimiWebInstance.validID) == true
+        guard key == "kimi", sessionId.map(KimiWebInstance.validID) == true else { return false }
+        return kimiCodeApplicationURL() == nil ? kimiWebAvailable : prefersKimiDesktopSessionNavigation()
     }
 
     static func supportsApplicationNavigation(forToolKey key: String) -> Bool {
@@ -31,7 +46,14 @@ enum NotificationRouter {
         case "kimi-work": return "打开 Kimi 应用"
         case "zcode": return "打开 ZCode 应用或宿主"
         case "hermes": return "打开 Hermes 应用或宿主"
-        case "kimi": return sessionId == nil ? "打开 Kimi 网页或宿主" : "打开对应 Kimi 会话或宿主"
+        case "kimi":
+            if kimiCodeApplicationURL() != nil {
+                if prefersKimiDesktopSessionNavigation(), sessionId.map(KimiWebInstance.validID) == true {
+                    return "尝试在 Kimi Code 中打开这条会话，失败时打开应用"
+                }
+                return "打开 Kimi Code 应用（会话需在应用内选择）"
+            }
+            return sessionId == nil ? "打开 Kimi 网页或宿主" : "打开对应 Kimi 会话或宿主"
         case "codex-cli", "claude": return "打开宿主终端或编辑器"
         case "dsh": return "打开 DSH 页面"
         default: return "暂不支持自动打开"
@@ -85,6 +107,45 @@ enum NotificationRouter {
     private static func openKimi(sessionId: String?) {
         guard !resolvingKimi else { return }
         resolvingKimi = true
+        guard let applicationURL = kimiCodeApplicationURL() else {
+            openKimiWebOrHost(sessionId: sessionId)
+            return
+        }
+        let app = NSRunningApplication.runningApplications(withBundleIdentifier: kimiCodeBundleID).first
+        app?.unhide()
+        if #available(macOS 14, *) {
+            NSApp.yieldActivation(toApplicationWithBundleIdentifier: kimiCodeBundleID)
+        }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        configuration.hides = false
+        configuration.createsNewApplicationInstance = false
+        configuration.allowsRunningApplicationSubstitution = false
+        let precise = prefersKimiDesktopSessionNavigation()
+        if precise && app == nil { configuration.arguments = KimiDesktopNavigation.launchArguments }
+        // A running app is never restarted to enable debugging. A normal reopen
+        // remains the fallback when the opt-in bridge is absent or incompatible.
+        NSWorkspace.shared.openApplication(at: applicationURL, configuration: configuration) { opened, error in
+            DispatchQueue.main.async {
+                if error == nil, let opened {
+                    guard precise, let sessionId, KimiWebInstance.validID(sessionId) else {
+                        resolvingKimi = false
+                        return
+                    }
+                    let pid = opened.processIdentifier
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        _ = KimiDesktopNavigation.openSession(sessionId, pid: pid,
+                            applicationURL: applicationURL, waitForLaunch: app == nil)
+                        DispatchQueue.main.async { resolvingKimi = false }
+                    }
+                } else {
+                    openKimiWebOrHost(sessionId: sessionId)
+                }
+            }
+        }
+    }
+
+    private static func openKimiWebOrHost(sessionId: String?) {
         DispatchQueue.global(qos: .userInitiated).async {
             let resolution = KimiWebResolver().resolve(sessionId: sessionId)
             DispatchQueue.main.async {

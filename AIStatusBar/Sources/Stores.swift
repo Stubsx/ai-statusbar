@@ -40,6 +40,8 @@ final class SettingsStore: ObservableObject {
     @Published var kimiTokenDecrypt = false { didSet { save() } }
     /// 跳转 Kimi 网页时复用已打开的同源标签页（需浏览器自动化授权，失败回退新开）
     @Published var kimiWebTabReuse = true { didSet { save() } }
+    /// 实验性桌面会话跳转；本机 Electron 调试连接，默认关闭。
+    @Published var kimiDesktopSessionNavigation = false { didSet { save() } }
     /// 用量同步：多设备通过共享目录汇总用量/活跃；空目录 = iCloud Drive 默认目录
     @Published var usageSyncEnabled = false { didSet { save() } }
     @Published var usageSyncDir = "" { didSet { save() } }
@@ -108,6 +110,7 @@ final class SettingsStore: ObservableObject {
         if let v = obj["online_quota"] as? Bool { onlineQuota = v }
         if let v = obj["kimi_token_decrypt"] as? Bool { kimiTokenDecrypt = v }
         if let v = obj["kimi_web_tab_reuse"] as? Bool { kimiWebTabReuse = v }
+        if let v = obj["kimi_desktop_session_navigation"] as? Bool { kimiDesktopSessionNavigation = v }
         if let s = obj["usage_sync"] as? [String: Any] {
             if let v = s["enabled"] as? Bool { usageSyncEnabled = v }
             if let v = s["dir"] as? String { usageSyncDir = v }
@@ -136,6 +139,7 @@ final class SettingsStore: ObservableObject {
             "online_quota": onlineQuota,
             "kimi_token_decrypt": kimiTokenDecrypt,
             "kimi_web_tab_reuse": kimiWebTabReuse,
+            "kimi_desktop_session_navigation": kimiDesktopSessionNavigation,
             "usage_sync": ["enabled": usageSyncEnabled, "dir": usageSyncDir],
             "number_unit": numberUnit,
             "auto_update_check": autoUpdateCheck,

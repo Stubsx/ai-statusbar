@@ -293,7 +293,7 @@ struct PanelView: View {
                 // Codex App/CLI 共享同一配额，合并为一张卡片
                 let withQuota = tools.filter { $0.quota != nil && $0.key != "codex-cli" }
                 if withQuota.isEmpty {
-                    Text("配额暂不可用，可在“连接与诊断”查看原因")
+                    Text("配额暂不可用，可在“工具与连接”查看原因")
                         .font(.system(size: 11))
                         .foregroundColor(.secondary.opacity(0.6))
                         .padding(.vertical, 4)

@@ -18,7 +18,9 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" .build
 
 # 构建共享 Swift 采集器（arm64 + x86_64），原生 App、SwiftBar 和 Übersicht 共用。
 swift build --package-path .. -c release --arch arm64 --arch x86_64
-cp ../.build/apple/Products/Release/lingmou-collector "$APP/Contents/Resources/"
+# Swift 工具链会调整产物目录，使用实际输出路径，避免误拷历史构建。
+COLLECTOR_BIN_DIR="$(swift build --package-path .. -c release --arch arm64 --arch x86_64 --show-bin-path)"
+cp "$COLLECTOR_BIN_DIR/lingmou-collector" "$APP/Contents/Resources/"
 chmod 755 "$APP/Contents/Resources/lingmou-collector"
 
 for arch in arm64 x86_64; do

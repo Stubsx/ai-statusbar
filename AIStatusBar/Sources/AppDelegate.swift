@@ -69,6 +69,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         let collectorPath = Bundle.main.path(forResource: "lingmou-collector", ofType: nil)
         store = StatusStore(collectorPath: collectorPath, settings: settings)
         NotificationRouter.prefersBrowserTabReuse = { [settings] in settings.kimiWebTabReuse }
+        NotificationRouter.prefersKimiDesktopSessionNavigation = { [settings] in settings.kimiDesktopSessionNavigation }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {

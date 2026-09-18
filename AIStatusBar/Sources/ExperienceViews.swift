@@ -71,14 +71,31 @@ struct FreshnessView: View {
     }
 }
 
-struct ConnectionDiagnosticsView: View {
+struct ToolsConnectionsView<ToolSettings: View>: View {
     @ObservedObject var store: StatusStore
+    @ViewBuilder var toolSettings: (String) -> ToolSettings
     @State private var copied = false
+
+    private var groups: [(key: String, name: String)] {
+        let known = SettingsStore.tools.map { (key: $0.0, name: $0.1) }
+        let extra = (store.data?.tools ?? []).filter { tool in
+            !["codex-ide", "codex-cli"].contains(tool.key)
+                && !known.contains(where: { $0.key == tool.key })
+        }.map { (key: $0.key, name: $0.name) }
+        return known + extra
+    }
+
+    private func tools(for key: String) -> [ToolStatus] {
+        (store.data?.tools ?? []).filter {
+            key == "codex" ? ["codex-ide", "codex-cli"].contains($0.key) : $0.key == key
+        }
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 20) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("连接与诊断").font(.system(size: 15, weight: .semibold))
+                    Text("工具设置与状态").font(.system(size: 15, weight: .semibold))
                     FreshnessView(timestamp: store.lastCollectedAt)
                 }
                 Spacer()
@@ -94,33 +111,68 @@ struct ConnectionDiagnosticsView: View {
             if let error = store.integrationError ?? store.quotaError {
                 Label(error, systemImage: "internaldrive").foregroundColor(.orange)
             }
-            ForEach(store.data?.tools ?? [], id: \.key) { tool in
+            ForEach(groups, id: \.key) { group in
                 VStack(alignment: .leading, spacing: 7) {
-                    HStack {
-                        Text(tool.name).font(.system(size: 13, weight: .semibold))
-                        Spacer()
-                        Circle().fill(tool.health?.state == "ready" ? Color.green : Color.secondary.opacity(0.5))
-                            .frame(width: 6, height: 6)
-                        Button("打开工具") { NotificationRouter.openDestination(forToolKey: tool.key) }
-                            .controlSize(.small).help(NotificationRouter.destinationLabel(forToolKey: tool.key))
+                    Text(group.name)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.secondary.opacity(0.9))
+                        .padding(.leading, 2)
+                    VStack(spacing: 0) {
+                        let statuses = tools(for: group.key)
+                        if statuses.isEmpty {
+                            Text("尚未读取到本地状态")
+                                .font(.system(size: 11)).foregroundColor(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading).padding(14)
+                        } else {
+                            ForEach(statuses, id: \.key) { tool in
+                                diagnostics(for: tool, showName: statuses.count > 1)
+                            }
+                        }
+                        if SettingsStore.tools.contains(where: { $0.0 == group.key }) {
+                            Divider().padding(.leading, 14).opacity(0.5)
+                        }
+                        toolSettings(group.key)
                     }
-                    Text(tool.health?.message ?? "当前采集器未提供诊断信息，请更新灵眸")
-                        .font(.system(size: 11)).foregroundColor(.secondary)
-                    Text("任务事件：\(phaseDescription(tool.capabilities?.eventPhases ?? []))")
-                        .font(.system(size: 10)).foregroundColor(.secondary)
-                    Text("\(NotificationRouter.destinationLabel(forToolKey: tool.key)) · \(ExperienceFormat.quotaState(tool.health?.quotaState))")
-                        .font(.system(size: 10)).foregroundColor(.secondary)
-                    if let timestamp = tool.health?.sourceUpdatedAt {
-                        Text("最近本地活动：\(ExperienceFormat.age(timestamp))")
-                            .font(.system(size: 10)).foregroundColor(.secondary)
-                    }
+                    .background(RoundedRectangle(cornerRadius: 12).fill(Color.primary.opacity(0.045)))
+                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.07), lineWidth: 0.5))
                 }
-                .padding(12)
-                .background(RoundedRectangle(cornerRadius: 12).fill(Color.primary.opacity(0.045)))
             }
             Text("诊断内容仅含工具名、支持能力、状态与时间，不包含任务标题、会话正文、凭证或个人路径。")
                 .font(.system(size: 10)).foregroundColor(.secondary)
         }
+    }
+
+    private func diagnostics(for tool: ToolStatus, showName: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .top, spacing: 8) {
+                Circle().fill(tool.health?.state == "error" ? Color.orange :
+                              tool.health?.state == "ready" ? Color.green : Color.secondary.opacity(0.5))
+                    .frame(width: 6, height: 6).padding(.top, 4)
+                VStack(alignment: .leading, spacing: 3) {
+                    if showName { Text(tool.name).font(.system(size: 12, weight: .medium)) }
+                    Text(tool.health?.message ?? "当前采集器未提供诊断信息，请更新灵眸")
+                        .font(.system(size: 11)).foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 4)
+                if NotificationRouter.supportsApplicationNavigation(forToolKey: tool.key) {
+                    Button("打开工具") { NotificationRouter.openDestination(forToolKey: tool.key) }
+                        .controlSize(.small).help(NotificationRouter.destinationLabel(forToolKey: tool.key))
+                }
+            }
+            DisclosureGroup("诊断详情") {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("任务事件：\(phaseDescription(tool.capabilities?.eventPhases ?? []))")
+                    Text("\(NotificationRouter.destinationLabel(forToolKey: tool.key)) · \(ExperienceFormat.quotaState(tool.health?.quotaState))")
+                    if let timestamp = tool.health?.sourceUpdatedAt {
+                        Text("最近本地活动：\(ExperienceFormat.age(timestamp))")
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true).padding(.top, 5)
+            }
+            .font(.system(size: 10)).foregroundColor(.secondary)
+        }.padding(14)
     }
 
     private func phaseDescription(_ phases: [String]) -> String {

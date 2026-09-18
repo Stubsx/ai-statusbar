@@ -227,13 +227,14 @@ struct FileSupport {
 
 /// 进程探测。`output` 泛用于任意子进程；`count`/`pids` 走按实例缓存的
 /// ps 快照——一轮采集里每个收集器原先各自 spawn `/bin/ps`（合计约 10 次，
-/// 占单次采集耗时的大头），现在一次采集窗口内进程列表视为不变，只 spawn 一次。
+/// 占单次采集耗时的大头），现在一次采集窗口内每种快照只读取一次。
 /// 实例生命周期 = 一次 `LingmouCollector.collect()`，缓存不会跨轮失效。
 final class ProcessSupport {
     var outputOverride: ((String, [String], TimeInterval) -> String)?
     var identityOverride: ((Int32) -> (path: String, startedAt: TimeInterval)?)?
     private var argumentLinesCache: [String]?
     private var pidLinesCache: [(pid: Int32, args: String)]?
+    private var executablePathsCache: [String]?
 
     init(outputOverride: ((String, [String], TimeInterval) -> String)? = nil) {
         self.outputOverride = outputOverride
@@ -318,6 +319,21 @@ final class ProcessSupport {
                     count += 1
                 }
             }
+    }
+
+    /// App 名称和安装目录可能含空格，不能把 args 的首个 token 当作可执行文件。
+    /// comm 不含命令行参数；匹配主程序完整后缀，排除 Helper 和退出后残留的崩溃上报进程。
+    func isAppRunning(executableName: String) -> Bool {
+        let paths: [String]
+        if let executablePathsCache {
+            paths = executablePathsCache
+        } else {
+            paths = output(executable: "/bin/ps", arguments: ["-eo", "comm="])
+                .split(whereSeparator: \.isNewline)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+            executablePathsCache = paths
+        }
+        return paths.contains { $0.hasSuffix(".app/Contents/MacOS/\(executableName)") }
     }
 
     func isNamed(pid: Int32, basename: String) -> Bool {

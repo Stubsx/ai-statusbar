@@ -2,6 +2,24 @@
 
 日期：2026-09-12；更新：2026-09-13。状态：Kimi Web 首版已接入，CLI 终端位置登记尚未实施。设计基线为构建 120；构建 121 已贯通任务/事件的会话 ID，并为 Codex App 接入官方本地对话深链，详见 TOOLS.md。
 
+## Kimi Code 桌面版优先跳转（2026-09-18）
+
+本机安装包 1.0.1 确认为 `com.kimi.code.desktop`，与 `com.moonshot.kimichat`（Kimi Work）独立。桌面运行时默认使用 `~/.kimi-code`，与 CLI / Web 共用会话数据，但共享数据不代表拥有相同的外部导航接口。
+
+只读核验安装包 `Info.plist` 和 `app.asar` 中 `src/main/deep-link.ts`、`parseLaunchArgs`：协议仅接受 `kimi-code://auth/success`；启动参数仅处理 `--new-chat`、`--workspace=`，没有选择会话的入口。不能构造未经支持的 `kimi-code://sessions/<id>` 并把系统接受打开请求当作精确跳转成功。
+
+统一路由现在优先按 bundle ID 查找 Kimi Code，恢复已有窗口或启动应用；同名的 Kimi Work 不参与匹配。已运行实例优先，其次标准安装目录，再由 Launch Services 查找其他位置。未安装或启动失败才调用原有 Web / 宿主路径，保留会话 ID。默认会话提示明确需要在 App 内选择。可选的实验性跳转见下文，不修改 Kimi 安装包或通过辅助功能搜索会话。
+
+### 可选的本机调试桥
+
+1.0.1 实机验证了 Electron `--remote-debugging-address=127.0.0.1 --remote-debugging-port=0`：动态端口只监听回环地址，原生 Swift WebSocket 能连接桌面主页面。前端已有 `/sessions/<id>` 路由和 `popstate` 处理，会调用自身 `selectSession`。
+
+`KimiDesktopNavigation.swift` 仅读取标准桌面配置的 `DevToolsActivePort`，核验进程真实可执行文件、lsof 监听端口、调试 browser ID 和唯一主 renderer；排除截图窗口、浏览器覆盖层、外部地址和歧义页面。不支持自定义 Electron user-data-dir 时保守回退。页面已加载的会话直接走既有路由；未加载的历史先向同进程已验证的本机服务 GET 会话元数据，拒绝缺失、错 ID 或归档记录，防止 Kimi 自行选择其他历史。等待后比较页面路由及 Pinia `kimi.sessions.activeSessionId`，只改 URL 不算成功；预检期间用户已切会话则放弃本次导航。
+
+设置默认关闭。冷启动才加入调试参数，已运行的应用不自动重启；连接失败回退应用级打开。关闭开关不会关闭 Electron 自己的端口，设置和隐私说明明确要求退出并正常重开 Kimi。接口依赖桌面实现，后续版本不兼容时回退，不声称为官方深链。
+
+验证入口：`bash scripts/test-kimi-desktop-navigation.sh` 检查进程身份、回环端口、目标页面和 ID 边界；`--live <pid> <app-path> <session-a> <session-b>` 仅用于已经明确开启调试的真实安装版，切换两条已有会话并拒绝不存在 ID。`--expression <output-path>` 导出生产表达式，可用 `node tests/KimiDesktopNavigationTests/renderer.mjs <output-path>` 验证冷历史预检、用户并发导航及“URL 改了但会话未切换”等回退情况。
+
 ## 已实施的 Kimi Web 首版
 
 Kimi 最近任务补充会话 ID，并优先读取 `state.json` 的 `cwd` 字段，兼容旧版 `workDir`。采集器以 30 秒内的心跳、真实可执行文件和启动时间识别被命名为 `kimi-cod` 的 Web 进程，并按 PID 去重；周期采集不访问 HTTP。`KimiWebNavigation.swift` 负责导航所需的实例发现与会话解析，点击时另外核验监听端口，并通过只读 `/api/v1/healthz`、`/api/v1/sessions/{id}`、`/api/v1/connections` 获取目标位置。服务有该会话的运行状态或客户端订阅时直接跳转；多个确认位置选择；仅共享历史时由用户选择「在网页查看」或终端。不会使用可能加载会话的 `/snapshot`、`/runtime` 接口来探测归属。
@@ -12,7 +30,7 @@ Kimi 最近任务补充会话 ID，并优先读取 `state.json` 的 `cwd` 字段
 
 ## 结论
 
-以「会话当前所在的位置」决定跳转。CLI 的启动父进程只能用来推断宿主，不能代表用户当前操作的界面。保持灵眸的轻量定位：正常点击直接返回原位置，存在多个有效位置时才显示短列表；增强连接放在现有「连接与诊断」中。
+以「会话当前所在的位置」决定跳转。CLI 的启动父进程只能用来推断宿主，不能代表用户当前操作的界面。保持灵眸的轻量定位：正常点击直接返回原位置，存在多个有效位置时才显示短列表；增强连接放在「工具与连接」中。
 
 ## 构建 120 的实现与缺口
 

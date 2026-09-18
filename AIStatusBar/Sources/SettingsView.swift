@@ -15,7 +15,6 @@ struct SettingsView: View {
     @State private var showKimiDecryptAlert = false
     @State private var showAdaptiveAlert = false
     @State private var clearHistoryConfirmation = false
-    @State private var perToolBusyExpanded = false
     @State private var advancedExpanded = false
     /// 系统级通知授权状态（设置窗口打开通知页时查询，用于提示"被系统拒绝"的情况）
     @State private var notifyAuth: UNAuthorizationStatus = .notDetermined
@@ -69,7 +68,12 @@ struct SettingsView: View {
                     }
                 }
             case "connections":
-                settingsScroll { ConnectionDiagnosticsView(store: store) }
+                settingsScroll {
+                    onlineQuotaSection
+                    ToolsConnectionsView(store: store) { key in
+                        toolSettings(for: key)
+                    }
+                }
             case "welcome":
                 settingsScroll { welcomeSection }
             case "data":
@@ -101,7 +105,7 @@ struct SettingsView: View {
             tabButton("桌宠", "pet")
             tabButton("数据", "data")
             tabButton("通知", "notify")
-            tabButton("连接", "connections")
+            tabButton("工具与连接", "connections")
             Spacer()
         }
         .padding(.horizontal, 24)
@@ -143,8 +147,6 @@ struct SettingsView: View {
                 valuePicker($settings.defaultSec,
                             options: SettingsStore.busyOptions.map { (SettingsStore.labelSec($0), $0) })
             }
-            divider
-            perToolBusyDisclosure
             divider
             settingRow("长时间无活动视为离线",
                        detail: "进程仍在但持续无活动，超过该时长按未运行显示") {
@@ -196,25 +198,14 @@ struct SettingsView: View {
                 toggle($settings.experience.privacyMode)
             }
             divider
-            settingRow("数量单位", detail: "用量数字按 K/M/B 或 万/亿 显示") {
-                modePicker($settings.numberUnit, options: [
-                    ("K / M / B", "metric"), ("万 / 亿", "wan"),
-                ])
-            }
-            divider
-            settingRow("跳转 Kimi 网页时复用标签页",
-                       detail: "已打开同源页面就切到该标签并跳到目标会话，不再重复开新标签。首次使用会请求浏览器自动化授权；拒绝或失败时照常新开标签页") {
-                toggle($settings.kimiWebTabReuse)
-            }
-            divider
             settingRow("在 Dock 中显示图标", detail: "默认仅驻留菜单栏") {
                 toggle($settings.showDockIcon)
             }
         }
     }
 
-    private var dataSection: some View {
-        section("数据") {
+    private var onlineQuotaSection: some View {
+        section("账号配额") {
             // 联网配额默认开启，只向各工具自己的厂商接口发送对应令牌。
             settingRow("查询账号配额",
                        detail: "读取本地登录令牌，仅发送到对应厂商的配额接口") {
@@ -226,29 +217,67 @@ struct SettingsView: View {
             } message: {
                 Text("灵眸会读取各工具的本地登录令牌，并仅发送到对应厂商的 HTTPS 配额接口。令牌不会写入灵眸日志或缓存。")
             }
+        }
+    }
+
+    @ViewBuilder
+    private func toolSettings(for key: String) -> some View {
+        if key == "kimi" {
+            settingRow("桌面版精确跳转（实验性）",
+                       detail: "启用可控制 Kimi 页面的本机调试连接。首次开启后，退出 Kimi Code，再从灵眸打开。失败时仅打开应用；关闭后需退出 Kimi Code 再正常启动，才能关闭连接") {
+                toggle($settings.kimiDesktopSessionNavigation)
+            }
             divider
-            if settings.onlineQuota {
-                settingRow(
-                    "读取 Kimi 月度额度",
-                    detail: "连接后自动更新月度额度；后台不会弹出钥匙串窗口"
-                ) {
-                    toggle(kimiTokenDecryptBinding)
-                        .disabled(store.isAuthorizingKimi)
+            settingRow("网页跳转复用标签页",
+                       detail: "优先使用已打开的同源标签页。首次使用需浏览器自动化授权；拒绝或失败时照常新开标签页") {
+                toggle($settings.kimiWebTabReuse)
+            }
+            divider
+        } else if key == "kimi-work" {
+            kimiQuotaSettings
+            divider
+        }
+        if SettingsStore.tools.contains(where: { $0.0 == key }) {
+            settingRow("进入空闲前无活动时长", detail: "仅对本工具生效；跟随统一时使用通用设置") {
+                valuePicker(perToolBinding(key),
+                            options: [("跟随统一", 0)] + SettingsStore.busyOptions.map { (SettingsStore.labelSec($0), $0) })
+            }
+        }
+    }
+
+    private var kimiQuotaSettings: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            settingRow("读取 Kimi 月度额度",
+                       detail: settings.onlineQuota
+                       ? "连接后自动更新月度额度；后台不会弹出钥匙串窗口"
+                       : "已暂停查询；开启本页顶部的“查询账号配额”后更新") {
+                toggle(kimiTokenDecryptBinding)
+                    .disabled(store.isAuthorizingKimi || (!settings.onlineQuota && !settings.kimiTokenDecrypt))
+            }
+            .alert("连接 Kimi 月度额度？", isPresented: $showKimiDecryptAlert) {
+                Button("取消", role: .cancel) {}
+                Button("连接并开启") { store.authorizeKimiCredentials() }
+            } message: {
+                Text("灵眸需要读取钥匙串“kimi-desktop Safe Storage”来解密 Kimi 登录凭证。本次连接最多等待 60 秒；拒绝或超时后不会自动重试。授权成功后会把解密口令以仅当前用户可读的文件备份在本机（~/.ai-statusbar），之后重建或重装灵眸都不会再掉授权，关闭本开关则立即删除该文件。口令只用于本机解密，不会外传；Kimi 桌面端重置密钥后需重新连接一次。")
+            }
+            if store.isAuthorizingKimi {
+                settingRow("等待钥匙串授权", detail: store.kimiAuthorizationMessage ?? "") {
+                    Button("取消请求") { store.cancelKimiAuthorization() }
                 }
-                .alert("连接 Kimi 月度额度？", isPresented: $showKimiDecryptAlert) {
-                    Button("取消", role: .cancel) {}
-                    Button("连接并开启") { store.authorizeKimiCredentials() }
-                } message: {
-                    Text("灵眸需要读取钥匙串“kimi-desktop Safe Storage”来解密 Kimi 登录凭证。本次连接最多等待 60 秒；拒绝或超时后不会自动重试。授权成功后会把解密口令以仅当前用户可读的文件备份在本机（~/.ai-statusbar），之后重建或重装灵眸都不会再掉授权，关闭本开关则立即删除该文件。口令只用于本机解密，不会外传；Kimi 桌面端重置密钥后需重新连接一次。")
-                }
-                if store.isAuthorizingKimi {
-                    settingRow("等待钥匙串授权", detail: store.kimiAuthorizationMessage ?? "") {
-                        Button("取消请求") { store.cancelKimiAuthorization() }
-                    }
-                } else if let message = store.kimiAuthorizationMessage {
-                    Text(message).font(.system(size: 11)).foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+            } else if let message = store.kimiAuthorizationMessage {
+                Text(message).font(.system(size: 11)).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 14).padding(.bottom, 10)
+            }
+        }
+    }
+
+    private var dataSection: some View {
+        section("数据") {
+            settingRow("数量单位", detail: "用量数字按 K/M/B 或 万/亿 显示") {
+                modePicker($settings.numberUnit, options: [
+                    ("K / M / B", "metric"), ("万 / 亿", "wan"),
+                ])
             }
             divider
             settingRow("用量同步", detail: "多台设备共用一个目录（默认 iCloud Drive）汇总用量与活跃") {
@@ -314,7 +343,7 @@ struct SettingsView: View {
                  "已发现：\(detected.map(\.name).joined(separator: "、"))")
                 .font(.system(size: 11)).foregroundColor(.secondary)
             HStack {
-                Button("查看连接") { settingsTab = "connections" }
+                Button("查看工具与连接") { settingsTab = "connections" }
                 Spacer()
                 Button("开始使用") {
                     settings.experience.onboardingCompleted = true
@@ -586,37 +615,6 @@ struct SettingsView: View {
             .controlSize(.regular)
     }
 
-    /// 按工具自定义空闲时长：次级配置默认折叠，避免主导航被 6 行选择器淹没
-    private var perToolBusyDisclosure: some View {
-        DisclosureGroup(isExpanded: $perToolBusyExpanded) {
-            VStack(spacing: 0) {
-                ForEach(Array(SettingsStore.tools.enumerated()), id: \.offset) { idx, tool in
-                    HStack {
-                        Text(tool.1)
-                            .font(.system(size: 12))
-                            .foregroundColor(.primary.opacity(0.85))
-                        Spacer()
-                        valuePicker(perToolBinding(tool.0),
-                                    options: [("跟随统一", 0)] + SettingsStore.busyOptions.map { (SettingsStore.labelSec($0), $0) })
-                    }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 6)
-                    if idx < SettingsStore.tools.count - 1 {
-                        Divider().padding(.leading, 14).opacity(0.4)
-                    }
-                }
-            }
-            .padding(.top, 2)
-            .padding(.bottom, 4)
-        } label: {
-            Text(perToolBusyExpanded ? "收起按工具的自定义" : "按工具自定义空闲时长")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundColor(.accentColor.opacity(0.85))
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-    }
-
     /// 通知工具清单：开启后以两列网格紧凑呈现
     private var notifyToolsGrid: some View {
         VStack(spacing: 0) {
@@ -757,7 +755,7 @@ struct SettingsView: View {
         )
     }
 
-    /// 开启前先说明 Kimi App 依赖；关闭不需要二次确认。
+    /// 开启前说明厂商配额查询；关闭不需要二次确认。
     private var onlineQuotaBinding: Binding<Bool> {
         Binding(
             get: { settings.onlineQuota },

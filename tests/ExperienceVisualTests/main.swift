@@ -28,6 +28,14 @@ private final class FixtureWheelEvent: NSEvent {
 func renderExperience() throws {
     setbuf(stdout, nil)
     _ = NSApplication.shared
+    let applicationLookup = NotificationRouter.kimiCodeApplicationURL
+    let desktopPreference = NotificationRouter.prefersKimiDesktopSessionNavigation
+    defer {
+        NotificationRouter.kimiCodeApplicationURL = applicationLookup
+        NotificationRouter.prefersKimiDesktopSessionNavigation = desktopPreference
+    }
+    NotificationRouter.prefersKimiDesktopSessionNavigation = { false }
+    NotificationRouter.kimiCodeApplicationURL = { nil }
     let codexID = "01234567-89ab-4cde-8fab-0123456789ab"
     assert(NotificationRouter.conversationURL(forToolKey: "codex-ide", sessionId: codexID)?.absoluteString
            == "codex://threads/\(codexID)")
@@ -48,6 +56,25 @@ func renderExperience() throws {
         assert(!NotificationRouter.supportsSessionNavigation(forToolKey: key, sessionId: codexID, kimiWebAvailable: true))
     }
     assert(!NotificationRouter.supportsApplicationNavigation(forToolKey: "unknown"))
+    let webLabel = NotificationRouter.destinationLabel(forToolKey: "kimi", sessionId: "web-session")
+    NotificationRouter.kimiCodeApplicationURL = { URL(fileURLWithPath: "/fixture/Kimi Code.app") }
+    for id in [nil, "web-session", "../bad"] as [String?] {
+        assert(!NotificationRouter.supportsSessionNavigation(forToolKey: "kimi", sessionId: id, kimiWebAvailable: true),
+               "An installed desktop app must not claim Web session navigation")
+        assert(NotificationRouter.destinationLabel(forToolKey: "kimi", sessionId: id)
+               == "打开 Kimi Code 应用（会话需在应用内选择）")
+    }
+    assert(NotificationRouter.destinationLabel(forToolKey: "kimi-work") == "打开 Kimi 应用")
+    assert(NotificationRouter.supportsSessionNavigation(forToolKey: "codex-ide", sessionId: codexID))
+    NotificationRouter.prefersKimiDesktopSessionNavigation = { true }
+    assert(NotificationRouter.supportsSessionNavigation(forToolKey: "kimi", sessionId: "session_fixture"))
+    assert(!NotificationRouter.supportsSessionNavigation(forToolKey: "kimi", sessionId: "../bad"))
+    assert(NotificationRouter.destinationLabel(forToolKey: "kimi", sessionId: "session_fixture")
+           == "尝试在 Kimi Code 中打开这条会话，失败时打开应用")
+    NotificationRouter.prefersKimiDesktopSessionNavigation = { false }
+    NotificationRouter.kimiCodeApplicationURL = { nil }
+    assert(NotificationRouter.destinationLabel(forToolKey: "kimi", sessionId: "web-session") == webLabel)
+    print("PASS: Kimi Code desktop takes priority without claiming session deep links or changing Kimi Work")
     print("PASS: Codex conversation links validate IDs and preserve CLI host routing")
     let chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     assert(NotificationRouter.defaultChromiumProfilePID([(11, chrome), (22, chrome + " --headless --user-data-dir=/tmp/fixture")]) == 11)
@@ -82,6 +109,11 @@ func renderExperience() throws {
     let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: temporary) }
     try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+    let navigationSettingsURL = temporary.appendingPathComponent("navigation-settings.json")
+    let navigationSettings = SettingsStore(path: navigationSettingsURL.path, systemEffects: false)
+    assert(!navigationSettings.kimiDesktopSessionNavigation)
+    navigationSettings.kimiDesktopSessionNavigation = true
+    assert(SettingsStore(path: navigationSettingsURL.path, systemEffects: false).kimiDesktopSessionNavigation)
     // Simulate an unresponsive child without touching Keychain or any real account.
     let stuck = Process()
     stuck.executableURL = URL(fileURLWithPath: "/bin/sh")

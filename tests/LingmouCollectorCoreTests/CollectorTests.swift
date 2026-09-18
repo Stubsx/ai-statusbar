@@ -37,7 +37,12 @@ final class CollectorTests: XCTestCase {
 
     private func processSupport(_ names: [String]) -> ProcessSupport {
         ProcessSupport { executable, arguments, _ in
-            guard executable == "/bin/ps", arguments.contains("args=") else { return "" }
+            guard executable == "/bin/ps" else { return "" }
+            if arguments.contains("comm=") {
+                return names.map { "/Applications/\($0).app/Contents/MacOS/\($0)" }
+                    .joined(separator: "\n") + "\n"
+            }
+            guard arguments.contains("args=") else { return "" }
             return names.map { "/usr/local/bin/\($0)" }.joined(separator: "\n") + "\n"
         }
     }
@@ -798,6 +803,14 @@ final class CollectorTests: XCTestCase {
         XCTAssertEqual(state.processOn, true)
         XCTAssertEqual(state.busy.map(\.title), ["日常问候"])
         XCTAssertEqual(state.latest?.title, "日常问候")
+
+        // Work 退出后，即使 Code 仍开着且 wire 留有未闭合 step，也应立即离线。
+        let offline = kimiWorkCollectors(
+            home: home, now: now, processes: processSupport(["Kimi Code"])
+        ).kimiWork()
+        XCTAssertFalse(offline.processOn)
+        XCTAssertTrue(offline.busy.isEmpty)
+        XCTAssertEqual(offline.latest?.title, "日常问候")
     }
 
     /// step 闭合或 wire 过期都不算运行中。
@@ -885,6 +898,43 @@ final class CollectorTests: XCTestCase {
             .kimiWork()
         XCTAssertTrue(online.processOn)
         XCTAssertEqual(online.sourceError, "会话数据库不可读或格式不兼容")
+    }
+
+    func testKimiWorkRequiresItsMainAppProcess() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        try write("not a sqlite database", to: home.appendingPathComponent(
+            "Library/Application Support/kimi-desktop/daimon-share/daimon/agents/main/sessions/hosted-logical/conversations.sqlite"))
+        let otherProcesses = [
+            "/Applications/Kimi Code.app/Contents/MacOS/Kimi Code",
+            "/Applications/Kimi Code.app/Contents/Frameworks/Kimi Code Helper.app/Contents/MacOS/Kimi Code Helper",
+            "/Applications/Kimi.app/Contents/Frameworks/Kimi Helper (Renderer).app/Contents/MacOS/Kimi Helper (Renderer)",
+            "/Applications/Kimi.app/Contents/Frameworks/Electron Framework.framework/Helpers/chrome_crashpad_handler",
+        ]
+        let cases: [(paths: [String], appOn: Bool)] = [
+            ([], false),
+            ([otherProcesses[0]], false),
+            (Array(otherProcesses.dropFirst()), false),
+            (otherProcesses, false),
+            (otherProcesses + ["/Applications/Kimi.app/Contents/MacOS/Kimi"], true),
+            (["/Volumes/External Apps/Kimi Work.app/Contents/MacOS/Kimi"], true),
+        ]
+        for item in cases {
+            let processes = ProcessSupport { executable, arguments, _ in
+                guard executable == "/bin/ps",
+                      arguments.contains("args=") || arguments.contains("comm=") else { return "" }
+                return item.paths.joined(separator: "\n") + "\n"
+            }
+            let state = kimiWorkCollectors(home: home, now: now, processes: processes).kimiWork()
+            XCTAssertEqual(state.processOn, item.appOn, "\(item.paths)")
+            XCTAssertTrue(state.busy.isEmpty)
+            XCTAssertEqual(state.sourceError, item.appOn ? "会话数据库不可读或格式不兼容" : nil)
+            let health = ToolSupport.health(for: "kimi-work", raw: state, quota: nil,
+                environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+                settings: CollectorSettings())
+            XCTAssertEqual(health.state, item.appOn ? "error" : "not_running")
+        }
     }
 
     /// Kimi 3.2.4+ safeStorage 加密的 token-store：未开启解密时给出中性提示，不再误报“登录已过期”。
