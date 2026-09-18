@@ -92,6 +92,7 @@ private final class FloatingBallPlaybackDelegate: NSObject, NSApplicationDelegat
                     hashes.removeAll()
                     angles.removeAll()
                     if stage == 0 {
+                        guard displayedWidth == 160 else { return }
                         print("PASS: transparent floating panel presents changing blue frames")
                         hosted.rootView = artwork(.blue, hovered: true)
                         stage = 5
@@ -165,7 +166,7 @@ private final class FloatingBallPlaybackDelegate: NSObject, NSApplicationDelegat
                     window.orderOut(nil)
                     window.close()
                     print("PASS: Reduce Motion uses the static drawing")
-                    self.checkPointerPolling()
+                    self.checkInterruptedPlayback()
                 }
             }
         }
@@ -184,6 +185,103 @@ private final class FloatingBallPlaybackDelegate: NSObject, NSApplicationDelegat
     private func pointerView(in view: NSView) -> BallMouseTrackingView? {
         if let view = view as? BallMouseTrackingView { return view }
         return view.subviews.lazy.compactMap { self.pointerView(in: $0) }.first
+    }
+
+    private func checkInterruptedPlayback() {
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 160, height: 80))
+        let flow = BallInkFlowView(working: true, palette: .blue)
+        flow.frame = NSRect(x: 8, y: 8, width: 56, height: 56)
+        let content = NSView()
+        content.wantsLayer = true
+        content.layer?.backgroundColor = NSColor.systemBlue.cgColor
+        let orbit = BallOrbitView(content: content, duration: 2.8)
+        orbit.frame = NSRect(x: 88, y: 8, width: 54, height: 54)
+        root.addSubview(flow)
+        root.addSubview(orbit)
+        let window = NSPanel(contentRect: root.frame, styleMask: [.borderless, .nonactivatingPanel],
+                             backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.level = .floating
+        window.hidesOnDeactivate = false
+        window.contentView = root
+        window.orderFront(nil)
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard let paint = flow.layer?.sublayers?.first,
+                  let rotor = orbit.subviews.first?.layer,
+                  paint.animation(forKey: "ink-flow") != nil,
+                  rotor.animation(forKey: "ball-orbit") != nil else {
+                self.fail("Recovery fixture did not start playing")
+            }
+            // 模拟窗口/图层重建移除动画：业务状态与可见性没有改变。
+            paint.removeAllAnimations()
+            rotor.removeAllAnimations()
+            try? await Task.sleep(nanoseconds: 2_200_000_000)
+            guard paint.animation(forKey: "ink-flow") != nil,
+                  rotor.animation(forKey: "ball-orbit") != nil else {
+                self.fail("Visible flow and orbit never recover after their animations are removed")
+            }
+            print("PASS: interrupted flow and orbit restart without status or visibility changes")
+            guard !flow.playbackMonitor.usesFallback, !orbit.playbackMonitor.usesFallback else {
+                self.fail("Healthy native playback should not switch to fallback")
+            }
+            // 动画对象仍在，但其图层时钟停止：仅判断 animation(forKey:) 不会发现故障。
+            paint.speed = 0
+            rotor.speed = 0
+            try? await Task.sleep(nanoseconds: 3_500_000_000)
+            guard flow.playbackMonitor.usesFallback, orbit.playbackMonitor.usesFallback else {
+                self.fail("Frozen presentation did not activate bounded fallback playback")
+            }
+            var frames = Set<Data>()
+            var angles = Set<Int>()
+            for _ in 0..<5 {
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                guard let contents = paint.presentation()?.contents,
+                      let bytes = (contents as! CGImage).dataProvider?.data,
+                      let transform = rotor.presentation()?.transform else {
+                    self.fail("Fallback must produce actual presentation-layer output")
+                }
+                frames.insert(bytes as Data)
+                angles.insert(Int(atan2(transform.m12, transform.m11) * 1_000))
+            }
+            guard frames.count >= 3, angles.count >= 3 else {
+                self.fail("Fallback timers run but do not visibly change flow and orbit")
+            }
+            print("PASS: frozen native clocks recover with changing presented frames and orbit angles")
+            flow.setResting(true)
+            guard !flow.playbackMonitor.isRunning else { self.fail("Resting wash kept its fallback timer") }
+            flow.setResting(false)
+            window.orderOut(nil)
+            guard !flow.playbackMonitor.isRunning, !orbit.playbackMonitor.isRunning else {
+                self.fail("Hidden fallback retained animation timers")
+            }
+            window.orderFront(nil)
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard flow.playbackMonitor.isRunning, orbit.playbackMonitor.isRunning else {
+                self.fail("Fallback did not resume when shown")
+            }
+            flow.stop()
+            orbit.stop()
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard !flow.playbackMonitor.isRunning, !orbit.playbackMonitor.isRunning else {
+                self.fail("Dismantled fallback restarted itself")
+            }
+            print("PASS: fallback respects rest, hide/resume and teardown")
+            let lateFlow = BallInkFlowView(working: true, palette: .ink)
+            lateFlow.frame = flow.frame
+            root.addSubview(lateFlow)
+            // 即使窗口仍可见，dismantle 之后晚到的帧准备回调也不得启动播放。
+            lateFlow.stop()
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            guard !lateFlow.playbackMonitor.isRunning,
+                  lateFlow.layer?.sublayers?.first?.animation(forKey: "ink-flow") == nil else {
+                self.fail("A late frame callback restarted a dismantled flow view")
+            }
+            print("PASS: late frame preparation cannot restart a dismantled view")
+            window.orderOut(nil)
+            window.close()
+            self.checkPointerPolling()
+        }
     }
 
     private func checkPointerPolling() {

@@ -167,6 +167,15 @@ func runChecks() throws {
     let inkFrames = BallInkDrawing.flowFrames
     let blueFrames = BallInkDrawing.blueFlowFrames
     for palette in [BallInkDrawing.Palette.ink, .blue] {
+        let startup = palette.startupFrames
+        assert(startup.count == 24 && startup.first?.width == 112)
+        assert(startup.first === palette.startupFrames.first)
+        let startupAlpha = startup.map { image -> [UInt8] in
+            let bytes = image.dataProvider!.data! as Data
+            return stride(from: 3, to: bytes.count, by: 4).map { bytes[$0] }
+        }
+        assert(startupAlpha.dropFirst().allSatisfy { $0 == startupAlpha[0] },
+               "Startup playback must keep the same circular silhouette")
         let frames = palette.frames
         assert(frames.count == BallInkDrawing.flowFrameCount)
         assert(frames.first === palette.frames.first)

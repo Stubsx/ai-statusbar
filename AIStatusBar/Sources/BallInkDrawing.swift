@@ -8,6 +8,9 @@ enum BallInkDrawing {
 
         var still: CGImage? { self == .ink ? BallInkDrawing.dark : BallInkDrawing.blue }
         var frames: [CGImage] { self == .ink ? BallInkDrawing.flowFrames : BallInkDrawing.blueFlowFrames }
+        var startupFrames: [CGImage] {
+            self == .ink ? BallInkDrawing.inkStartupFrames : BallInkDrawing.blueStartupFrames
+        }
 
         func flowDuration(working: Bool) -> TimeInterval {
             self == .blue ? (working ? 6 : 10) : (working ? 8 : 14)
@@ -22,6 +25,13 @@ enum BallInkDrawing {
     }
     static let blueFlowFrames: [CGImage] = (0..<flowFrameCount).compactMap {
         render(size: 160, phase: Double($0) / Double(flowFrameCount), palette: .blue)
+    }
+    // 先生成一个完整但较轻的循环，慢机器不必等全部高精度帧才开始流动。
+    private static let inkStartupFrames = startupFrames(palette: .ink)
+    private static let blueStartupFrames = startupFrames(palette: .blue)
+
+    private static func startupFrames(palette: Palette) -> [CGImage] {
+        (0..<24).compactMap { render(size: 112, phase: Double($0) / 24, palette: palette) }
     }
 
     static func noise(_ x: Double, _ y: Double, seed: UInt32 = 17) -> Double {

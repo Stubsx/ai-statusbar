@@ -1,6 +1,53 @@
 import Cocoa
 import SwiftUI
 
+/// 低频确认原生动画实际前进；合成时钟停住时才启用有上限的逐帧兜底。
+/// 停播/隐藏时撤销全部计时器。正常路径每秒检查一次，不逐帧触发 SwiftUI。
+final class BallAnimationMonitor {
+    private let effect: String
+    private(set) var usesFallback = false
+    private(set) var isRunning = false
+    private var timer: Timer?
+    private var lastSignature: UInt64?
+    private var stalledSamples = 0
+
+    init(effect: String) { self.effect = effect }
+
+    func start(inspect: @escaping () -> UInt64?, draw: @escaping () -> Void) {
+        guard timer == nil else { return }
+        isRunning = true
+        let timer = Timer(timeInterval: usesFallback ? 1 / 30 : 1, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            if self.usesFallback { draw(); return }
+            let signature = inspect()
+            // inspect 可能因隐藏/销毁而调用 stop，不能在同一回调里重新启动。
+            guard self.timer === timer else { return }
+            self.stalledSamples = signature == nil || signature == self.lastSignature
+                ? self.stalledSamples + 1 : 0
+            self.lastSignature = signature
+            guard self.stalledSamples >= 2 else { return }
+            self.stop()
+            self.usesFallback = true
+            NSLog("FloatingBall %@: native presentation stalled; using bounded playback", self.effect)
+            draw()
+            self.start(inspect: inspect, draw: draw)
+        }
+        timer.tolerance = usesFallback ? 0.004 : 0.1
+        self.timer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+        isRunning = false
+        lastSignature = nil
+        stalledSamples = 0
+    }
+
+    deinit { stop() }
+}
+
 /// Keep the existing SwiftUI drawing static; only its native container rotates.
 /// SwiftUI repeatForever otherwise keeps the hosting layout active on every frame.
 struct BallOrbitRotation<Content: View>: View {
@@ -41,6 +88,8 @@ final class BallOrbitView: NSView {
     private var visibilityObserver: NSObjectProtocol?
     private var visibilityObservation: NSKeyValueObservation?
     private var animationSize = CGSize.zero
+    private var attached = false
+    let playbackMonitor = BallAnimationMonitor(effect: "orbit")
 
     init(content: NSView, duration: TimeInterval) {
         self.content = content
@@ -71,6 +120,7 @@ final class BallOrbitView: NSView {
         super.viewDidMoveToWindow()
         stop()
         guard let window else { return }
+        attached = true
         // 跨空间悬浮窗 orderOut 后遮挡标记可能暂时不变，直接跟踪可见性以立即停播。
         visibilityObservation = window.observe(\.isVisible) { [weak self] _, _ in self?.updatePlayback() }
         visibilityObserver = NotificationCenter.default.addObserver(
@@ -83,12 +133,18 @@ final class BallOrbitView: NSView {
     override func viewDidUnhide() { super.viewDidUnhide(); updatePlayback() }
 
     private func updatePlayback() {
-        guard let window, window.isVisible, window.occlusionState.contains(.visible),
-              !isHiddenOrHasHiddenAncestor else { pause(); return }
+        guard canPlay else { pause(); return }
         guard bounds.width > 0, bounds.height > 0, let layer = rotor.layer else { return }
-        guard layer.animation(forKey: "ball-orbit") == nil || animationSize != bounds.size else { return }
         let now = CACurrentMediaTime()
         clock.resume(at: now)
+        playbackMonitor.start(inspect: { [weak self] in
+            guard let self else { return nil }
+            self.updatePlayback()
+            guard let transform = self.rotor.layer?.presentation()?.transform else { return nil }
+            return Double(transform.m11).bitPattern ^ Double(transform.m12).bitPattern
+        }, draw: { [weak self] in self?.drawFallback() })
+        if playbackMonitor.usesFallback { drawFallback(); return }
+        guard layer.animation(forKey: "ball-orbit") == nil || animationSize != bounds.size else { return }
         // AppKit owns backing-layer anchorPoint (0,0), so changing it is undone
         // on the next layout. Rotate around the center in the transform itself.
         let animation = CAKeyframeAnimation(keyPath: "transform")
@@ -109,7 +165,22 @@ final class BallOrbitView: NSView {
         return CATransform3DTranslate(transform, -bounds.midX, -bounds.midY, 0)
     }
 
+    private var canPlay: Bool {
+        guard attached, let window else { return false }
+        return window.isVisible && window.occlusionState.contains(.visible) && !isHiddenOrHasHiddenAncestor
+    }
+
+    private func drawFallback() {
+        guard canPlay else { pause(); return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        rotor.layer?.removeAnimation(forKey: "ball-orbit")
+        rotor.layer?.transform = rotation(phase: clock.phase(at: CACurrentMediaTime()))
+        CATransaction.commit()
+    }
+
     private func pause() {
+        playbackMonitor.stop()
         clock.pause(at: CACurrentMediaTime())
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -119,6 +190,7 @@ final class BallOrbitView: NSView {
     }
 
     func stop() {
+        attached = false
         pause()
         visibilityObservation = nil
         if let visibilityObserver {
@@ -160,6 +232,8 @@ final class BallInkFlowView: NSView {
     private var visibilityObservation: NSKeyValueObservation?
     private var clock: BallInkFlowClock
     private var resting: Bool
+    private var attached = false
+    let playbackMonitor = BallAnimationMonitor(effect: "flow")
 
     init(working: Bool, palette: BallInkDrawing.Palette = .ink, resting: Bool = false) {
         self.palette = palette
@@ -191,6 +265,7 @@ final class BallInkFlowView: NSView {
         super.viewDidMoveToWindow()
         stop()
         guard let window else { return }
+        attached = true
         visibilityObservation = window.observe(\.isVisible) { [weak self] _, _ in self?.updatePlayback() }
         visibilityObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didChangeOcclusionStateNotification,
@@ -206,7 +281,9 @@ final class BallInkFlowView: NSView {
         let duration = palette.flowDuration(working: working)
         guard duration != clock.duration else { return }
         clock.setDuration(duration, at: CACurrentMediaTime())
-        if clock.playing { installAnimation() }
+        if clock.playing {
+            if playbackMonitor.usesFallback { drawFallback() } else { installAnimation() }
+        }
     }
 
     func setResting(_ value: Bool) {
@@ -216,7 +293,7 @@ final class BallInkFlowView: NSView {
     }
 
     private var canPlay: Bool {
-        guard let window else { return false }
+        guard attached, let window else { return false }
         return window.isVisible && window.occlusionState.contains(.visible) && !isHiddenOrHasHiddenAncestor
     }
 
@@ -226,6 +303,7 @@ final class BallInkFlowView: NSView {
             return
         }
         if resting {
+            playbackMonitor.stop()
             clock.pause(at: CACurrentMediaTime())
             showBaseFrame()
             return
@@ -235,6 +313,12 @@ final class BallInkFlowView: NSView {
             return
         }
         if !clock.playing { clock.resume(at: CACurrentMediaTime()) }
+        playbackMonitor.start(inspect: { [weak self] in
+            guard let self else { return nil }
+            self.updatePlayback()
+            return self.presentationSignature()
+        }, draw: { [weak self] in self?.drawFallback() })
+        if playbackMonitor.usesFallback { drawFallback(); return }
         if paint.animation(forKey: "ink-flow") == nil { installAnimation() }
     }
 
@@ -243,13 +327,39 @@ final class BallInkFlowView: NSView {
         loading = true
         let palette = self.palette
         DispatchQueue.global(qos: .utility).async { [weak self] in
+            let startup = palette.startupFrames
+            DispatchQueue.main.async { [weak self] in self?.acceptFrames(startup, final: false) }
             let frames = palette.frames
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.frames = frames
-                if !frames.isEmpty { self.updatePlayback() }
-            }
+            DispatchQueue.main.async { [weak self] in self?.acceptFrames(frames, final: true) }
         }
+    }
+
+    private func acceptFrames(_ frames: [CGImage], final: Bool) {
+        if final { loading = false }
+        guard !frames.isEmpty else { return }
+        self.frames = frames
+        paint.removeAnimation(forKey: "ink-flow")
+        // 替换缓存不重置相位；隐藏/销毁期间完成的后台任务不能重新开播。
+        updatePlayback()
+    }
+
+    private func presentationSignature() -> UInt64? {
+        guard let contents = paint.presentation()?.contents,
+              let data = (contents as! CGImage).dataProvider?.data,
+              let bytes = CFDataGetBytePtr(data) else { return nil }
+        let count = CFDataGetLength(data)
+        guard count > 0 else { return nil }
+        var hash: UInt64 = 14695981039346656037
+        // 分散取样内部颜色，无需复制/遍历整帧像素。
+        for index in stride(from: 0, to: count, by: max(1, count / 257)) {
+            hash = (hash ^ UInt64(bytes[index])) &* 1099511628211
+        }
+        return hash
+    }
+
+    private func drawFallback() {
+        guard canPlay, !resting else { pause(); return }
+        showBaseFrame()
     }
 
     private func installAnimation() {
@@ -271,6 +381,7 @@ final class BallInkFlowView: NSView {
     }
 
     private func pause() {
+        playbackMonitor.stop()
         let now = CACurrentMediaTime()
         clock.pause(at: now)
         showBaseFrame()
@@ -290,6 +401,7 @@ final class BallInkFlowView: NSView {
     }
 
     func stop() {
+        attached = false
         pause()
         visibilityObservation = nil
         if let visibilityObserver {
