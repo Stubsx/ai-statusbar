@@ -47,6 +47,16 @@ func runChecks() throws {
         return gaze
     }
     assert(abs(followedGaze(fps: 30).width - followedGaze(fps: 60).width) < 0.000001)
+    assert(abs(followedGaze(fps: 10).width - followedGaze(fps: 60).width) < 0.000001)
+    var pointerActivity = BallPointerActivity()
+    pointerActivity.observe(.zero, at: 1)
+    assert(!pointerActivity.isActive(at: 1))
+    for step in 1...120 {
+        let time = 1 + Double(step) / 60
+        pointerActivity.observe(CGPoint(x: Double(step) / 60, y: 0), at: time)
+        assert(pointerActivity.isActive(at: time), "Slow pointer motion must not be mistaken for rest")
+    }
+    assert(pointerActivity.isActive(at: 3.49) && !pointerActivity.isActive(at: 3.51))
     for t in stride(from: 0.0, through: 0.4, by: 0.001) {
         assert((0...1).contains(BallBlinkTiming.openness(elapsed: t)))
     }

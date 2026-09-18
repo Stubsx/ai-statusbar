@@ -817,6 +817,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // 阴影由 SwiftUI 球体自带（圆形轮廓），窗口阴影会按矩形画边，关掉
         ballPanel.hasShadow = false
         ballPanel.hidesOnDeactivate = false
+        ballPanel.acceptsMouseMovedEvents = true
         ballPanel.isReleasedWhenClosed = false
         ballPanel.isMovableByWindowBackground = true
         applyWindowLevel(to: ballPanel)

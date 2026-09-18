@@ -179,6 +179,9 @@ struct FloatingBallArtwork: View {
 
                 if tracksPointer {
                     BallTrackingFace(reduceMotion: reduceMotion)
+                        .frame(width: 48, height: 48)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
                 } else {
                     BallFaceArtwork(gaze: gaze, eyeOpenness: eyeOpenness)
                 }
@@ -193,23 +196,6 @@ struct FloatingBallArtwork: View {
         .animation(staticEffects ? nil : .easeInOut(duration: 0.22), value: mood)
     }
 
-}
-
-/// 视线与眨眼只更新脸部，避免每一帧重建球体纹理、工作环和状态胶囊。
-private struct BallTrackingFace: View {
-    let reduceMotion: Bool
-    @State private var gaze = CGSize.zero
-    @State private var eyeOpenness: CGFloat = 1
-
-    var body: some View {
-        BallFaceArtwork(gaze: gaze, eyeOpenness: eyeOpenness)
-            .background {
-                BallMouseTracker(reduceMotion: reduceMotion,
-                                 onGaze: { gaze = $0 }, onBlink: { eyeOpenness = $0 })
-            }
-            .allowsHitTesting(false)
-            .accessibilityHidden(true)
-    }
 }
 
 private struct BallFaceArtwork: View {
@@ -414,156 +400,4 @@ enum BallGazeGeometry {
         let magnitude = 5 * tanh(distance / 130)
         return CGSize(width: dx / distance * magnitude, height: dy / distance * magnitude)
     }
-}
-
-private struct BallMouseTracker: NSViewRepresentable {
-    let reduceMotion: Bool
-    let onGaze: (CGSize) -> Void
-    let onBlink: (CGFloat) -> Void
-
-    func makeNSView(context: Context) -> BallMouseTrackingView {
-        let view = BallMouseTrackingView()
-        view.onGaze = onGaze
-        view.onBlink = onBlink
-        view.reduceMotion = reduceMotion
-        return view
-    }
-
-    func updateNSView(_ nsView: BallMouseTrackingView, context: Context) {
-        nsView.onGaze = onGaze
-        nsView.onBlink = onBlink
-        nsView.reduceMotion = reduceMotion
-    }
-
-    static func dismantleNSView(_ nsView: BallMouseTrackingView, coordinator: ()) {
-        nsView.stop()
-    }
-}
-
-/// 只读取鼠标位置，不创建全局事件钩子，不申请辅助功能/录屏权限。
-/// 视图没有 hitTest，不会吞掉 HostingView 的点击、右键和拖动。
-final class BallMouseTrackingView: NSView {
-    var onGaze: ((CGSize) -> Void)?
-    var onBlink: ((CGFloat) -> Void)?
-    var mouseLocation: () -> NSPoint = { NSEvent.mouseLocation }
-    var reduceMotion = false
-    private var timer: Timer?
-    private var visibilityObserver: NSObjectProtocol?
-    private var visibilityObservation: NSKeyValueObservation?
-    private var current = CGSize.zero
-    private var nextBlink = TimeInterval.infinity
-    private var blinkStart: TimeInterval?
-    private var lastOpenness: CGFloat = 1
-    private var lastSampleTime: TimeInterval?
-
-    override var isFlipped: Bool { true }
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        stop()
-        guard let window else { return }
-        visibilityObservation = window.observe(\.isVisible) { [weak self] _, _ in self?.updatePolling() }
-        visibilityObserver = NotificationCenter.default.addObserver(
-            forName: NSWindow.didChangeOcclusionStateNotification,
-            object: window, queue: .main
-        ) { [weak self] _ in self?.updatePolling() }
-        updatePolling()
-    }
-
-    override func viewDidHide() {
-        super.viewDidHide()
-        updatePolling()
-    }
-
-    override func viewDidUnhide() {
-        super.viewDidUnhide()
-        updatePolling()
-    }
-
-    private func updatePolling() {
-        guard let window, window.isVisible,
-              window.occlusionState.contains(.visible),
-              !isHiddenOrHasHiddenAncestor else {
-            timer?.invalidate()
-            timer = nil
-            return
-        }
-        guard timer == nil else { return }
-        blinkStart = nil
-        nextBlink = ProcessInfo.processInfo.systemUptime + Double.random(in: 2.5...5.5)
-        scheduleSample(after: 0)
-    }
-
-    /// 静止时保持 4Hz 探测；仅脸部移动与眨眼期间用 60fps，仍无需全局事件权限。
-    private func scheduleSample(after delay: TimeInterval) {
-        let timer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
-            self?.timer = nil
-            self?.sample()
-        }
-        timer.tolerance = delay >= 0.2 ? 0.025 : 0.001
-        self.timer = timer
-        RunLoop.main.add(timer, forMode: .common)
-    }
-
-    private func sample() {
-        guard let window, window.isVisible, window.occlusionState.contains(.visible),
-              !isHiddenOrHasHiddenAncestor else {
-            updatePolling()
-            return
-        }
-        // 屏幕 -> 窗口 -> flipped 视图坐标，支持负坐标和不同缩放的多显示器。
-        sampleBlink()
-        let local = convert(window.convertPoint(fromScreen: mouseLocation()), from: nil)
-        let target = BallGazeGeometry.offset(cursor: local, center: CGPoint(x: bounds.midX, y: bounds.midY))
-        let now = ProcessInfo.processInfo.systemUptime
-        // 静止后的首次采样不跨过整个间隔，避免直接跳到指针方向。
-        let elapsed = min(1 / 30, lastSampleTime.map { now - $0 } ?? 1 / 60)
-        lastSampleTime = now
-        let next = reduceMotion ? target : BallGazeGeometry.follow(current: current, target: target, elapsed: elapsed)
-        let moving = hypot(target.width - current.width, target.height - current.height) > 0.03
-        if moving {
-            current = next
-            onGaze?(next)
-        }
-        let untilBlink = reduceMotion ? TimeInterval.infinity
-            : max(1 / 60, nextBlink - now)
-        let delay = !reduceMotion && (moving || blinkStart != nil) ? 1 / 60 : min(0.25, untilBlink)
-        scheduleSample(after: delay)
-    }
-
-    private func sampleBlink() {
-        let now = ProcessInfo.processInfo.systemUptime
-        var openness: CGFloat = 1
-        if reduceMotion {
-            blinkStart = nil
-            nextBlink = now + Double.random(in: 3...6)
-        } else {
-            if blinkStart == nil, now >= nextBlink { blinkStart = now }
-            if let start = blinkStart {
-                openness = BallBlinkTiming.openness(elapsed: now - start)
-                if now - start >= BallBlinkTiming.duration {
-                    blinkStart = nil
-                    nextBlink = now + Double.random(in: 3...6)
-                }
-            }
-        }
-        if abs(openness - lastOpenness) > 0.001 {
-            lastOpenness = openness
-            onBlink?(openness)
-        }
-    }
-
-    func stop() {
-        timer?.invalidate()
-        timer = nil
-        lastSampleTime = nil
-        visibilityObservation = nil
-        if let visibilityObserver {
-            NotificationCenter.default.removeObserver(visibilityObserver)
-            self.visibilityObserver = nil
-        }
-    }
-
-    deinit { stop() }
 }

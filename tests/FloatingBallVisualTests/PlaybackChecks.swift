@@ -148,6 +148,12 @@ private final class FloatingBallPlaybackDelegate: NSObject, NSApplicationDelegat
                         stage = 10
                     } else {
                         guard lowEnergyTracker === tracker else { self.fail("Style change reset live eye tracking") }
+                        if let bitmap = hosted.bitmapImageRepForCachingDisplay(in: hosted.bounds) {
+                            hosted.cacheDisplay(in: hosted.bounds, to: bitmap)
+                            let output = URL(fileURLWithPath: CommandLine.arguments[1])
+                            try? bitmap.representation(using: .png, properties: [:])?.write(
+                                to: output.appendingPathComponent("low-energy-live-gaze.png"))
+                        }
                         print("PASS: low-energy mode stops both palettes and orbits, preserving live eyes")
                         hosted.rootView = artwork(.blue)
                         stage = 11
@@ -189,44 +195,96 @@ private final class FloatingBallPlaybackDelegate: NSObject, NSApplicationDelegat
         window.hidesOnDeactivate = false
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.contentView = tracker
+        tracker.watchesPointerEvents = false
         var reads = 0
         var gazeUpdates = 0
         var offset: CGFloat = 0
+        var slowStart: TimeInterval?
+        var sampleTimes: [TimeInterval] = []
         tracker.mouseLocation = {
             reads += 1
-            let point = tracker.convert(NSPoint(x: 32 + offset, y: 32), to: nil)
+            let now = CACurrentMediaTime()
+            let y = slowStart.map { now - $0 } ?? 0
+            if slowStart != nil { sampleTimes.append(now) }
+            let point = tracker.convert(NSPoint(x: 32 + offset, y: 32 + y), to: nil)
             return window.convertPoint(toScreen: point)
         }
         tracker.onGaze = { _ in gazeUpdates += 1 }
         window.orderFront(nil)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-            assert((2...8).contains(reads), "Stationary gaze should poll around 4Hz, not 30Hz: \(reads)")
+        Task { @MainActor in
+            func wait(_ seconds: Double) async { try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000)) }
+            await wait(1.2)
+            assert((2...8).contains(reads), "Stationary gaze should poll around 4Hz: \(reads)")
             offset = 400
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                assert(gazeUpdates >= 12, "Active gaze must get enough updates for smooth following")
-                tracker.reduceMotion = true
-                let beforeReduced = reads
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-                    assert(reads - beforeReduced <= 8, "Reduce Motion must use low-frequency polling")
-                    window.orderOut(nil)
-                    let beforeHidden = reads
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                        assert(reads == beforeHidden, "Hidden pointer tracker must not wake")
-                        window.orderFront(nil)
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                            assert(reads > beforeHidden, "Pointer tracking must resume on show")
-                            tracker.stop()
-                            // Break the fixture-only ownership cycle.
-                            tracker.mouseLocation = { .zero }
-                            window.orderOut(nil)
-                            window.close()
-                            print("PASS: idle pointer polls at 4Hz, moving gaze stays smooth; reduced motion and hide/resume")
-                            NSApplication.shared.terminate(nil)
-                        }
-                    }
-                }
-            }
+            let beforeWake = reads
+            tracker.pointerDidMove()
+            assert(reads == beforeWake + 1 && gazeUpdates > 0, "Motion must wake immediately, before the idle poll")
+            for _ in 0..<1000 { tracker.pointerDidMove() }
+            assert(reads == beforeWake + 1, "High-rate mouse events must not cause extra per-event renders")
+            await wait(0.8)
+            assert(gazeUpdates >= 12, "Active gaze must smoothly approach the target")
+
+            // 远离球体、每秒只移动一个点：眼睛几乎已跟上，仍需维持连续采样。
+            slowStart = CACurrentMediaTime()
+            tracker.pointerDidMove()
+            await wait(0.85)
+            slowStart = nil
+            let intervals = zip(sampleTimes.dropFirst(), sampleTimes).map { $0 - $1 }.sorted()
+            assert(intervals.count >= 20, "Slow movement incorrectly fell back to idle polling")
+            let p95 = intervals[Int(Double(intervals.count - 1) * 0.95)]
+            assert(p95 < 0.08 && (intervals.last ?? 1) < 0.15,
+                   "Slow tracking contains visible polling gaps: \(intervals)")
+            print(String(format: "PASS: immediate wake, coalesced 1000-event burst, slow pointer %.0fHz / p95 %.1fms / max %.1fms",
+                         Double(intervals.count) / (sampleTimes.last! - sampleTimes.first!), p95 * 1000, intervals.last! * 1000))
+
+            tracker.reduceMotion = true
+            await wait(0.7)
+            let beforeReduced = reads
+            await wait(1.2)
+            assert(reads - beforeReduced <= 8, "Settled Reduce Motion must use low-frequency polling")
+            window.orderOut(nil)
+            let beforeHidden = reads
+            tracker.pointerDidMove()
+            await wait(0.5)
+            assert(reads == beforeHidden, "Hidden tracking must ignore input and stop reading positions")
+            window.orderFront(nil)
+            await wait(0.5)
+            assert(reads > beforeHidden, "Pointer tracking must resume on show")
+            tracker.stop()
+            let beforeStop = reads
+            await wait(0.1)
+            assert(reads == beforeStop, "A dismantled tracker must have no queued updates")
+            tracker.mouseLocation = { .zero }
+            window.orderOut(nil)
+            window.close()
+            print("PASS: idle 4Hz, Reduce Motion, hidden input suppression, hide/resume and teardown")
+            await self.checkLegacyClock()
+            NSApplication.shared.terminate(nil)
         }
+    }
+
+    private func checkLegacyClock() async {
+        var ticks = 0
+        guard let clock = BallLegacyFrameClock(screen: NSScreen.main, tick: { ticks += 1 }), clock.start() else {
+            fail("Core Video fallback clock could not start")
+        }
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        assert(ticks >= 3, "Core Video fallback must deliver native display ticks")
+        // 模拟主线程繁忙：显示线程不能把过时的眼睛更新排成一长串。
+        let beforeStall = ticks
+        usleep(120_000)
+        assert(ticks == beforeStall)
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        assert((1...3).contains(ticks - beforeStall), "Display ticks accumulated during a main-thread stall")
+        clock.stop()
+        let stopped = ticks
+        try? await Task.sleep(nanoseconds: 80_000_000)
+        assert(ticks == stopped, "Stopped clock must discard a queued callback")
+        assert(clock.start())
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        assert(ticks > stopped, "Fallback clock must restart without stale callbacks")
+        clock.stop()
+        print("PASS: macOS 12/13 display clock, stalled-main-thread coalescing, stop/restart")
     }
 
     private func fail(_ message: String) -> Never {
