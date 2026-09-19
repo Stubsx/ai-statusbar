@@ -1,7 +1,7 @@
 import Foundation
 
 /// Quota cards have three states: current (fresh read), stale snapshot (last successful
-/// read, shown dimmed with its age) and unavailable (never read or every window expired).
+/// read, shown with its age only) and unavailable (never read or every window expired).
 /// Some tools only refresh their token when a real session runs, so a read failure with
 /// an unexpired historical snapshot still shows the snapshot instead of hiding it.
 struct QuotaPresentation {

@@ -324,28 +324,17 @@ struct PanelView: View {
                                 }
                             }
                             if !presentation.windows.isEmpty {
+                                // 快照旧了也只写更新时间：新鲜与否由时间本身表达，不加橙色提醒或变暗。
                                 let age = ExperienceFormat.age(presentation.lastSuccessAt ?? 0,
                                                                now: context.date.timeIntervalSince1970)
-                                if presentation.isStale {
-                                    Label("快照 · 更新于 \(age)，可能不是最新",
-                                          systemImage: "clock.arrow.circlepath")
-                                        .font(.system(size: 10)).foregroundColor(.orange)
-                                } else {
-                                    Text("更新于 \(age)")
-                                        .font(.system(size: 10)).foregroundColor(.secondary)
-                                }
+                                Text("更新于 \(age)")
+                                    .font(.system(size: 10)).foregroundColor(.secondary)
                                 ForEach(presentation.windows, id: \.label) { window in
                                     if window.kind == "month", !(window.components ?? []).isEmpty {
                                         monthlyQuotaRow(window)
                                     } else {
                                         quotaRow(window)
                                     }
-                                }
-                                .opacity(presentation.isStale ? 0.55 : 1)
-                                if presentation.isStale, !presentation.notice.isEmpty {
-                                    Text(presentation.notice)
-                                        .font(.system(size: 10)).foregroundColor(.secondary)
-                                        .fixedSize(horizontal: false, vertical: true)
                                 }
                             } else {
                                 Label("当前额度暂不可用", systemImage: "exclamationmark.circle")
