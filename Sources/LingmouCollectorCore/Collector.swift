@@ -30,7 +30,9 @@ public final class LingmouCollector {
 
     /// Slow enrichment runs independently from the one-second local status path.
     public func collectMetrics() -> CollectorMetrics {
-        let quota = QuotaCollector(environment: environment, settings: settings, files: files).collect()
+        let quota = QuotaCollector(
+            environment: environment, settings: settings, files: files, processes: processes
+        ).collect()
         let usage = UsageCollector(environment: environment, settings: settings, files: files).collectWithSync()
         return CollectorMetrics(quotas: quota.compactMapValues { $0 }, usage: usage.local,
                                 usageMerged: usage.merged, sync: usage.sync, collectedAt: environment.now)

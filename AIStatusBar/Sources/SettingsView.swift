@@ -260,6 +260,15 @@ struct SettingsView: View {
             } message: {
                 Text("灵眸需要读取钥匙串“kimi-desktop Safe Storage”来解密 Kimi 登录凭证。本次连接最多等待 60 秒；拒绝或超时后不会自动重试。授权成功后会把解密口令以仅当前用户可读的文件备份在本机（~/.ai-statusbar），之后重建或重装灵眸都不会再掉授权，关闭本开关则立即删除该文件。口令只用于本机解密，不会外传；Kimi 桌面端重置密钥后需重新连接一次。")
             }
+            if settings.kimiTokenDecrypt {
+                divider
+                settingRow("App 关闭时代续期凭证",
+                           detail: "Kimi App 退出后它的登录凭证约 15 分钟过期，月度额度会停在最后一次读取。开启后灵眸会按设定频率用刷新凭证换新并回写 Kimi 本地凭证库（回写前自动备份），仅在 Kimi App 未运行时执行") {
+                    valuePicker($settings.kimiTokenRefreshHours, options: [
+                        ("关闭", 0), ("每 2 小时", 2), ("每 5 小时", 5), ("每天", 24),
+                    ])
+                }
+            }
             if store.isAuthorizingKimi {
                 settingRow("等待钥匙串授权", detail: store.kimiAuthorizationMessage ?? "") {
                     Button("取消请求") { store.cancelKimiAuthorization() }
@@ -766,13 +775,17 @@ struct SettingsView: View {
         )
     }
 
-    /// 首次开启需说明钥匙串授权；关闭直接生效。
+    /// 首次开启需说明钥匙串授权；关闭直接生效（代续期依赖解密，一并关闭）。
     private var kimiTokenDecryptBinding: Binding<Bool> {
         Binding(
             get: { settings.kimiTokenDecrypt },
             set: { enabled in
                 if enabled { showKimiDecryptAlert = true }
-                else { settings.kimiTokenDecrypt = false; store.clearKimiKeyCache(); store.refresh() }
+                else {
+                    settings.kimiTokenDecrypt = false
+                    settings.kimiTokenRefreshHours = 0
+                    store.clearKimiKeyCache(); store.refresh()
+                }
             }
         )
     }

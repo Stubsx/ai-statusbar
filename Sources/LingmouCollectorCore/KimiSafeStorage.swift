@@ -133,19 +133,46 @@ enum KimiSafeStorage {
         return JSONValue.object(from: text)
     }
 
+    /// 与解密对称的 v10 加密：同一口令派生密钥、同一固定 IV，产物可被 Kimi 桌面端
+    /// 正常解密。仅供“代续期凭证”回写 token-store 使用，其余场景灵眸保持只读。
+    static func encryptTokenStore(
+        plain: JSONObject,
+        keyProvider: (String, String) -> Data? = { service, account in
+            readKeychainPassword(service: service, account: account)
+        }
+    ) -> String? {
+        guard JSONSerialization.isValidJSONObject(plain),
+            let data = try? JSONSerialization.data(withJSONObject: plain),
+            let password = keyProvider(keychainService, keychainAccount),
+            let key = deriveKey(password: password),
+            let cipher = aesCBCEncrypt(
+                key: key, iv: Data(repeating: 0x20, count: kCCBlockSizeAES128),
+                plaintext: data)
+        else { return nil }
+        return (Data("v10".utf8) + cipher).base64EncodedString()
+    }
+
     private static func aesCBCDecrypt(key: Data, iv: Data, ciphertext: Data) -> Data? {
+        crypt(key: key, iv: iv, input: ciphertext, operation: CCOperation(kCCDecrypt))
+    }
+
+    private static func aesCBCEncrypt(key: Data, iv: Data, plaintext: Data) -> Data? {
+        crypt(key: key, iv: iv, input: plaintext, operation: CCOperation(kCCEncrypt))
+    }
+
+    private static func crypt(key: Data, iv: Data, input: Data, operation: CCOperation) -> Data? {
         var keyBytes = [UInt8](key)
         var ivBytes = [UInt8](iv)
-        var cipherBytes = [UInt8](ciphertext)
-        var outputBytes = [UInt8](repeating: 0, count: cipherBytes.count + kCCBlockSizeAES128)
+        var inputBytes = [UInt8](input)
+        var outputBytes = [UInt8](repeating: 0, count: inputBytes.count + kCCBlockSizeAES128)
         var moved = 0
         let status = CCCrypt(
-            CCOperation(kCCDecrypt),
+            operation,
             CCAlgorithm(kCCAlgorithmAES),
             CCOptions(kCCOptionPKCS7Padding),
             &keyBytes, keyBytes.count,
             &ivBytes,
-            &cipherBytes, cipherBytes.count,
+            &inputBytes, inputBytes.count,
             &outputBytes, outputBytes.count,
             &moved
         )

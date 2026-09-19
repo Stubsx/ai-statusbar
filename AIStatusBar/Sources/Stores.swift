@@ -38,6 +38,8 @@ final class SettingsStore: ObservableObject {
     @Published var onlineQuota = true { didSet { save() } }
     /// 解密新版 Kimi（3.2.4+）safeStorage 加密的登录凭证以读取月度额度；默认关闭
     @Published var kimiTokenDecrypt = false { didSet { save() } }
+    /// Kimi App 关闭期间按频率代续期凭证（小时；0=关闭）。依赖解密开启。
+    @Published var kimiTokenRefreshHours = 0 { didSet { save() } }
     /// 跳转 Kimi 网页时复用已打开的同源标签页（需浏览器自动化授权，失败回退新开）
     @Published var kimiWebTabReuse = true { didSet { save() } }
     /// 实验性桌面会话跳转；本机 Electron 调试连接，默认关闭。
@@ -109,6 +111,9 @@ final class SettingsStore: ObservableObject {
         }
         if let v = obj["online_quota"] as? Bool { onlineQuota = v }
         if let v = obj["kimi_token_decrypt"] as? Bool { kimiTokenDecrypt = v }
+        if let v = obj["kimi_token_refresh_hours"] as? Int, [0, 2, 5, 24].contains(v) {
+            kimiTokenRefreshHours = v
+        }
         if let v = obj["kimi_web_tab_reuse"] as? Bool { kimiWebTabReuse = v }
         if let v = obj["kimi_desktop_session_navigation"] as? Bool { kimiDesktopSessionNavigation = v }
         if let s = obj["usage_sync"] as? [String: Any] {
@@ -138,6 +143,7 @@ final class SettingsStore: ObservableObject {
             "pet_scale": petScale,
             "online_quota": onlineQuota,
             "kimi_token_decrypt": kimiTokenDecrypt,
+            "kimi_token_refresh_hours": kimiTokenRefreshHours,
             "kimi_web_tab_reuse": kimiWebTabReuse,
             "kimi_desktop_session_navigation": kimiDesktopSessionNavigation,
             "usage_sync": ["enabled": usageSyncEnabled, "dir": usageSyncDir],

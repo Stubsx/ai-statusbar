@@ -23,3 +23,12 @@
 ## 验证范围
 
 使用虚构凭证和替身系统调用验证：后台禁止交互、禁用失败时不读取、拒绝缓存、交互锁、授权后缓存失效；原生测试使用测试子进程验证超时退出、重复点击、拒绝和取消。测试不向真实钥匙串申请权限，也不写入厂商凭证。
+
+## App 关闭期间的凭证代续期（可选）
+
+Kimi 桌面端写入 `token-store.json` 的 access_token 实测只有约 15 分钟有效期；App 退出后无人续期，灵眸的月度额度只能沿用最后一次成功读取的快照。设置「工具与连接 → Kimi Work → App 关闭时代续期凭证」提供可选项（关闭 / 每 2 小时 / 每 5 小时 / 每天，默认关闭）：
+
+- 触发条件全部满足才执行：解密开关已开启、access_token 已过期且账号带 refresh_token、Kimi App 未运行（运行中由它自己续期，且并发回写有风险）、距上次尝试超过设定频率。尝试记录在 `~/.ai-statusbar/kimi-token-refresh.json`。
+- 刷新走 Kimi 官方客户端同一接口 `GET https://www.kimi.com/api/auth/token/refresh`（Bearer refresh_token）。该接口会轮换 refresh_token：请求成功后必须把新凭证按原格式回写 `token-store.json`（safeStorage v10 重新加密、保留原权限位），否则 App 里保存的旧凭证会失效。回写前先把原文件备份到 `~/.ai-statusbar/kimi-token-store-backup.json`；加密口令不可用（回写必然失败）时不会发起请求，避免“服务端已轮换、本地没写回”的最坏情况。
+- 任何失败（网络、非 2xx、响应缺新凭证或新 token 已过期）都不改动原文件，沿用既有降级：保留最近一次有效配额，不误报登录过期。
+- 续期成功后立即用新 access_token 完成本次额度查询。除上述单一接口调用与原格式回写外，不修改 Kimi 安装文件、不新增常驻服务；关闭解密开关时该功能一并关闭。

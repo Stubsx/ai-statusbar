@@ -2256,3 +2256,166 @@ final class CollectorTests: XCTestCase {
         XCTAssertTrue(collector.renderSwiftBar(decoded).contains("C=Codex App"))
     }
 }
+
+// MARK: - Kimi 凭证代续期
+
+extension CollectorTests {
+    private func kimiRefreshJWT(exp: TimeInterval) -> String {
+        let payload = "{\"exp\":\(Int(exp))}"
+        let base64 = Data(payload.utf8).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return "h.\(base64).s"
+    }
+
+    /// 构造与真实磁盘一致的加密 token-store（safeStorage v10）。
+    private func kimiRefreshEncryptedStore(
+        home: URL, expiredAccess: String, refresh: String
+    ) throws -> (path: URL, original: String) {
+        let plain: JSONObject = [
+            "origin": "https://www.kimi.com",
+            "tokens": [
+                "access_token": expiredAccess, "refresh_token": refresh, "msh_user_id": "u",
+            ] as JSONObject,
+        ]
+        let payload = KimiSafeStorage.encryptTokenStore(
+            plain: plain, keyProvider: { _, _ in Data("test-password".utf8) })
+        let body = "{\"data\":\"\(payload ?? "")\",\"encryption\":\"safeStorage.v1\"}"
+        let path = home.appendingPathComponent(
+            "Library/Application Support/kimi-desktop/bridge-store/token-store.json")
+        try write(body, to: path)
+        return (path, body)
+    }
+
+    private func kimiRefreshCollector(
+        home: URL, refreshHours: Int,
+        processes: ProcessSupport? = nil,
+        requestOverride: @escaping (URLRequest) -> JSONObject?
+    ) -> QuotaCollector {
+        QuotaCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: 2_000_000_000),
+            settings: CollectorSettings(
+                onlineQuota: true, kimiTokenDecrypt: true, kimiTokenRefreshHours: refreshHours),
+            files: FileSupport(),
+            processes: processes,
+            requestOverride: requestOverride,
+            kimiKeychainOverride: { _, _ in Data("test-password".utf8) })
+    }
+
+    func testKimiSafeStorageEncryptRoundtrip() throws {
+        let plain: JSONObject = [
+            "origin": "https://www.kimi.com",
+            "tokens": ["access_token": "a.b.c", "refresh_token": "r"] as JSONObject,
+        ]
+        let provider: (String, String) -> Data? = { _, _ in Data("roundtrip".utf8) }
+        let payload = KimiSafeStorage.encryptTokenStore(plain: plain, keyProvider: provider)
+        XCTAssertNotNil(payload)
+        let decoded = KimiSafeStorage.decryptTokenStore(payload: payload!, keyProvider: provider)
+        XCTAssertEqual(decoded?["origin"] as? String, "https://www.kimi.com")
+        XCTAssertEqual((decoded?["tokens"] as? JSONObject)?["refresh_token"] as? String, "r")
+    }
+
+    func testKimiTokenRefreshRenewsAndWritesBackWhenAppClosed() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let expired = kimiRefreshJWT(exp: 2_000_000_000 - 3_600)
+        let store = try kimiRefreshEncryptedStore(
+            home: home, expiredAccess: expired, refresh: "refresh-old")
+        var refreshAuthorizations: [String] = []
+        let newAccess = kimiRefreshJWT(exp: 2_000_000_000 + 600)
+        let quota = kimiRefreshCollector(home: home, refreshHours: 2) { request in
+            switch request.url?.path {
+            case "/api/auth/token/refresh":
+                refreshAuthorizations.append(request.value(forHTTPHeaderField: "Authorization") ?? "")
+                return ["access_token": newAccess, "refresh_token": "refresh-new"]
+            case "/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats":
+                return [
+                    "subscriptionBalance": [
+                        "amountUsedRatio": 0.42, "kimiCodeUsedRatio": 0.1,
+                        "expireTime": "2034-05-12T03:33:20Z",
+                    ] as JSONObject,
+                ]
+            case "/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscription":
+                return ["subscription": ["goods": ["title": "Allegro"]] as JSONObject]
+            default:
+                return nil
+            }
+        }.collect()
+        XCTAssertEqual(refreshAuthorizations, ["Bearer refresh-old"])
+        XCTAssertEqual(quota["kimi-work"]??.plan, "Allegro")
+        XCTAssertEqual(quota["kimi-work"]??.windows.first?.usedPercent, 42.0)
+        XCTAssertEqual(quota["kimi-work"]??.updatedAt, 2_000_000_000)
+        // 回写：加密形态保留，新凭证可被同一口令解开。
+        let rewritten = try String(contentsOf: store.path, encoding: .utf8)
+        let object = JSONValue.object(from: rewritten)
+        XCTAssertNotNil(JSONValue.string(object?["encryption"]))
+        let payload = JSONValue.string(object?["data"])
+        let plain = KimiSafeStorage.decryptTokenStore(
+            payload: payload!, keyProvider: { _, _ in Data("test-password".utf8) })
+        let tokens = plain?["tokens"] as? JSONObject
+        XCTAssertEqual(tokens?["access_token"] as? String, newAccess)
+        XCTAssertEqual(tokens?["refresh_token"] as? String, "refresh-new")
+        // 原文件有备份；续期节流状态已记账。
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: home.appendingPathComponent(".ai-statusbar/kimi-token-store-backup.json").path))
+        let state = try String(
+            contentsOf: home.appendingPathComponent(".ai-statusbar/kimi-token-refresh.json"),
+            encoding: .utf8)
+        XCTAssertTrue(state.contains("2.0e9") || state.contains("2000000000"))
+    }
+
+    func testKimiTokenRefreshSkippedWhileKimiAppRunning() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let expired = kimiRefreshJWT(exp: 2_000_000_000 - 3_600)
+        let store = try kimiRefreshEncryptedStore(
+            home: home, expiredAccess: expired, refresh: "refresh-old")
+        let processes = ProcessSupport { executable, arguments, _ in
+            executable == "/bin/ps" && arguments.contains("comm=")
+                ? "/Applications/Kimi.app/Contents/MacOS/Kimi" : ""
+        }
+        var refreshed = false
+        _ = kimiRefreshCollector(home: home, refreshHours: 2, processes: processes) { request in
+            if request.url?.path == "/api/auth/token/refresh" { refreshed = true }
+            return nil
+        }.collect()
+        XCTAssertFalse(refreshed)
+        // App 在线时灵眸不碰凭证文件。
+        XCTAssertEqual(try String(contentsOf: store.path, encoding: .utf8), store.original)
+    }
+
+    func testKimiTokenRefreshThrottledWithinConfiguredInterval() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let expired = kimiRefreshJWT(exp: 2_000_000_000 - 3_600)
+        let store = try kimiRefreshEncryptedStore(
+            home: home, expiredAccess: expired, refresh: "refresh-old")
+        try write(
+            "{\"lastAttemptAt\":1999999400}",
+            to: home.appendingPathComponent(".ai-statusbar/kimi-token-refresh.json"))
+        var refreshed = false
+        _ = kimiRefreshCollector(home: home, refreshHours: 2) { request in
+            if request.url?.path == "/api/auth/token/refresh" { refreshed = true }
+            return nil
+        }.collect()
+        XCTAssertFalse(refreshed)
+        XCTAssertEqual(try String(contentsOf: store.path, encoding: .utf8), store.original)
+    }
+
+    func testKimiTokenRefreshDisabledLeavesStoreUntouched() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let expired = kimiRefreshJWT(exp: 2_000_000_000 - 3_600)
+        let store = try kimiRefreshEncryptedStore(
+            home: home, expiredAccess: expired, refresh: "refresh-old")
+        var refreshed = false
+        let quota = kimiRefreshCollector(home: home, refreshHours: 0) { request in
+            if request.url?.path == "/api/auth/token/refresh" { refreshed = true }
+            return nil
+        }.collect()
+        XCTAssertFalse(refreshed)
+        XCTAssertNil(quota["kimi-work"] ?? nil)
+        XCTAssertEqual(try String(contentsOf: store.path, encoding: .utf8), store.original)
+    }
+}

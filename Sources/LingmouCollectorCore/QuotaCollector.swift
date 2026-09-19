@@ -4,6 +4,8 @@ struct QuotaCollector {
     let environment: CollectorEnvironment
     let settings: CollectorSettings
     let files: FileSupport
+    /// App 在线判定用于代续期门控（App 运行中它自己会续期，灵眸不插手）。
+    var processes: ProcessSupport? = nil
     var requestOverride: ((URLRequest) -> JSONObject?)? = nil
     var kimiKeychainOverride: ((String, String) -> Data?)? = nil
 
@@ -324,42 +326,47 @@ struct QuotaCollector {
             "Library", "Application Support", "kimi-desktop", "bridge-store", "token-store.json")
     }
 
-    /// 取 token-store 里的 access_token。旧版是明文 JSON（tokens.access_token）；
-    /// Kimi 3.2.4+ 整包 safeStorage 加密（encryption/data 字段），需在设置中开启
-    /// 解密并用钥匙串口令解开，读不到时返回对应的降级提示。refreshable 表示凭证
-    /// 带 refresh_token（App 持有它即可免登录自动续期，access_token 过期≠账号退出）。
-    private func kimiStoredAccessToken(_ store: JSONObject) -> (
-        token: String?, refreshable: Bool, notice: String?
+    /// 把 token-store 文件对象解析成可用形态：旧版明文直接返回；新版 safeStorage
+    /// 密文按需解密。encryptedPayload 非 nil 表示原文件是加密库（回写需重新加密）。
+    private func kimiPlainTokenStore(_ raw: JSONObject) -> (
+        plain: JSONObject?, encryptedPayload: String?, notice: String?
     ) {
-        if let tokens = store["tokens"] as? JSONObject,
-            let token = JSONValue.string(tokens["access_token"]), !token.isEmpty
-        {
-            return (token, kimiHasRefreshToken(tokens), nil)
-        }
-        guard JSONValue.string(store["encryption"]) != nil,
-            let payload = JSONValue.string(store["data"])
-        else { return (nil, false, nil) }
+        if raw["tokens"] != nil { return (raw, nil, nil) }
+        guard JSONValue.string(raw["encryption"]) != nil,
+            let payload = JSONValue.string(raw["data"])
+        else { return (nil, nil, nil) }
         guard settings.kimiTokenDecrypt else {
-            return (nil, false, Self.kimiEncryptedNotice)
+            return (nil, payload, Self.kimiEncryptedNotice)
         }
+        guard let plain = KimiSafeStorage.decryptTokenStore(
+            payload: payload, keyProvider: kimiStorageKeyProvider)
+        else { return (nil, payload, Self.kimiDecryptFailedNotice) }
+        return (plain, payload, nil)
+    }
+
+    private var kimiStorageKeyProvider: (String, String) -> Data? {
         let base = kimiKeychainOverride ?? KimiSafeStorage.readKeychainPassword
-        // 钥匙串拒绝时回退到授权时备份的口令副本：重建/重装灵眸后 ACL 失效也能继续读。
-        let provider: (String, String) -> Data? = { service, account in
+        return { service, account in
             base(service, account)
                 ?? KimiSafeStorage.cachedPassword(homeDirectory: environment.homeDirectory)
         }
-        guard let plain = KimiSafeStorage.decryptTokenStore(payload: payload, keyProvider: provider)
-        else { return (nil, false, Self.kimiDecryptFailedNotice) }
-        // 兼容 {"tokens":{"access_token":…}} 与解密后直接平铺两种形态。
-        let tokens = (plain["tokens"] as? JSONObject) ?? plain
-        guard let token = JSONValue.string(tokens["access_token"]), !token.isEmpty else {
-            return (nil, false, Self.kimiDecryptFailedNotice)
-        }
-        return (token, kimiHasRefreshToken(tokens), nil)
     }
 
-    private func kimiHasRefreshToken(_ tokens: JSONObject) -> Bool {
-        !(JSONValue.string(tokens["refresh_token"]) ?? "").isEmpty
+    /// 取 token-store 里的 access_token/refresh_token。旧版是明文 JSON（tokens.access_token）；
+    /// Kimi 3.2.4+ 整包 safeStorage 加密（encryption/data 字段），需在设置中开启
+    /// 解密并用钥匙串口令解开，读不到时返回对应的降级提示。refreshable 表示凭证
+    /// 带 refresh_token（App 持有它即可免登录自动续期，access_token 过期≠账号退出）。
+    private func kimiStoredAccessToken(_ raw: JSONObject) -> (
+        token: String?, refreshToken: String?, refreshable: Bool, notice: String?
+    ) {
+        let resolved = kimiPlainTokenStore(raw)
+        guard let plain = resolved.plain,
+            // 兼容 {"tokens":{"access_token":…}} 与解密后直接平铺两种形态。
+            let tokens = (plain["tokens"] as? JSONObject) ?? (plain.isEmpty ? nil : plain),
+            let token = JSONValue.string(tokens["access_token"]), !token.isEmpty
+        else { return (nil, nil, false, resolved.notice) }
+        let refresh = JSONValue.string(tokens["refresh_token"]) ?? ""
+        return (token, refresh.isEmpty ? nil : refresh, !refresh.isEmpty, nil)
     }
 
     private var kimiTokenModificationTime: TimeInterval {
@@ -429,17 +436,23 @@ struct QuotaCollector {
             return (nil, "Kimi 登录已过期，请打开 Kimi App 重新登录")
         }
         let stored = kimiStoredAccessToken(store)
-        guard let token = stored.token, !token.isEmpty else {
+        guard var token = stored.token, !token.isEmpty else {
             return (nil, stored.notice ?? "Kimi 登录已过期，请打开 Kimi App 重新登录")
         }
         let expiration = jwtExpiration(token)
-        guard expiration == 0 || environment.now < expiration - 30 else {
-            // access_token 只是短期快照，App 持 refresh_token 会在使用时自动续期并
-            // 回写（重开 App 也无需重新登录）；过期只说明快照陈旧，不代表账号退出。
-            // 灵眸保持只读，沿用最近一次有效配额；仅当确实没有 refresh_token 时才
-            // 提示需要重新登录。
-            if stored.refreshable { return (nil, nil) }
-            return (nil, "Kimi 登录已过期，请打开 Kimi App 重新登录")
+        if !(expiration == 0 || environment.now < expiration - 30) {
+            // access_token 只是短期快照（实测约 15 分钟），App 持 refresh_token 会在
+            // 使用时自动续期并回写。开启“代续期”后，灵眸在 App 关闭期间也会用
+            // refresh_token 换新并回写，随后立即用新 token 查询。
+            if let renewed = renewExpiredKimiToken(raw: store, stored: stored) {
+                token = renewed
+            } else if stored.refreshable {
+                // 未开启代续期（或本次未成功）：灵眸沿用最近一次有效配额，
+                // 过期只说明快照陈旧，不代表账号退出。
+                return (nil, nil)
+            } else {
+                return (nil, "Kimi 登录已过期，请打开 Kimi App 重新登录")
+            }
         }
         guard
             let object = request(
@@ -481,6 +494,149 @@ struct QuotaCollector {
             )
         ]
         return (ToolQuota(plan: planTitle, windows: windows, updatedAt: Int(environment.now)), nil)
+    }
+
+    // MARK: - Kimi 凭证代续期（默认关闭的显式选项）
+
+    private struct KimiTokenRefreshState: Codable {
+        var lastAttemptAt: TimeInterval?
+        var lastSuccessAt: TimeInterval?
+    }
+
+    private var kimiTokenRefreshStatePath: String {
+        environment.path(".ai-statusbar", "kimi-token-refresh.json")
+    }
+
+    /// App 关闭期间用 refresh_token 代续期：成功则把新凭证按原格式回写 token-store
+    /// 并立即用于本次配额查询。Kimi 的刷新接口会轮换 refresh_token，成功后不回写
+    /// 会让 App 里存的旧凭证失效，因此回写失败视为本次续期失败（原文件不动）。
+    private func renewExpiredKimiToken(
+        raw: JSONObject,
+        stored: (token: String?, refreshToken: String?, refreshable: Bool, notice: String?)
+    ) -> String? {
+        guard settings.kimiTokenRefreshHours > 0,
+            let refreshToken = stored.refreshToken, !refreshToken.isEmpty,
+            kimiTokenRefreshAttemptAllowed()
+        else { return nil }
+        let resolved = kimiPlainTokenStore(raw)
+        guard let plain = resolved.plain else { return nil }
+        // 先确认能按原格式回写（加密口令可用）再动用 refresh_token：请求一旦成功，
+        // 服务端已轮换，回写不了就只能眼睁睁让 App 侧凭证失效。
+        if resolved.encryptedPayload != nil,
+            KimiSafeStorage.encryptTokenStore(plain: plain, keyProvider: kimiStorageKeyProvider) == nil
+        { return nil }
+        recordKimiTokenRefreshAttempt()
+        guard let response = request(
+            url: "https://www.kimi.com/api/auth/token/refresh",
+            headers: ["Authorization": "Bearer \(refreshToken)"]
+        ), let pair = renewedTokenPair(response)
+        else { return nil }
+        guard
+            writeRenewedKimiTokenStore(raw: raw, plain: plain, access: pair.access, refresh: pair.refresh)
+        else { return nil }
+        recordKimiTokenRefreshSuccess()
+        return pair.access
+    }
+
+    /// 代续期节流与门控：Kimi App 未运行（运行中它自己会续期，并发回写也有风险）
+    /// 且距上次尝试超过设定频率。
+    private func kimiTokenRefreshAttemptAllowed() -> Bool {
+        if let processes, processes.isAppRunning(executableName: "Kimi") { return false }
+        let interval = TimeInterval(max(1, settings.kimiTokenRefreshHours)) * 3_600
+        if let last = readKimiTokenRefreshState().lastAttemptAt,
+            environment.now - last < interval
+        { return false }
+        return true
+    }
+
+    /// 响应里定位新凭证：兼容顶层与 data/tokens 嵌套、snake/camel 命名。
+    /// 新 access_token 已过期视为异常响应，整体丢弃。
+    private func renewedTokenPair(_ object: JSONObject) -> (access: String, refresh: String?)? {
+        func pair(in value: Any, depth: Int) -> (String, String?)? {
+            guard depth <= 2, let dict = value as? JSONObject else { return nil }
+            let access = JSONValue.string(dict["access_token"]) ?? JSONValue.string(dict["accessToken"])
+            if let access, !access.isEmpty {
+                let refresh = JSONValue.string(dict["refresh_token"])
+                    ?? JSONValue.string(dict["refreshToken"])
+                return (access, (refresh?.isEmpty ?? true) ? nil : refresh)
+            }
+            for child in dict.values.sorted(by: { String(describing: $0) < String(describing: $1) }) {
+                if let found = pair(in: child, depth: depth + 1) { return found }
+            }
+            return nil
+        }
+        guard let result = pair(in: object, depth: 0) else { return nil }
+        let expiration = jwtExpiration(result.0)
+        guard expiration == 0 || environment.now < expiration - 30 else { return nil }
+        return (access: result.0, refresh: result.1)
+    }
+
+    /// 回写 token-store：原文件先备份到灵眸目录；加密库按原样重新加密，明文库按
+    /// 明文回写；沿用原文件权限位，不改动 Kimi 目录本身的权限。
+    private func writeRenewedKimiTokenStore(
+        raw: JSONObject, plain: JSONObject, access: String, refresh: String?
+    ) -> Bool {
+        var updatedPlain = plain
+        if var tokens = plain["tokens"] as? JSONObject {
+            tokens["access_token"] = access
+            if let refresh { tokens["refresh_token"] = refresh }
+            updatedPlain["tokens"] = tokens
+        } else {
+            updatedPlain["access_token"] = access
+            if let refresh { updatedPlain["refresh_token"] = refresh }
+        }
+        let backupPath = environment.path(".ai-statusbar", "kimi-token-store-backup.json")
+        if let original = files.read(kimiTokenPath) {
+            try? files.writePrivateData(original, to: backupPath)
+        }
+        let encryption = JSONValue.string(raw["encryption"])
+        let body: String?
+        if encryption != nil {
+            guard let encrypted = KimiSafeStorage.encryptTokenStore(
+                plain: updatedPlain, keyProvider: kimiStorageKeyProvider)
+            else { return false }
+            let wrapper: JSONObject = ["encryption": encryption ?? "safeStorage.v1", "data": encrypted]
+            body = (try? JSONSerialization.data(withJSONObject: wrapper, options: [.sortedKeys]))
+                .flatMap { String(data: $0, encoding: .utf8) }
+        } else {
+            guard JSONSerialization.isValidJSONObject(updatedPlain) else { return false }
+            body = (try? JSONSerialization.data(withJSONObject: updatedPlain, options: [.sortedKeys]))
+                .flatMap { String(data: $0, encoding: .utf8) }
+        }
+        guard let body else { return false }
+        let attributes = try? files.manager.attributesOfItem(atPath: kimiTokenPath)
+        let permissions = (attributes?[.posixPermissions] as? NSNumber)?.int16Value ?? 0o644
+        do {
+            try Data(body.utf8).write(to: URL(fileURLWithPath: kimiTokenPath), options: .atomic)
+            try files.manager.setAttributes(
+                [.posixPermissions: permissions], ofItemAtPath: kimiTokenPath)
+            return true
+        } catch { return false }
+    }
+
+    private func readKimiTokenRefreshState() -> KimiTokenRefreshState {
+        guard let data = files.read(kimiTokenRefreshStatePath),
+            let state = try? JSONDecoder().decode(KimiTokenRefreshState.self, from: data)
+        else { return KimiTokenRefreshState() }
+        return state
+    }
+
+    private func writeKimiTokenRefreshState(_ state: KimiTokenRefreshState) {
+        if let data = try? JSONEncoder().encode(state) {
+            try? files.writePrivateData(data, to: kimiTokenRefreshStatePath)
+        }
+    }
+
+    private func recordKimiTokenRefreshAttempt() {
+        var state = readKimiTokenRefreshState()
+        state.lastAttemptAt = environment.now
+        writeKimiTokenRefreshState(state)
+    }
+
+    private func recordKimiTokenRefreshSuccess() {
+        var state = readKimiTokenRefreshState()
+        state.lastSuccessAt = environment.now
+        writeKimiTokenRefreshState(state)
     }
 
     private func subscriptionTitle(token: String) -> String? {
