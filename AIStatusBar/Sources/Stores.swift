@@ -307,6 +307,11 @@ final class StatusStore: ObservableObject {
         eventOpener(ToolDestination(toolKey: conversation.toolKey, sessionId: conversation.sessionId))
     }
 
+    /// 一键已读：批量清除一组会话的提醒，不打开任何会话；历史与原工具状态不受影响。
+    func acknowledgeConversations(_ conversations: [HarnessConversation]) {
+        acknowledgeEvents(conversations.flatMap(\.eventIDs))
+    }
+
     func openNotification(_ info: [AnyHashable: Any], showHistory: () -> Void) {
         let ids = info["event_ids"] as? [String] ?? []
         let record = ids.count == 1 ? recentEvents.first { $0.id == ids[0] } : nil

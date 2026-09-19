@@ -201,7 +201,8 @@ struct PanelView: View {
             ForEach(store.harnessGroups) { group in
                 StatusToolSection(group: group, kimiWebAvailable: kimiWebAvailable,
                                   displayTitle: { store.displayTitle($0) },
-                                  openConversation: store.openConversation)
+                                  openConversation: store.openConversation,
+                                  clearFinished: store.acknowledgeConversations)
             }
         }
     }

@@ -8,17 +8,32 @@ struct StatusToolSection: View {
     let displayTitle: (String) -> String
     var openDestination: (ToolDestination) -> Void = NotificationRouter.openDestination
     let openConversation: (HarnessConversation) -> Void
+    /// 一键已读入口；nil 时（如预览）不显示清除按钮。
+    var clearFinished: (([HarnessConversation]) -> Void)? = nil
+    @State private var clearHovered = false
     private var tool: ToolStatus { group.tool }
+
+    /// 已结束/已中断/异常的结果行；运行中与待回答的会话不参与一键清除。
+    private var finishedConversations: [HarnessConversation] {
+        clearFinished == nil ? [] : group.conversations.filter { !$0.current }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
-            if NotificationRouter.supportsApplicationNavigation(forToolKey: tool.key) {
-                Button { openDestination(ToolDestination(toolKey: tool.key)) } label: { header }
-                    .buttonStyle(StatusRowButtonStyle())
-                    .help(NotificationRouter.destinationLabel(forToolKey: tool.key))
-                    .accessibilityIdentifier("status-app-\(tool.key)")
-            } else {
-                header.padding(.horizontal, 6).padding(.vertical, 4).padding(.trailing, 16)
+            HStack(spacing: 0) {
+                if NotificationRouter.supportsApplicationNavigation(forToolKey: tool.key) {
+                    Button { openDestination(ToolDestination(toolKey: tool.key)) } label: { header }
+                        .buttonStyle(StatusRowButtonStyle(showsArrow: finishedConversations.isEmpty,
+                                                          trailingInset: headerTrailingInset))
+                        .help(NotificationRouter.destinationLabel(forToolKey: tool.key))
+                        .accessibilityIdentifier("status-app-\(tool.key)")
+                } else {
+                    header.padding(.horizontal, 6).padding(.vertical, 4)
+                        .padding(.trailing, headerTrailingInset)
+                }
+                if !finishedConversations.isEmpty {
+                    clearFinishedButton
+                }
             }
             ForEach(group.conversations) { conversation in
                 sessionRow(conversation)
@@ -28,6 +43,29 @@ struct StatusToolSection: View {
                     .font(.system(size: 10)).foregroundColor(.orange).padding(.leading, 20)
             }
         }
+    }
+
+    /// 清除图标在场时收窄箭头预留位，让图标紧跟运行/待查看计数，读作同一组状态图标。
+    private var headerTrailingInset: CGFloat { finishedConversations.isEmpty ? 16 : 4 }
+
+    /// 与头部计数（play.fill / bubble.left.fill）同一套图标语言：纯 SF Symbol、
+    /// secondary 色、无底色，悬停点亮；不与文字按钮混排。
+    private var clearFinishedButton: some View {
+        Button {
+            clearFinished?(finishedConversations)
+        } label: {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(clearHovered ? .accentColor : .secondary)
+                .padding(3)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.trailing, 7)
+        .help("一键清除已结束/已中断会话的提醒；运行中与待回答的会话保持不变")
+        .accessibilityIdentifier("status-clear-\(tool.key)")
+        .accessibilityLabel("清除已结束会话")
+        .onHover { clearHovered = $0 }
     }
 
     private var header: some View {
@@ -109,9 +147,12 @@ struct StatusToolSection: View {
 /// 只有真正的按钮安装 Hover；箭头始终预留位置，悬停不会挤动标题。
 struct StatusRowButtonStyle: ButtonStyle {
     var showsArrow = true
+    /// 尾部为悬停箭头预留的宽度；被清除图标占用时收窄。
+    var trailingInset: CGFloat = 16
 
     func makeBody(configuration: Configuration) -> some View {
-        StatusRowButtonBody(label: configuration.label, isPressed: configuration.isPressed, showsArrow: showsArrow)
+        StatusRowButtonBody(label: configuration.label, isPressed: configuration.isPressed,
+                            showsArrow: showsArrow, trailingInset: trailingInset)
     }
 }
 
@@ -119,11 +160,12 @@ private struct StatusRowButtonBody<Label: View>: View {
     let label: Label
     let isPressed: Bool
     let showsArrow: Bool
+    let trailingInset: CGFloat
     @State private var hovered = false
 
     var body: some View {
         label
-            .padding(.trailing, 16)
+            .padding(.trailing, trailingInset)
             .overlay(alignment: .trailing) {
                 if showsArrow {
                     Image(systemName: "arrow.up.right").font(.system(size: 9, weight: .medium))
