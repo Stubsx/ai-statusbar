@@ -192,6 +192,32 @@ public struct UsageData: Codable, Hashable, Sendable {
     }
 }
 
+/// At current public API prices, in USD. Unpriced models are excluded from amountUsd.
+public struct CostEstimate: Codable, Hashable, Sendable {
+    public let amountUsd: Double
+    public let pricedTokens: Int
+    public let totalTokens: Int
+    public let byModelUsd: [String: Double]
+    public let unpricedModels: [String]
+}
+
+public struct CostPeriods: Codable, Hashable, Sendable {
+    public let today: CostEstimate
+    public let weekly: CostEstimate?
+    public let monthly: CostEstimate?
+}
+
+public struct CostData: Codable, Hashable, Sendable {
+    public let source: String
+    public let priceUpdatedAt: TimeInterval
+    public let usdToCny: Double?
+    public let exchangeRateSource: String?
+    public let exchangeRateDate: String?
+    public let exchangeRateUpdatedAt: TimeInterval?
+    public let local: CostPeriods?
+    public let merged: CostPeriods?
+}
+
 /// 用量同步文件中的一行：某设备某天某工具某模型的 token 计数。
 public struct UsageSyncDay: Codable, Hashable, Sendable {
     public let date: String
@@ -270,6 +296,7 @@ public struct StatusData: Codable, Hashable, Sendable {
     /// 合并同步目录中所有设备后的用量/热力图；usage 恒为本机数据，前端按需选择展示
     public let usageMerged: UsageData?
     public let sync: UsageSyncStatus?
+    public let cost: CostData?
 
     public init(
         updatedAt: String,
@@ -277,6 +304,7 @@ public struct StatusData: Codable, Hashable, Sendable {
         usage: UsageData?,
         usageMerged: UsageData? = nil,
         sync: UsageSyncStatus? = nil,
+        cost: CostData? = nil,
         collectedAt: TimeInterval? = nil
     ) {
         self.updatedAt = updatedAt
@@ -284,6 +312,7 @@ public struct StatusData: Codable, Hashable, Sendable {
         self.usage = usage
         self.usageMerged = usageMerged
         self.sync = sync
+        self.cost = cost
         self.collectedAt = collectedAt
     }
 }

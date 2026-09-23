@@ -14,6 +14,8 @@ public struct CollectorSettings: Sendable {
     /// 用量同步（多设备汇总）。默认关闭；目录为空时用 iCloud Drive 默认目录
     public var usageSyncEnabled: Bool
     public var usageSyncDir: String?
+    /// Fetch public model prices. Off by default; no usage or account data is sent.
+    public var priceEstimatesEnabled: Bool
 
     public init(
         defaultBusySeconds: Int = 300,
@@ -23,7 +25,8 @@ public struct CollectorSettings: Sendable {
         kimiTokenDecrypt: Bool = false,
         kimiTokenRefreshHours: Int = 0,
         usageSyncEnabled: Bool = false,
-        usageSyncDir: String? = nil
+        usageSyncDir: String? = nil,
+        priceEstimatesEnabled: Bool = false
     ) {
         self.defaultBusySeconds = defaultBusySeconds
         self.perToolBusySeconds = perToolBusySeconds
@@ -33,6 +36,7 @@ public struct CollectorSettings: Sendable {
         self.kimiTokenRefreshHours = kimiTokenRefreshHours
         self.usageSyncEnabled = usageSyncEnabled
         self.usageSyncDir = usageSyncDir
+        self.priceEstimatesEnabled = priceEstimatesEnabled
     }
 
     public func busySeconds(for tool: String) -> Int {
@@ -59,7 +63,8 @@ public struct CollectorSettings: Sendable {
             kimiTokenDecrypt: JSONValue.bool(object["kimi_token_decrypt"]) ?? false,
             kimiTokenRefreshHours: JSONValue.int(object["kimi_token_refresh_hours"]) ?? 0,
             usageSyncEnabled: JSONValue.bool(sync?["enabled"]) ?? false,
-            usageSyncDir: syncDir.isEmpty ? nil : syncDir
+            usageSyncDir: syncDir.isEmpty ? nil : syncDir,
+            priceEstimatesEnabled: JSONValue.bool(object["price_estimates_enabled"]) ?? false
         )
     }
 }

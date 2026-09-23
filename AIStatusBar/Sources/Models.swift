@@ -78,6 +78,31 @@ struct UsageData: Codable {
     let monthly: UsageRange?  // 近30日（含今日）
 }
 
+struct CostEstimate: Codable {
+    let amountUsd: Double
+    let pricedTokens: Int
+    let totalTokens: Int
+    let byModelUsd: [String: Double]
+    let unpricedModels: [String]
+}
+
+struct CostPeriods: Codable {
+    let today: CostEstimate
+    let weekly: CostEstimate?
+    let monthly: CostEstimate?
+}
+
+struct CostData: Codable {
+    let source: String
+    let priceUpdatedAt: TimeInterval
+    let usdToCny: Double?
+    let exchangeRateSource: String?
+    let exchangeRateDate: String?
+    let exchangeRateUpdatedAt: TimeInterval?
+    let local: CostPeriods?
+    let merged: CostPeriods?
+}
+
 struct UsageSyncSource: Codable {
     let device: String
     let name: String
@@ -101,6 +126,7 @@ struct StatusData: Codable {
     /// 合并同步目录所有设备后的用量/热力图；usage 恒为本机数据
     let usageMerged: UsageData?
     let sync: UsageSyncStatus?
+    var cost: CostData? = nil
 }
 
 extension Notification.Name {

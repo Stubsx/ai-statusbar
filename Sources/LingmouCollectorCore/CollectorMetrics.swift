@@ -7,7 +7,20 @@ public struct CollectorMetrics: Codable, Sendable {
     public let usage: UsageData?
     public let usageMerged: UsageData?
     public let sync: UsageSyncStatus?
+    public let cost: CostData?
     public let collectedAt: TimeInterval
+
+    public init(
+        quotas: [String: ToolQuota], usage: UsageData?, usageMerged: UsageData?,
+        sync: UsageSyncStatus?, cost: CostData? = nil, collectedAt: TimeInterval
+    ) {
+        self.quotas = quotas
+        self.usage = usage
+        self.usageMerged = usageMerged
+        self.sync = sync
+        self.cost = cost
+        self.collectedAt = collectedAt
+    }
 
     public static func path(home: String) -> String {
         (home as NSString).appendingPathComponent(".ai-statusbar/collector-metrics.json")

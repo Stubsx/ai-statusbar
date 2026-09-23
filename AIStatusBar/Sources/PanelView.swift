@@ -17,6 +17,7 @@ struct PanelView: View {
     /// 用量时间范围：today=今日（默认） 7d=近七日 30d=近30日
     @AppStorage("usageRange") private var usageRange = "today"
     @AppStorage("usageBreakdown") private var usageBreakdown = "tools"
+    @AppStorage("usageCurrency") private var usageCurrency = "cny"
     @State private var kimiWebAvailable = false
 
     private var page: PanelPage { PanelPage.restored(tab) }
@@ -227,6 +228,30 @@ struct PanelView: View {
         }
     }
 
+    private var rangeCost: CostEstimate? {
+        let periods = usageScope == "all" && syncAvailable
+            ? store.data?.cost?.merged : store.data?.cost?.local
+        switch usageRange {
+        case "7d": return periods?.weekly
+        case "30d": return periods?.monthly
+        default: return periods?.today
+        }
+    }
+
+    private func dollars(_ amount: Double) -> String {
+        String(format: amount < 0.01 && amount > 0 ? "$%.4f" : "$%.2f", amount)
+    }
+
+    private func yuan(_ amount: Double) -> String {
+        String(format: amount < 0.01 && amount > 0 ? "¥%.4f" : "¥%.2f", amount)
+    }
+
+    private func estimatedCostText(_ amount: Double) -> String {
+        if usageCurrency == "usd" { return dollars(amount) }
+        guard let rate = store.data?.cost?.usdToCny else { return "—" }
+        return yuan(amount * rate)
+    }
+
     private var usageView: some View {
         VStack(alignment: .leading, spacing: 0) {
             if let entries = rangeEntries {
@@ -244,13 +269,22 @@ struct PanelView: View {
                 HStack(spacing: 0) {
                     segmentButton("按工具", tag: "tools", selection: $usageBreakdown)
                     segmentButton("按模型", tag: "models", selection: $usageBreakdown)
+                    Spacer()
+                    if store.settings.priceEstimatesEnabled {
+                        HStack(spacing: 0) {
+                            segmentButton("人民币", tag: "cny", selection: $usageCurrency)
+                            segmentButton("美元", tag: "usd", selection: $usageCurrency)
+                        }
+                    }
                 }.padding(.vertical, 8)
                 Text(rangeSubtitle)
                     .font(.system(size: 9).monospacedDigit())
                     .foregroundColor(.secondary.opacity(0.7))
                     .padding(.top, 3)
                     .padding(.bottom, 5)
-                usageRow("总计", entries.total, bold: true)
+                usageRow("总计", entries.total,
+                         estimatedUSD: rangeCost?.amountUsd,
+                         showEstimate: store.settings.priceEstimatesEnabled)
                 Divider().background(Color.primary.opacity(0.1))
                 // 按工具总用量（输入+缓存+输出）从高到低排序
                 let sortedTools = (usageBreakdown == "models" ? (rangeModels ?? [:]) : entries.tools).sorted { lhs, rhs in
@@ -259,7 +293,10 @@ struct PanelView: View {
                     return l > r
                 }
                 ForEach(sortedTools, id: \.key) { key, e in
-                    usageRow(usageBreakdown == "models" ? key : usageName(key), e, bold: false)
+                    usageRow(
+                        usageBreakdown == "models" ? key : usageName(key), e,
+                        estimatedUSD: usageBreakdown == "models" ? rangeCost?.byModelUsd[key] : nil,
+                        showEstimate: usageBreakdown == "models" && store.settings.priceEstimatesEnabled)
                 }
                 if usageBreakdown == "models" && (rangeModels ?? [:]).isEmpty {
                     Text("此时间范围暂无模型明细").font(.system(size: 11)).foregroundColor(.secondary)
@@ -273,15 +310,25 @@ struct PanelView: View {
         }
     }
 
-    private func usageRow(_ name: String, _ e: UsageEntry, bold: Bool) -> some View {
+    private func usageRow(
+        _ name: String, _ e: UsageEntry,
+        estimatedUSD: Double? = nil, showEstimate: Bool = false
+    ) -> some View {
         HStack {
             Text(name)
-                .font(.system(size: 12, weight: bold ? .semibold : .medium))
-                .foregroundColor(bold ? Color.primary : Color.primary.opacity(0.8))
+                .font(.system(size: 11))
+                .foregroundColor(Color.primary.opacity(0.8))
             Spacer()
-            Text("\(fmt(e.input)) / \(fmt(e.cache)) / \(fmt(e.output))")
-                .font(.system(size: 11, weight: bold ? .semibold : .regular).monospacedDigit())
-                .foregroundColor(bold ? Color.primary.opacity(0.9) : Color.secondary)
+            VStack(alignment: .trailing, spacing: 1) {
+                Text("\(fmt(e.input)) / \(fmt(e.cache)) / \(fmt(e.output))")
+                    .font(.system(size: 11).monospacedDigit())
+                    .foregroundColor(.secondary)
+                if showEstimate {
+                    Text(estimatedUSD.map { estimatedCostText($0) } ?? "—")
+                        .font(.system(size: 10).monospacedDigit())
+                        .foregroundColor(.secondary)
+                }
+            }
         }
         .padding(.vertical, 4)
     }

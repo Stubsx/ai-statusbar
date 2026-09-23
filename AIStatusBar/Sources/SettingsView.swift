@@ -78,6 +78,8 @@ struct SettingsView: View {
                 settingsScroll { welcomeSection }
             case "data":
                 settingsScroll { dataSection; eventInterfaceSection }
+            case "price-details":
+                settingsScroll { priceDetailsPage }
             case "notify":
                 settingsScroll {
                     notifySection
@@ -113,15 +115,16 @@ struct SettingsView: View {
     }
 
     private func tabButton(_ title: String, _ id: String) -> some View {
-        Button(action: { settingsTab = id }) {
+        let selected = settingsTab == id || (id == "data" && settingsTab == "price-details")
+        return Button(action: { settingsTab = id }) {
             Text(title)
-                .font(.system(size: 12.5, weight: settingsTab == id ? .semibold : .regular))
-                .foregroundColor(settingsTab == id ? Color.primary : Color.secondary)
+                .font(.system(size: 12.5, weight: selected ? .semibold : .regular))
+                .foregroundColor(selected ? Color.primary : Color.secondary)
                 .padding(.horizontal, 13)
                 .padding(.vertical, 6)
                 .background(
                     Capsule().fill(
-                        settingsTab == id ? Color.primary.opacity(0.16) : Color.primary.opacity(0.06)
+                        selected ? Color.primary.opacity(0.16) : Color.primary.opacity(0.06)
                     )
                 )
         }
@@ -138,6 +141,7 @@ struct SettingsView: View {
             .padding(.top, 16)
             .padding(.bottom, 20)
         }
+        .frame(maxHeight: .infinity)
     }
 
     private var statusSection: some View {
@@ -296,6 +300,14 @@ struct SettingsView: View {
                 syncDetail
             }
             divider
+            settingRow("预估 API 费用", detail: "按公开单价估算美元和人民币费用") {
+                HStack(spacing: 10) {
+                    Button("详情") { settingsTab = "price-details" }
+                        .controlSize(.small)
+                    toggle($settings.priceEstimatesEnabled)
+                }
+            }
+            divider
             settingRow("会话记录", detail: "本机保留 7 天 / 200 条，显示在各 Harness 下") {
                 Button("清空…") { clearHistoryConfirmation = true }
                     .disabled(store.recentEvents.isEmpty && store.historyError == nil)
@@ -305,6 +317,79 @@ struct SettingsView: View {
                 Button("清空", role: .destructive) { store.clearHistory() }
             } message: {
                 Text("仅清除灵眸本机记录，不影响原工具的对话。运行中和仍在等待的会话会保留，旧事件不会再次推送。")
+            }
+        }
+    }
+
+    private func priceTime(_ timestamp: TimeInterval?) -> String {
+        guard let timestamp, timestamp > 0 else { return "尚未获取" }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MM-dd HH:mm"
+        let time = formatter.string(from: Date(timeIntervalSince1970: timestamp))
+        return Date().timeIntervalSince1970 - timestamp >= 86_400 ? "快照 · \(time)" : time
+    }
+
+    private func priceDetailText(_ value: String) -> some View {
+        Text(value)
+            .font(.system(size: 11))
+            .foregroundColor(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 9)
+    }
+
+    private var priceDetailsPage: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            Button {
+                settingsTab = "data"
+            } label: {
+                Label("返回数据", systemImage: "chevron.left")
+            }
+            .buttonStyle(.plain)
+            .font(.system(size: 12, weight: .medium))
+
+            section("预估 API 费用") {
+                settingRow("模型报价", detail: "OpenRouter 公开模型目录") {
+                    Text(priceTime(store.data?.cost?.priceUpdatedAt))
+                        .font(.system(size: 10).monospacedDigit())
+                        .foregroundColor(.secondary)
+                }
+                divider
+                settingRow("美元兑人民币", detail: store.data?.cost?.exchangeRateDate.map {
+                    "Frankfurter · \($0)"
+                } ?? "Frankfurter 汇率暂不可用") {
+                    Text(store.data?.cost?.usdToCny.map { String(format: "¥%.4f", $0) } ?? "暂不可用")
+                        .font(.system(size: 10).monospacedDigit())
+                        .foregroundColor(.secondary)
+                }
+                if let estimate = store.data?.cost?.local?.today,
+                   estimate.pricedTokens < estimate.totalTokens {
+                    divider
+                    settingRow("今日计价覆盖", detail: "按本机 token 数计算") {
+                        Text("\(Int(Double(estimate.pricedTokens) / Double(estimate.totalTokens) * 100))%")
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(.secondary)
+                    }
+                    if !estimate.unpricedModels.isEmpty {
+                        divider
+                        priceDetailText("未计价模型：\(estimate.unpricedModels.joined(separator: "、"))")
+                    }
+                }
+            }
+
+            section("计算说明") {
+                priceDetailText("按当前 OpenRouter 普通输入、缓存读取和输出 token 单价估算；仅精确匹配模型。未知模型或缺少单价的用量不计价，金额是已计价部分的下界。")
+                divider
+                priceDetailText("人民币按 Frankfurter 最近公布的 USD→CNY 汇率折算。历史用量也按当前报价估算，报价或汇率更新后金额可能变化。")
+                divider
+                priceDetailText("这是 API 标价参考，不代表 Codex、Kimi 等订阅服务的实际账单。")
+            }
+
+            section("数据与隐私") {
+                priceDetailText("报价和汇率分别每 24 小时刷新；失败时沿用已有快照，至少一小时后重试。缺少报价或汇率的金额显示为 —，可切换美元查看已有估算。")
+                divider
+                priceDetailText("网络请求只获取公开报价与汇率，不发送会话、用量或账号令牌。")
             }
         }
     }

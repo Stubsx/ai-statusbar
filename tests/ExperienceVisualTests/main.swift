@@ -617,6 +617,43 @@ func renderExperience() throws {
             assert(defaults.string(forKey: "panelTab") == "status", "Removed pages must restore the unified status page")
         }
     }
+    settings.priceEstimatesEnabled = true
+    let priceStore = StatusStore(
+        collectorPath: nil, settings: settings,
+        storageDirectory: temporary.appendingPathComponent("prices"))
+    let priceFixture = """
+    {"updated_at":"12:00:00","tools":[],
+     "usage":{"date":"2026-09-23","tools":{"codex":{"input":120000,"output":40000,"cache":400000},
+       "hermes":{"input":20000,"output":2000,"cache":60000}},
+       "models":{"gpt-6-sol":{"input":120000,"output":40000,"cache":400000},
+         "未知模型":{"input":20000,"output":2000,"cache":60000}},
+       "total":{"input":140000,"output":42000,"cache":460000}},
+     "cost":{"source":"OpenRouter","price_updated_at":1790128800,
+       "usd_to_cny":6.7001,"exchange_rate_source":"Frankfurter",
+       "exchange_rate_date":"2026-09-22","exchange_rate_updated_at":1790128800,
+       "local":{"today":{"amount_usd":0.72,"priced_tokens":560000,"total_tokens":642000,
+         "by_model_usd":{"gpt-6-sol":0.72},"unpriced_models":["未知模型"]}}}}
+    """
+    priceStore.data = try decoder.decode(StatusData.self, from: Data(priceFixture.utf8))
+    assert(priceStore.data?.cost?.local?.today.unpricedModels == ["未知模型"],
+           "Native status decoding must preserve price coverage and unpriced models")
+    for scheme in [ColorScheme.light, .dark] {
+        for currency in ["cny", "usd"] {
+            let suite = "io.github.stubsx.lingmou.visual.\(UUID().uuidString)"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.set("usage", forKey: "panelTab")
+            defaults.set("models", forKey: "usageBreakdown")
+            defaults.set(currency, forKey: "usageCurrency")
+            let name = "usage-price-" + (currency == "usd" ? "usd-" : "")
+                + (scheme == .light ? "light" : "dark")
+            try save(name,
+                     content: PanelView(store: priceStore).defaultAppStorage(defaults)
+                        .background(scheme == .light ? Color.white : Color(red: 0.09, green: 0.11, blue: 0.16)),
+                     scheme: scheme)
+        }
+    }
+    settings.priceEstimatesEnabled = false
     let overviewStore = StatusStore(collectorPath: nil, settings: settings,
                                    storageDirectory: temporary.appendingPathComponent("overview"))
     let overviewSuite = "io.github.stubsx.lingmou.visual.\(UUID().uuidString)"
@@ -662,6 +699,15 @@ func renderExperience() throws {
                 .defaultAppStorage(defaults).frame(height: 740).background(Color.white), scheme: .light)
         }
     }
+    settings.priceEstimatesEnabled = true
+    let priceDetailsSuite = "io.github.stubsx.lingmou.visual.\(UUID().uuidString)"
+    let priceDetailsDefaults = UserDefaults(suiteName: priceDetailsSuite)!
+    defer { priceDetailsDefaults.removePersistentDomain(forName: priceDetailsSuite) }
+    priceDetailsDefaults.set("price-details", forKey: "settingsTab")
+    try save("settings-price-details", content: SettingsView(
+        store: priceStore, settings: settings, catalog: catalog, maintenance: MaintenanceStore())
+        .defaultAppStorage(priceDetailsDefaults).frame(height: 740).background(Color.white), scheme: .light)
+    settings.priceEstimatesEnabled = false
     settings.experience.privacyMode = true
     try save("privacy-light", content: PanelView(store: store).defaultAppStorage(overviewDefaults)
         .background(Color.white), scheme: .light)

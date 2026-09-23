@@ -47,6 +47,7 @@ final class SettingsStore: ObservableObject {
     /// 用量同步：多设备通过共享目录汇总用量/活跃；空目录 = iCloud Drive 默认目录
     @Published var usageSyncEnabled = false { didSet { save() } }
     @Published var usageSyncDir = "" { didSet { save() } }
+    @Published var priceEstimatesEnabled = false { didSet { save() } }
     /// 用量数字单位：metric=K/M/B，wan=万/亿
     @Published var numberUnit = "metric" { didSet { save() } }
     /// 启动时后台检查一次新版本；发现更新会提醒，安装仍需用户确认
@@ -120,6 +121,7 @@ final class SettingsStore: ObservableObject {
             if let v = s["enabled"] as? Bool { usageSyncEnabled = v }
             if let v = s["dir"] as? String { usageSyncDir = v }
         }
+        if let v = obj["price_estimates_enabled"] as? Bool { priceEstimatesEnabled = v }
         if let v = obj["number_unit"] as? String, ["metric", "wan"].contains(v) { numberUnit = v }
         if let v = obj["auto_update_check"] as? Bool { autoUpdateCheck = v }
         if let value = obj["experience"], let data = try? JSONSerialization.data(withJSONObject: value),
@@ -147,6 +149,7 @@ final class SettingsStore: ObservableObject {
             "kimi_web_tab_reuse": kimiWebTabReuse,
             "kimi_desktop_session_navigation": kimiDesktopSessionNavigation,
             "usage_sync": ["enabled": usageSyncEnabled, "dir": usageSyncDir],
+            "price_estimates_enabled": priceEstimatesEnabled,
             "number_unit": numberUnit,
             "auto_update_check": autoUpdateCheck,
             "experience": (try? JSONSerialization.jsonObject(with: JSONEncoder().encode(experience))) ?? [:],
