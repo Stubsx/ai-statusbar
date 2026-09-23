@@ -485,7 +485,7 @@ struct UsageCollector {
                 """
                 SELECT session_id||'|'||model||'|'||billing_provider||'|'||
                     billing_base_url||'|'||billing_mode||'|'||task AS pk,
-                    input_tokens, output_tokens, cache_read_tokens, first_seen
+                    model, input_tokens, output_tokens, cache_read_tokens, first_seen
                 FROM session_model_usage
                 """)
             let calendar = Calendar.current

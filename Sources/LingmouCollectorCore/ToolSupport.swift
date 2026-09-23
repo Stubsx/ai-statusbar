@@ -67,7 +67,7 @@ public enum ToolSupport {
             state = "not_detected"; message = "尚未发现本地会话数据或运行中的工具"
         } else if !raw.processOn && raw.busy.isEmpty {
             state = "not_running"; message = "已发现本地数据，工具当前未运行"
-        } else if raw.activity == 0 && raw.busy.isEmpty {
+        } else if raw.activity == 0 && raw.busy.isEmpty && raw.latest == nil {
             state = "no_data"; message = "工具已运行，等待首次会话数据"
         } else {
             state = "ready"; message = "本地状态读取正常"

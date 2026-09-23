@@ -1802,6 +1802,36 @@ final class CollectorTests: XCTestCase {
         XCTAssertEqual(collectors.zcode().busy, [BusyItem(id: "sess_test", title: "ZCode 测试")])
     }
 
+    func testHermesUsageKeepsModelNameFromDatabase() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let path = home.appendingPathComponent(".hermes/state.db")
+        try FileManager.default.createDirectory(
+            at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let hermes = try SQLiteDatabase(path: path.path)
+        try hermes.execute("""
+            CREATE TABLE session_model_usage(
+                session_id TEXT, model TEXT, billing_provider TEXT,
+                billing_base_url TEXT, billing_mode TEXT, task TEXT,
+                input_tokens INTEGER, output_tokens INTEGER,
+                cache_read_tokens INTEGER, first_seen REAL)
+            """)
+        try hermes.execute(
+            "INSERT INTO session_model_usage VALUES('session', 'glm-5.3-flash', 'zai', '', '', '', 10, 2, 3, ?)",
+            binds: [.real(now)])
+
+        let collector = UsageCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            files: FileSupport())
+        let first = try XCTUnwrap(collector.collect())
+        let entry = UsageEntry(input: 10, output: 2, cache: 3)
+        XCTAssertEqual(first.tools["hermes"], entry)
+        XCTAssertEqual(first.models?["glm-5.3-flash"], entry)
+        XCTAssertNil(first.models?["未知模型"])
+        XCTAssertEqual(collector.collect()?.models?["glm-5.3-flash"], entry)
+    }
+
     func testHermesTurnLeaseAndActivityHeartbeat() throws {
         let home = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: home) }
@@ -1979,6 +2009,63 @@ final class CollectorTests: XCTestCase {
         XCTAssertEqual(state.busy, [BusyItem(id: "sess_live", title: "(未知任务)")])
         XCTAssertEqual(state.activity, now - 2, accuracy: 0.001)
         XCTAssertTrue(state.activities.isEmpty, "A new turn cannot export a previous completion")
+    }
+
+    func testZcodeUsesPrimarySessionsWhenTaskIndexIsUnreadable() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let index = home.appendingPathComponent(".zcode/v2/tasks-index.sqlite")
+        try write("not a sqlite database", to: index)
+
+        let usage = home.appendingPathComponent(".zcode/cli/db/db.sqlite")
+        try FileManager.default.createDirectory(
+            at: usage.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let database = try SQLiteDatabase(path: usage.path)
+        try database.execute("CREATE TABLE session(id TEXT, title TEXT, time_updated REAL)")
+        try database.execute("INSERT INTO session VALUES('sess_live', '主库中的标题', ?)",
+                             binds: [.real(now * 1_000)])
+        try database.execute(
+            "CREATE TABLE turn_usage(session_id TEXT, turn_id TEXT, status TEXT, started_at REAL, completed_at REAL)")
+        try database.execute("INSERT INTO turn_usage VALUES('sess_live', 'turn', 'running', ?, NULL)",
+                             binds: [.real(now * 1_000)])
+
+        let state = LocalCollectors(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            settings: CollectorSettings(), files: FileSupport(),
+            processes: processSupport(["ZCode"])
+        ).zcode()
+        XCTAssertNil(state.sourceError)
+        XCTAssertEqual(state.busy, [BusyItem(id: "sess_live", title: "主库中的标题")])
+        XCTAssertEqual(state.latest?.title, "主库中的标题")
+
+        try database.execute("UPDATE turn_usage SET status='completed', completed_at=?",
+                             binds: [.real(now * 1_000)])
+        let idleState = LocalCollectors(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            settings: CollectorSettings(), files: FileSupport(),
+            processes: processSupport(["ZCode"])
+        ).zcode()
+        XCTAssertTrue(idleState.busy.isEmpty)
+        XCTAssertEqual(ToolSupport.health(
+            for: "zcode", raw: idleState, quota: nil,
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            settings: CollectorSettings()).state, "ready")
+
+        try database.execute("DROP TABLE turn_usage")
+        let unreadableState = LocalCollectors(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            settings: CollectorSettings(), files: FileSupport(),
+            processes: processSupport(["ZCode"])
+        ).zcode()
+        XCTAssertEqual(unreadableState.sourceError, "会话索引数据库不可读或格式不兼容")
+
+        let offlineState = LocalCollectors(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            settings: CollectorSettings(), files: FileSupport(),
+            processes: processSupport([])
+        ).zcode()
+        XCTAssertNil(offlineState.sourceError, "An app that has exited must not report a transient index error")
     }
 
     func testUsageIncrementalScanDoesNotDoubleCount() throws {

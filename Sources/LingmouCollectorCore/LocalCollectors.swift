@@ -627,10 +627,30 @@ struct LocalCollectors {
                 result.latest = LatestItem(title: title, timestamp: timestamp)
             }
         }
-        else if files.manager.fileExists(atPath: databasePath) {
+        else if result.processOn && files.manager.fileExists(atPath: databasePath) {
             result.sourceError = "会话索引数据库不可读或格式不兼容"
         }
-        if let database = try? SQLiteDatabase(path: environment.path(".zcode", "cli", "db", "db.sqlite"), readOnly: true),
+        let sessionDatabase = try? SQLiteDatabase(
+            path: environment.path(".zcode", "cli", "db", "db.sqlite"), readOnly: true)
+        // The task index is a sidebar projection. If it is being replaced during
+        // an update, the primary session table still has the same IDs and titles.
+        var usedPrimarySessionFallback = false
+        if result.sourceError != nil, let database = sessionDatabase,
+           let columns = try? database.columns(in: "session"),
+           Set(["id", "title", "time_updated"]).isSubset(of: columns),
+           let sessions = try? database.query(
+                "SELECT id, title, time_updated FROM session WHERE id NOT LIKE 'sess_subagent_%'") {
+            for row in sessions {
+                guard let id = row["id"]?.string else { continue }
+                let title = row["title"]?.string?.nonempty ?? "(未知任务)"
+                titles[id] = title
+                if let updated = row["time_updated"]?.double {
+                    updateLatest(&result, title: title, timestamp: updated / 1_000)
+                }
+            }
+            usedPrimarySessionFallback = true
+        }
+        if let database = sessionDatabase,
            let columns = try? database.columns(in: "turn_usage"),
            Set(["session_id", "turn_id", "status", "started_at", "completed_at"]).isSubset(of: columns),
            let rows = try? database.query("""
@@ -640,14 +660,27 @@ struct LocalCollectors {
                   AND NOT EXISTS (SELECT 1 FROM turn_usage newer
                     WHERE newer.session_id = t.session_id AND newer.started_at > t.started_at)
                 """, binds: [.real((environment.now - 86_400) * 1_000)]) {
+            if usedPrimarySessionFallback { result.sourceError = nil }
             let messageColumns = (try? database.columns(in: "message")) ?? []
             let hasMessages = Set(["session_id", "time_created", "data"]).isSubset(of: messageColumns)
-            // A just-submitted user message precedes creation of its running row.
-            // Assistant/metadata writes after completion must not reopen the turn.
+            // A just-submitted user message can precede its running row. Recent
+            // ZCode also stores runtime reminders/compaction as role=user; only
+            // real input may reopen a completed turn, including late anchored writes.
             let onsetQuery = hasMessages ? """
-                SELECT session_id, MAX(time_created) / 1000.0 AS time FROM message
-                WHERE time_created > ? AND json_valid(data) AND json_extract(data, '$.role') = 'user'
-                GROUP BY session_id
+                SELECT m.session_id, MAX(m.time_created) / 1000.0 AS time FROM message m
+                WHERE m.time_created > ? AND CASE WHEN json_valid(m.data) THEN
+                    json_extract(m.data, '$.role') = 'user'
+                    AND COALESCE(json_extract(m.data, '$.synthetic'), 0) = 0
+                    AND COALESCE(json_extract(m.data, '$.visibility'), '') NOT IN ('model-only', 'hidden')
+                    AND COALESCE(json_extract(m.data, '$.semantics.origin'), 'real_user') = 'real_user'
+                    AND COALESCE(json_extract(m.data, '$.semantics.uiVisibility'), '') != 'hidden'
+                    AND NOT EXISTS (SELECT 1 FROM turn_usage ended
+                        WHERE ended.session_id = m.session_id
+                          AND ended.turn_id = json_extract(m.data, '$.anchor.turnId')
+                          AND ended.status IN ('completed', 'error', 'cancelled')
+                          AND ended.completed_at IS NOT NULL)
+                    ELSE 0 END
+                GROUP BY m.session_id
                 """ : """
                 SELECT session_id, MAX(time_updated) / 1000.0 AS time FROM part
                 WHERE time_updated > ? GROUP BY session_id
@@ -658,6 +691,30 @@ struct LocalCollectors {
                 guard let id = row["session_id"]?.string, !id.hasPrefix("sess_subagent_"), let time = row["time"]?.double else { return nil }
                 return (id, time)
             }, uniquingKeysWith: max)
+            // 3.x admits input before creating a message/turn. Queued input only
+            // starts work once promoted; cancelled/discarded/failed input never does.
+            let inputColumns = (try? database.columns(in: "session_input")) ?? []
+            if Set(["session_id", "delivery", "status", "time_created", "time_updated",
+                    "promoted_message_id"]).isSubset(of: inputColumns),
+               hasMessages, messageColumns.contains("id") {
+                let inputs = (try? database.query("""
+                    SELECT i.session_id,
+                        MAX(CASE WHEN i.status = 'promoted' THEN i.time_updated ELSE i.time_created END)
+                            / 1000.0 AS time
+                    FROM session_input i
+                    WHERE (CASE WHEN i.status = 'promoted' THEN i.time_updated ELSE i.time_created END) > ?
+                      AND ((i.status = 'admitted' AND i.delivery = 'startNow')
+                        OR (i.status = 'promoted' AND i.delivery IN ('startNow', 'queue')))
+                      AND NOT EXISTS (SELECT 1 FROM message m WHERE m.id = i.promoted_message_id
+                        AND m.session_id = i.session_id)
+                    GROUP BY i.session_id
+                    """, binds: [.real((environment.now - TimeInterval(settings.busySeconds(for: "zcode"))) * 1_000)])) ?? []
+                for input in inputs {
+                    guard let id = input["session_id"]?.string, !id.hasPrefix("sess_subagent_"),
+                          let time = input["time"]?.double else { continue }
+                    pendingParts[id] = max(pendingParts[id] ?? 0, time)
+                }
+            }
             for row in rows {
                 guard let id = row["session_id"]?.string, let started = row["started_at"]?.double else { continue }
                 let status = row["status"]?.string ?? ""
