@@ -1832,6 +1832,87 @@ final class CollectorTests: XCTestCase {
         XCTAssertEqual(collector.collect()?.models?["glm-5.3-flash"], entry)
     }
 
+    func testHermesLegacyUnknownModelRepairPreservesTotalsAndNewDeltas() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let path = home.appendingPathComponent(".hermes/state.db")
+        try FileManager.default.createDirectory(
+            at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let hermes = try SQLiteDatabase(path: path.path)
+        try hermes.execute("""
+            CREATE TABLE session_model_usage(
+                session_id TEXT, model TEXT, billing_provider TEXT,
+                billing_base_url TEXT, billing_mode TEXT, task TEXT,
+                input_tokens INTEGER, output_tokens INTEGER,
+                cache_read_tokens INTEGER, first_seen REAL, last_seen REAL)
+            """)
+        for (model, task, input) in [("glm-5.3-flash", "", 10), ("kimi-k3", "title_generation", 4)] {
+            try hermes.execute(
+                "INSERT INTO session_model_usage VALUES('session',?,'zai','','',?,?,2,3,?,?)",
+                binds: [.text(model), .text(task), .integer(Int64(input)), .real(now), .real(now)])
+        }
+        let collector = UsageCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now), files: FileSupport())
+        let first = try XCTUnwrap(collector.collect())
+        let database = try SQLiteDatabase(path: home.appendingPathComponent(".ai-statusbar/usage.sqlite").path)
+        // 模拟旧版：每日聚合丢了模型，快照仍保留正确的模型及计数。
+        try database.execute("DELETE FROM daily WHERE tool='hermes'")
+        try database.execute("INSERT INTO daily VALUES(?,'hermes','',14,4,6)",
+                             binds: [.text(DateSupport.localDay(now))])
+        try hermes.execute("UPDATE session_model_usage SET input_tokens=12 WHERE model='glm-5.3-flash'")
+
+        let repaired = try XCTUnwrap(collector.collect())
+        XCTAssertNil(repaired.models?["未知模型"])
+        XCTAssertEqual(repaired.models?["glm-5.3-flash"], UsageEntry(input: 12, output: 2, cache: 3))
+        XCTAssertEqual(repaired.models?["kimi-k3"], UsageEntry(input: 4, output: 2, cache: 3))
+        XCTAssertEqual(repaired.total, UsageEntry(input: first.total.input + 2, output: 4, cache: 6))
+        XCTAssertEqual(collector.collect()?.total, repaired.total, "重复采集不能双计修复或新增量")
+    }
+
+    func testHermesLegacyUnknownModelRepairLeavesAmbiguousDaysUnchanged() throws {
+        for scenario in ["mismatched-counts", "cross-day", "mixed-known", "missing-timestamp", "missing-model"] {
+            let home = try temporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: home) }
+            let now: TimeInterval = 2_000_000_000
+            let path = home.appendingPathComponent(".hermes/state.db")
+            try FileManager.default.createDirectory(
+                at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let hermes = try SQLiteDatabase(path: path.path)
+            try hermes.execute("""
+                CREATE TABLE session_model_usage(
+                    session_id TEXT, model TEXT, billing_provider TEXT,
+                    billing_base_url TEXT, billing_mode TEXT, task TEXT,
+                    input_tokens INTEGER, output_tokens INTEGER,
+                    cache_read_tokens INTEGER, first_seen REAL, last_seen REAL)
+                """)
+            try hermes.execute(
+                "INSERT INTO session_model_usage VALUES('session','glm-5.3-flash','zai','','','',10,2,3,?,?)",
+                binds: [.real(now), .real(now)])
+            let collector = UsageCollector(
+                environment: CollectorEnvironment(homeDirectory: home.path, now: now), files: FileSupport())
+            _ = collector.collect()
+            let database = try SQLiteDatabase(path: home.appendingPathComponent(".ai-statusbar/usage.sqlite").path)
+            if scenario != "mixed-known" {
+                try database.execute("DELETE FROM daily WHERE tool='hermes'")
+            }
+            let input = scenario == "mismatched-counts" ? 9 : 10
+            try database.execute("INSERT INTO daily VALUES(?,'hermes','',?,2,3)",
+                                 binds: [.text(DateSupport.localDay(now)), .integer(Int64(input))])
+            if scenario == "cross-day" {
+                try hermes.execute("UPDATE session_model_usage SET first_seen=?", binds: [.real(now - 86_400)])
+            } else if scenario == "missing-timestamp" {
+                try hermes.execute("UPDATE session_model_usage SET last_seen=NULL")
+            } else if scenario == "missing-model" {
+                try hermes.execute("UPDATE session_model_usage SET model=''")
+                try database.execute("UPDATE hermes_snap SET pk='session||zai|||'")
+            }
+            let unchanged = try XCTUnwrap(collector.collect())
+            XCTAssertEqual(unchanged.models?["未知模型"], UsageEntry(input: input, output: 2, cache: 3), scenario)
+            XCTAssertEqual(collector.collect()?.total, unchanged.total, scenario)
+        }
+    }
+
     func testHermesTurnLeaseAndActivityHeartbeat() throws {
         let home = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: home) }

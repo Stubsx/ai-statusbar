@@ -481,13 +481,16 @@ struct UsageCollector {
                 """)
             let hermes = try SQLiteDatabase(
                 path: environment.path(".hermes", "state.db"), readOnly: true)
+            let lastSeenColumn = try hermes.columns(in: "session_model_usage").contains("last_seen")
+                ? "last_seen" : "NULL AS last_seen"
             let rows = try hermes.query(
                 """
                 SELECT session_id||'|'||model||'|'||billing_provider||'|'||
                     billing_base_url||'|'||billing_mode||'|'||task AS pk,
-                    model, input_tokens, output_tokens, cache_read_tokens, first_seen
+                    model, input_tokens, output_tokens, cache_read_tokens, first_seen, \(lastSeenColumn)
                 FROM session_model_usage
                 """)
+            try repairHermesModelAttribution(rows: rows, database: database)
             let calendar = Calendar.current
             let todayStart = calendar.startOfDay(for: Date(timeIntervalSince1970: environment.now))
                 .timeIntervalSince1970
@@ -531,6 +534,72 @@ struct UsageCollector {
             }
         } catch {
             return
+        }
+    }
+
+    /// 旧版 SELECT 漏掉 model，但快照主键保留了模型。仅当已入账快照全部发生在
+    /// 同一天、且与该日未知桶逐项完全一致时回填；跨日累计值无法还原逐日归属。
+    /// 使用采集前快照，避免把尚未入账的新增量混入修复；不重扫、不修改总量。
+    private func repairHermesModelAttribution(
+        rows: [[String: SQLiteValue]], database: SQLiteDatabase
+    ) throws {
+        let unknown = try database.query(
+            "SELECT date, input, output, cache FROM daily WHERE tool='hermes' AND model=''")
+        guard !unknown.isEmpty else { return }
+        let snapshots = Dictionary(uniqueKeysWithValues: try database.query(
+            "SELECT pk, input, output, cache FROM hermes_snap"
+        ).compactMap { row -> (String, UsageEntry)? in
+            guard let key = row["pk"]?.string else { return nil }
+            return (key, UsageEntry(
+                input: row["input"]?.int ?? 0, output: row["output"]?.int ?? 0,
+                cache: row["cache"]?.int ?? 0))
+        })
+        for row in unknown {
+            guard let day = row["date"]?.string else { continue }
+            // 混合新旧归类的日期缺少逐条来源，保留原值，避免将已知模型重复入账。
+            guard try database.query(
+                "SELECT model FROM daily WHERE date=? AND tool='hermes' AND model<>''",
+                binds: [.text(day)]).isEmpty else { continue }
+            var byModel: [String: UsageEntry] = [:]
+            var ambiguous = false
+            for source in rows {
+                guard let key = source["pk"]?.string, let usage = snapshots[key],
+                    usage.input > 0 || usage.output > 0 || usage.cache > 0
+                else { continue }
+                guard let first = source["first_seen"]?.double,
+                    let last = source["last_seen"]?.double, first > 0, last >= first
+                else { ambiguous = true; break }
+                let firstDay = DateSupport.localDay(first)
+                let lastDay = DateSupport.localDay(last)
+                guard firstDay <= day, day <= lastDay else { continue }
+                let model = source["model"]?.string ?? ""
+                guard firstDay == day, lastDay == day,
+                    !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                else { ambiguous = true; break }
+                byModel[model, default: UsageEntry()].add(usage)
+            }
+            var total = UsageEntry()
+            for usage in byModel.values { total.add(usage) }
+            let original = UsageEntry(
+                input: row["input"]?.int ?? 0, output: row["output"]?.int ?? 0,
+                cache: row["cache"]?.int ?? 0)
+            guard !ambiguous, !byModel.isEmpty, total == original else { continue }
+            try database.execute("BEGIN IMMEDIATE")
+            do {
+                for (model, usage) in byModel {
+                    try database.execute(
+                        "INSERT INTO daily(date,tool,model,input,output,cache) VALUES(?,'hermes',?,?,?,?)",
+                        binds: [.text(day), .text(model), .integer(Int64(usage.input)),
+                                .integer(Int64(usage.output)), .integer(Int64(usage.cache))])
+                }
+                try database.execute(
+                    "DELETE FROM daily WHERE date=? AND tool='hermes' AND model=''",
+                    binds: [.text(day)])
+                try database.execute("COMMIT")
+            } catch {
+                try? database.execute("ROLLBACK")
+                throw error
+            }
         }
     }
 
