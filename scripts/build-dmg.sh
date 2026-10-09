@@ -4,9 +4,9 @@ set -euo pipefail
 ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 cd "$ROOT"
 source "$ROOT/scripts/xcode-env.sh"
+source "$ROOT/scripts/signing-env.sh"
 
 # 先校验发布参数，避免配置错误时已经生成 DMG 或清理历史产物。
-SIGN_IDENTITY="${SIGN_IDENTITY:-}"
 if [[ -n "${NOTARY_PROFILE:-}" && "$SIGN_IDENTITY" != "Developer ID Application:"* ]]; then
   echo "错误：使用 NOTARY_PROFILE 公证时必须同时指定 Developer ID Application 签名身份" >&2
   exit 1

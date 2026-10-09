@@ -38,6 +38,6 @@ fi
 rm -rf "${INSTALLED_APP}"
 cp -R "$SRC_APP" "${INSTALLED_APP}"
 
-# 4) 启动新版本（同 bundle id + 同 Lingmou Local 签名身份 → TCC 授权延续）
+# 4) 启动新版本（同 bundle id + 同签名身份 → TCC 授权延续）
 open "${INSTALLED_APP}"
 echo "✅ 已安装并启动: ${INSTALLED_APP}"

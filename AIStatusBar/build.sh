@@ -4,6 +4,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../scripts/xcode-env.sh"
+source "$SCRIPT_DIR/../scripts/signing-env.sh"
 cd "$SCRIPT_DIR"
 APP="灵眸.app"  # 产物名与 release/安装版一致，避免本地出现英文 AIStatusBar.app 与授权列表名不一致
 
@@ -82,12 +83,11 @@ fi
     -c "Set :CFBundleVersion ${BUILD_NUMBER}" \
     "$APP/Contents/Info.plist"
 
-# 固定自签名（Lingmou Local）：签名身份跨构建稳定，TCC 授权（录屏/通知）不会随重建失效。
+# 签名身份来自环境变量或本机配置；未配置时使用 Lingmou Local。
 # 注意：TCC 授权跟随签名证书哈希。ad-hoc 或换了证书的构建会被系统当成新 app，
 # 首次运行会重新请求录屏授权——本地构建、下载安装的 release 签名不同时就各自要授权一次。
-SIGN_IDENTITY="${SIGN_IDENTITY:-Lingmou Local}"
 if [[ "$SIGN_IDENTITY" == "Developer ID Application:"* ]]; then
-  if ! security find-identity -p codesigning | grep -Fq "$SIGN_IDENTITY"; then
+  if ! security find-identity -v -p codesigning | grep -Fq "$SIGN_IDENTITY"; then
     echo "错误：未找到指定的 Developer ID 签名身份：$SIGN_IDENTITY" >&2
     exit 1
   fi

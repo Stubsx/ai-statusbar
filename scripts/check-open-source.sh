@@ -17,7 +17,7 @@ test -s LICENSE
 test -s PRIVACY.md
 swiftc -typecheck -target arm64-apple-macosx12.0 AIStatusBar/Sources/*.swift Sources/LingmouCollectorCore/ActivityModels.swift Sources/LingmouCollectorCore/EventFeed.swift Sources/LingmouCollectorCore/KimiWebNavigation.swift
 /bin/bash -n AIStatusBar/build.sh scripts/build-dmg.sh scripts/install-local.sh scripts/release.sh \
-  scripts/xcode-env.sh scripts/with-xcode.sh
+  scripts/xcode-env.sh scripts/signing-env.sh scripts/with-xcode.sh
 /bin/bash -n scripts/test-busy-sessions.sh scripts/test-experience.sh scripts/test-kimi-desktop-navigation.sh
 /bin/bash -n swiftbar-plugins/ai-cli-status.10s.sh
 

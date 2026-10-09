@@ -89,6 +89,8 @@ bash scripts/test-experience-visuals.sh
 
 本地构建默认用自签名身份 `Lingmou Local` 签名，系统授权（录屏/通知）跟随该证书跨构建保留。多台机器协作时请共用同一张证书：在主力构建机导出 `.p12`，其他机器执行 `./scripts/import-signing-identity.sh lingmou-local.p12` 导入，避免各机器各签各的导致授权反复失效。
 
+本机已安装有效的 Apple 开发者证书时，可把 `security find-identity -v -p codesigning` 列出的完整 `Developer ID Application: ...` 名称写入 `~/.ai-statusbar/signing-identity`（单行纯文本）。本地安装、App 构建和 DMG 发布共用该配置；显式 `SIGN_IDENTITY` 环境变量优先。个人证书名称只保存在本机，不写入仓库。Developer ID 构建启用 Hardened Runtime 和安全时间戳，证书不可用时直接报错；Apple 公证仍需另设 `NOTARY_PROFILE`。
+
 ## 版本与发布
 
 App 的公开版本号来自最近的 `vX.Y.Z` tag，普通 commit 只更新内部构建号，不会改变用户看到的版本。每次发布必须先提交 `docs/releases/<tag>.md`，说明相对上一个正式版本的新增、优化和修复，不重复完整功能列表。规范见 [版本发布规范](docs/RELEASING.md)。维护者在 `main` 已推送且 CI 通过后执行：
@@ -97,7 +99,7 @@ App 的公开版本号来自最近的 `vX.Y.Z` tag，普通 commit 只更新内�
 ./scripts/release.sh v1.3.2
 ```
 
-脚本会校验版本说明，构建 DMG、推送 annotated tag，并创建附带更新正文和 SHA-256 校验文件的 GitHub Release。默认使用稳定的 `Lingmou Local` 自签名身份；需要 Developer ID 签名和 Apple 公证时，另外设置 `SIGN_IDENTITY` 与 `NOTARY_PROFILE`。
+脚本会校验版本说明，构建 DMG、推送 annotated tag，并创建附带更新正文和 SHA-256 校验文件的 GitHub Release。签名身份优先读取 `SIGN_IDENTITY`，其次读取本机 `~/.ai-statusbar/signing-identity`，均未配置时使用 `Lingmou Local`；需要 Apple 公证时另设 `NOTARY_PROFILE`。
 
 ## 卸载
 

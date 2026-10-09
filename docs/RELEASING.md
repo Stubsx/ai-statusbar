@@ -25,7 +25,7 @@
 
 - 完成相关测试和 [公开发布检查清单](../OPEN_SOURCE_CHECKLIST.md)，将代码及版本说明提交并推送到 `main`，确认 CI 通过。
 - 执行 `./scripts/release.sh vX.Y.Z`。脚本要求已提交的更新说明至少包含一条更新条目，再运行开源检查、构建 DMG、生成 SHA-256 文件、推送 annotated tag，并通过 `--notes-file` 写入正文。不得用 `--generate-notes` 代替人工整理的版本差异说明。
-- 默认使用稳定的 `Lingmou Local` 自签名身份。Developer ID 和 Apple 公证是可选配置；启用时传入 `SIGN_IDENTITY` 和 `NOTARY_PROFILE`，按实际产物描述签名与公证状态。
+- App、DMG 和本地安装共用签名配置：`SIGN_IDENTITY` 环境变量优先，其次是本机 `~/.ai-statusbar/signing-identity` 中的完整证书名称，未配置时使用 `Lingmou Local`。Developer ID 构建启用 Hardened Runtime 和安全时间戳；Apple 公证需另设 `NOTARY_PROFILE`。按实际产物描述签名与公证状态。
 - 发布后按上述要求回读验证，并运行 `./scripts/install-local.sh`，让本机安装版也使用刚发布的版本号。
 
 ## 补充历史说明
