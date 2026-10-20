@@ -8,7 +8,8 @@ import UserNotifications
 
 final class SettingsStore: ObservableObject {
     static let tools = [("codex", "Codex"), ("kimi", "Kimi Code"), ("kimi-work", "Kimi Work"),
-                        ("claude", "Claude Code"), ("hermes", "Hermes"), ("zcode", "ZCode"),
+                        ("claude", "Claude Code"), ("claude-desktop", "Claude Desktop"),
+                        ("hermes", "Hermes"), ("zcode", "ZCode"),
                         ("dsh", "DSH")]
     static let busyOptions = [60, 180, 300, 600, 900, 1800]
     static let offlineOptions: [(String, Int)] = [("1 小时", 3600), ("2 小时", 7200), ("3 小时", 10800),

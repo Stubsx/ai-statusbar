@@ -66,6 +66,7 @@ public final class LingmouCollector {
         let kimi = measured("kimi") { local.kimi() }
         let kimiWork = measured("kimiWork") { local.kimiWork() }
         let claude = measured("claude") { local.claude() }
+        let claudeDesktop = measured("claudeDesktop") { local.claudeDesktop() }
         let hermes = measured("hermes") { local.hermes() }
         let zcode = measured("zcode") { local.zcode() }
         let dsh = measured("dsh") { local.dsh() }
@@ -85,6 +86,9 @@ public final class LingmouCollector {
                 key: "kimi-work", letter: "W", name: "Kimi Work", raw: kimiWork,
                 quota: quota["kimi-work"] ?? nil),
             makeTool(key: "claude", letter: "L", name: "Claude Code", raw: claude, quota: nil),
+            makeTool(
+                key: "claude-desktop", letter: "A", name: "Claude Desktop",
+                raw: claudeDesktop, quota: nil),
             makeTool(key: "hermes", letter: "H", name: "Hermes", raw: hermes, quota: nil),
             makeTool(
                 key: "zcode", letter: "Z", name: "ZCode", raw: zcode, quota: quota["zcode"] ?? nil),
@@ -142,7 +146,7 @@ public final class LingmouCollector {
             output.append("---")
         }
         output.append(
-            "C=Codex App  X=Codex CLI  K=Kimi Code  W=Kimi Work  L=Claude  H=Hermes  Z=ZCode  D=DSH | size=10 color=gray"
+            "C=Codex App  X=Codex CLI  K=Kimi Code  W=Kimi Work  L=Claude  A=Claude Desktop  H=Hermes  Z=ZCode  D=DSH | size=10 color=gray"
         )
         output.append("🟢工作中  🟡空闲  ⚪️未运行 | size=10 color=gray")
         output.append("刷新 | refresh=true")

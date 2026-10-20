@@ -36,7 +36,7 @@ enum NotificationRouter {
     }
 
     static func supportsApplicationNavigation(forToolKey key: String) -> Bool {
-        ["codex-ide", "codex-cli", "kimi", "kimi-work", "claude", "hermes", "zcode", "dsh"].contains(key)
+        ["codex-ide", "codex-cli", "kimi", "kimi-work", "claude", "claude-desktop", "hermes", "zcode", "dsh"].contains(key)
     }
 
     static func destinationLabel(forToolKey key: String, sessionId: String? = nil) -> String {
@@ -55,6 +55,7 @@ enum NotificationRouter {
             }
             return sessionId == nil ? "打开 Kimi 网页或宿主" : "打开对应 Kimi 会话或宿主"
         case "codex-cli", "claude": return "打开宿主终端或编辑器"
+        case "claude-desktop": return "打开 Claude 应用"
         case "dsh": return "打开 DSH 页面"
         default: return "暂不支持自动打开"
         }
@@ -88,7 +89,10 @@ enum NotificationRouter {
                 openApplication(bundleID: "dev.zcode.app", path: "/Applications/ZCode.app")
             case "codex-cli": _ = openHost(of: "codex", excluding: hostedCodexMarks)
             case "kimi": openKimi(sessionId: sessionId)
-            case "claude": _ = openHost(of: "claude", excluding: ["Claude.app/"])
+            case "claude": _ = openHost(of: "claude", excluding: ["Claude.app/", "/claude-code/"])
+            case "claude-desktop":
+                if activateRunningApp(bundleID: "com.anthropic.claudefordesktop", named: ["Claude"]) { return }
+                openApplication(bundleID: "com.anthropic.claudefordesktop", path: "/Applications/Claude.app")
             case "hermes":
                 // named 兜底必须留空：/Applications/Hermes.app 是同名安装器，不是桌面端。
                 if activateRunningApp(bundleID: "com.nousresearch.hermes", named: []) { return }

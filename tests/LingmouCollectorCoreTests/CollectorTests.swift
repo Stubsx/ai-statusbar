@@ -86,8 +86,12 @@ final class CollectorTests: XCTestCase {
             JSONSerialization.jsonObject(with: collector.jsonData()) as? [String: Any])
         XCTAssertNotNil(object["updated_at"])
         let tools = try XCTUnwrap(object["tools"] as? [[String: Any]])
-        XCTAssertEqual(tools.count, 8)
+        XCTAssertEqual(tools.count, 9)
         XCTAssertNotNil(tools[0]["busy_count"])
+        XCTAssertEqual(
+            tools.compactMap { $0["key"] as? String },
+            ["codex-ide", "codex-cli", "kimi", "kimi-work", "claude", "claude-desktop",
+             "hermes", "zcode", "dsh"])
     }
 
     func testPrivateJSONPermissions() throws {
@@ -1464,6 +1468,114 @@ final class CollectorTests: XCTestCase {
         try touch(claude, at: now)
         XCTAssertTrue(collectors.kimi().busy.isEmpty)
         XCTAssertTrue(collectors.claude().busy.isEmpty)
+    }
+
+    func testClaudeDesktopBusyEndedAndLatest() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let startedMs = 1_999_999_400_000
+        // 桌面忙碌会话（hostSessionId 关联）、刚转 idle 的桌面会话（entrypoint 识别）、
+        // 终端 CLI 会话（两者皆无，必须排除）。
+        try write(
+            """
+            {"pid":123,"sessionId":"cli-1","hostSessionId":"local_1",\
+            "entrypoint":"claude-desktop-3p","name":"桌面忙碌会话","status":"busy",\
+            "updatedAt":1999999940000,"statusUpdatedAt":1999999940000,"startedAt":\(startedMs)}
+            """, to: home.appendingPathComponent(".claude/sessions/123.json"))
+        try write(
+            """
+            {"pid":124,"sessionId":"cli-2","hostSessionId":"local_2",\
+            "entrypoint":"claude-desktop-3p","name":"桌面结束会话","status":"idle",\
+            "updatedAt":1999999940000,"statusUpdatedAt":1999999940000,"startedAt":\(startedMs)}
+            """, to: home.appendingPathComponent(".claude/sessions/124.json"))
+        try write(
+            """
+            {"pid":125,"sessionId":"cli-3","entrypoint":"cli","name":"终端会话",\
+            "status":"busy","updatedAt":1999999940000,"startedAt":\(startedMs)}
+            """, to: home.appendingPathComponent(".claude/sessions/125.json"))
+        // 会话记录提供含已退出会话的最近标题；已归档的不参与。
+        let records = "Library/Application Support/Claude-3p/claude-code-sessions/profile/install"
+        try write(
+            """
+            {"sessionId":"local_9","title":"历史会话","isArchived":false,\
+            "lastActivityAt":1999999970000,"cwd":"/tmp/proj"}
+            """, to: home.appendingPathComponent("\(records)/local_9.json"))
+        try write(
+            """
+            {"sessionId":"local_8","title":"已归档会话","isArchived":true,\
+            "lastActivityAt":1999999990000,"cwd":"/tmp/old"}
+            """, to: home.appendingPathComponent("\(records)/local_8.json"))
+        let processes = processSupport(["Claude"])
+        processes.identityOverride = { pid in
+            switch pid {
+            case 123, 124:
+                return ("/tmp/claude-hosts/claude-code/2.1.295/abc/claude.app/Contents/MacOS/claude",
+                        now - 600)
+            case 125:
+                return ("/usr/local/bin/claude", now - 600)
+            default:
+                return nil
+            }
+        }
+        let collectors = LocalCollectors(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            settings: CollectorSettings(), files: FileSupport(), processes: processes)
+        let state = collectors.claudeDesktop()
+        XCTAssertEqual(state.busy.map(\.id), ["local_1"])
+        XCTAssertEqual(state.busy.first?.title, "桌面忙碌会话")
+        XCTAssertEqual(
+            state.activities.map { [$0.sessionId, $0.phase] }, [["local_2", "ended"]])
+        XCTAssertEqual(state.latest?.title, "历史会话")
+        XCTAssertTrue(state.processOn)
+        // 登记文件损坏时报源错误但不影响其他会话。
+        try write("not json", to: home.appendingPathComponent(".claude/sessions/126.json"))
+        XCTAssertEqual(collectors.claudeDesktop().sourceError, "部分会话登记不可读或格式不兼容")
+    }
+
+    func testClaudeCLIExcludesDesktopHostedProcesses() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let processes = ProcessSupport { executable, _, _ in
+            guard executable == "/bin/ps" else { return "" }
+            return """
+                /usr/local/bin/claude
+                /tmp/claude-hosts/claude-code/2.1.295/abc/claude.app/Contents/MacOS/claude
+                /Applications/Claude.app/Contents/MacOS/Claude
+                """
+        }
+        let collectors = LocalCollectors(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: 2_000_000_000),
+            settings: CollectorSettings(), files: FileSupport(), processes: processes)
+        XCTAssertEqual(collectors.claude().detail, "1 个进程")
+    }
+
+    func testClaudeSkipsDesktopTranscripts() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let desktop = home.appendingPathComponent(".claude/projects/project/desk.jsonl")
+        let terminal = home.appendingPathComponent(".claude/projects/project/term.jsonl")
+        try write(
+            "{\"type\":\"user\",\"entrypoint\":\"claude-desktop-3p\",\"message\":{\"content\":\"开始\"}}\n",
+            to: desktop)
+        try write("{\"type\":\"user\",\"message\":{\"content\":\"开始\"}}\n", to: terminal)
+        try touch(desktop, at: now)
+        try touch(terminal, at: now)
+        let collectors = LocalCollectors(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            settings: CollectorSettings(), files: FileSupport(),
+            processes: processSupport(["claude"]))
+        // 桌面会话的转写由 claudeDesktop() 上报，终端会话不受影响。
+        XCTAssertEqual(collectors.claude().busy.map(\.id), ["term"])
+        // 之后在终端恢复的会话，末条 entrypoint 不再是桌面，仍归本组。
+        try write(
+            """
+            {"type":"user","entrypoint":"claude-desktop-3p","message":{"content":"开始"}}
+            {"type":"user","entrypoint":"cli","message":{"content":"继续"}}
+            """ + "\n", to: desktop)
+        try touch(desktop, at: now)
+        XCTAssertEqual(collectors.claude().busy.map(\.id).sorted(), ["desk", "term"])
     }
 
     private func dshProjcache(openStep: String, pendingCalls: String = "{}") -> String {

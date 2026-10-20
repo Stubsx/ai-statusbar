@@ -9,6 +9,9 @@ public enum ToolSupport {
                                     quota: true, navigation: key == "codex-cli" ? "host" : "application")
         case "claude":
             return ToolCapabilities(eventPhases: ["ended"], navigation: "host")
+        case "claude-desktop":
+            // token 用量与 Claude Code 同源（~/.claude/projects），不再单独展示。
+            return ToolCapabilities(eventPhases: ["ended"], usage: false)
         case "zcode":
             return ToolCapabilities(eventPhases: ["ended", "interrupted"], quota: true)
         case "kimi":
@@ -30,6 +33,11 @@ public enum ToolSupport {
         case "kimi": return environment.path(".kimi-code", "sessions")
         case "kimi-work": return environment.path("Library", "Application Support", "kimi-desktop")
         case "claude": return environment.path(".claude", "projects")
+        case "claude-desktop":
+            let thirdParty = environment.path(
+                "Library", "Application Support", "Claude-3p", "claude-code-sessions")
+            if FileManager.default.fileExists(atPath: thirdParty) { return thirdParty }
+            return environment.path("Library", "Application Support", "Claude")
         case "hermes": return environment.path(".hermes", "state.db")
         case "zcode": return environment.path(".zcode")
         case "dsh": return environment.path(".dsh")

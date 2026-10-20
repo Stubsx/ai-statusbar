@@ -197,7 +197,9 @@ struct LocalCollectors {
     }
 
     func claude() -> RawToolState {
-        let count = processes.count(named: "claude", excluding: ["Claude.app/"])
+        // 桌面版托管的 CLI 位于 Application Support/Claude*/claude-code/ 下，
+        // 其会话由 claudeDesktop() 上报，这里排除避免同一会话双份忙碌。
+        let count = processes.count(named: "claude", excluding: ["Claude.app/", "/claude-code/"])
         var result = RawToolState(processOn: count > 0, detail: "\(count) 个进程")
         let root = environment.path(".claude", "projects")
         let window = TimeInterval(max(settings.busySeconds(for: "claude"), 1_800))
@@ -216,6 +218,13 @@ struct LocalCollectors {
                 continue
             }
             let text = files.readTail(path, bytes: 1 << 20)
+            // 桌面版会话的转写同样落在 ~/.claude/projects，其忙碌/结束/最近
+            // 全部由 claudeDesktop() 上报；以尾部最后一条 entrypoint 判定当前
+            // 宿主并跳过桌面会话，避免同一回合重复出现（之后在终端恢复的
+            // 会话末条 entrypoint 不再是桌面，仍归本组）。
+            let entrypointMarker = "\"entrypoint\":\""
+            if let range = text.range(of: entrypointMarker, options: .backwards),
+                text[range.upperBound...].hasPrefix("claude-desktop") { continue }
             if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                !text.split(whereSeparator: \.isNewline).contains(where: { JSONValue.object(from: String($0)) != nil }) {
                 result.sourceError = "部分会话日志格式不兼容"
@@ -268,6 +277,82 @@ struct LocalCollectors {
                         id: URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent,
                         title: title)
                 )
+            }
+        }
+        return result
+    }
+
+    /// Claude 桌面版：应用在线状态 + Code 标签页会话。
+    /// 每个桌面会话进程在 ~/.claude/sessions/<pid>.json 实时登记 busy/idle
+    /// （hostSessionId / claude-desktop entrypoint 与终端 CLI 区分），PID 与启动时间
+    /// 核验用于清理崩溃残留；claude-code-sessions 下的 local_*.json 提供含已退出
+    /// 会话在内的标题与最近活动。普通聊天页没有可靠的本地忙碌信号，不据此判忙。
+    func claudeDesktop() -> RawToolState {
+        let appOn = processes.isAppRunning(executableName: "Claude")
+        var result = RawToolState(processOn: appOn, detail: appOn ? "App 在线" : "无进程")
+        var liveSessions = 0
+        for path in files.files(atDepth: 1, under: environment.path(".claude", "sessions"),
+                                where: { $0.hasSuffix(".json") }) {
+            guard let record = files.read(path).flatMap(JSONValue.object) else {
+                result.sourceError = "部分会话登记不可读或格式不兼容"
+                continue
+            }
+            let hostId = JSONValue.string(record["hostSessionId"])
+            let entrypoint = JSONValue.string(record["entrypoint"]) ?? ""
+            guard hostId != nil || entrypoint.hasPrefix("claude-desktop"),
+                let rawPID = JSONValue.double(record["pid"]), rawPID > 0,
+                let pid = Int32(exactly: rawPID),
+                let identity = processes.identity(pid: pid),
+                URL(fileURLWithPath: identity.path).lastPathComponent == "claude"
+            else { continue }
+            if let started = JSONValue.double(record["startedAt"]),
+                abs(identity.startedAt - started / 1_000) > 5
+            { continue }
+            liveSessions += 1
+            let id =
+                hostId ?? JSONValue.string(record["sessionId"])
+                ?? URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+            let name = JSONValue.string(record["name"]).flatMap { $0.isEmpty ? nil : $0 }
+            let updatedAt = (JSONValue.double(record["updatedAt"]) ?? 0) / 1_000
+            if let name, updatedAt > 0 {
+                updateLatest(&result, title: name, timestamp: updatedAt, sessionId: id)
+            }
+            if JSONValue.string(record["status"]) == "busy" {
+                result.busy.append(BusyItem(id: id, title: name ?? "(未命名会话)"))
+            } else if let name {
+                // 状态由 busy 转 idle 即一轮结束；statusUpdatedAt 只在转换时推进，
+                // 同一轮结束只产生一条记录，全新空会话没有名称不会误报。
+                let statusAt = (JSONValue.double(record["statusUpdatedAt"])
+                    ?? JSONValue.double(record["updatedAt"]) ?? 0) / 1_000
+                if statusAt > 0, environment.now - statusAt <= 1_800 {
+                    result.activities.append(TaskActivity(
+                        id: "\(id):ended:\(statusAt)", sessionId: id, title: name,
+                        phase: "ended", updatedAt: statusAt))
+                }
+            }
+        }
+        result.processOn = appOn || liveSessions > 0
+        if !appOn, liveSessions > 0 { result.detail = "\(liveSessions) 个会话" }
+        // 会话记录（含已退出会话）提供标题与最近活动；已归档的不参与展示。
+        // 官方与第三方登录配置目录（Claude / Claude-3p）都扫描。
+        for variant in ["Claude-3p", "Claude"] {
+            let root = environment.path(
+                "Library", "Application Support", variant, "claude-code-sessions")
+            for path in files.files(atDepth: 3, under: root, where: {
+                let file = URL(fileURLWithPath: $0).lastPathComponent
+                return file.hasPrefix("local_") && file.hasSuffix(".json")
+            }) {
+                guard let record = files.read(path).flatMap(JSONValue.object),
+                    JSONValue.bool(record["isArchived"]) != true,
+                    let activity = JSONValue.double(record["lastActivityAt"]), activity > 0
+                else { continue }
+                let title =
+                    JSONValue.string(record["title"]).flatMap { $0.isEmpty ? nil : $0 }
+                    ?? JSONValue.string(record["cwd"]).flatMap {
+                        URL(fileURLWithPath: $0).lastPathComponent.nonempty
+                    } ?? "(未命名会话)"
+                updateLatest(&result, title: title, timestamp: activity / 1_000,
+                             sessionId: JSONValue.string(record["sessionId"]))
             }
         }
         return result

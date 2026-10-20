@@ -8,6 +8,7 @@
 | --- | --- | --- | --- | --- | --- |
 | Codex App / CLI | task_complete | turn_aborted | 未返回 request_user_input | 暂不支持 | App 本地对话深链 / CLI 宿主终端或编辑器 |
 | Claude Code | assistant.stop_reason=end_turn | 暂不支持 | 暂不支持 | 暂不支持 | 宿主终端或编辑器 |
+| Claude Desktop | Code 会话登记 status 由 busy 转 idle（仅限已有名称的会话） | 暂不支持 | 暂不支持 | 暂不支持 | App |
 | ZCode | turn_usage.status=completed | error / cancelled | 暂不支持 | 暂不支持 | App，CLI 宿主兜底 |
 | Kimi Code | 主代理 step.end.finishReason=end_turn，且无未闭合子代理 | 暂不支持 | 暂不支持 | 暂不支持 | 优先 Kimi Code App（应用内选择会话）；回退 Web 会话 / 宿主 |
 | Kimi Work | 同 Kimi Code | 暂不支持 | 暂不支持 | 暂不支持 | App |
@@ -27,6 +28,8 @@ Kimi Code 的任务与最近任务携带会话 ID。回退网页时在后台读�
 Kimi Code 桌面版按 `Kimi Code.app` 的主程序完整可执行文件后缀识别在线状态，不要求另有 `kimi`／`kimi-code` 命令行进程，排除 Helper、崩溃上报进程及 Kimi Work。桌面版与 CLI／Web 共用会话日志：提交后的待处理请求或未闭合模型步骤均算运行中，因此思考期间没有文字或工具输出也会保持运行；明确结束后恢复空闲，主程序退出后不再以残留日志维持运行。仅打开应用不会被判为忙碌，仍保留会话日志的过期限制。
 
 Kimi Code 的本机 Web 模式与终端模式共用会话日志检测，新建项目和恢复历史会话均适用。Web 服务将进程标题改写为 `kimi-cod` 时，采集器读取 `~/.kimi-code/server/instances/*.json`，校验 30 秒内的心跳、PID、真实 Kimi 可执行文件及启动时间（允许 5 秒登记延迟），并对同一进程去重；仅服务在线不会判为忙碌，仍需近期主代理或子代理日志中存在未闭合工作。此检测不访问 Web API、不读取访问令牌。会话定位与浏览器跳转仍受上表限制。
+
+Claude Desktop 单独成组：应用按 `Claude.app` 主程序后缀识别在线（官方与第三方登录配置目录 `~/Library/Application Support/Claude`、`Claude-3p` 都读取）。Code 标签页会话以 `~/.claude/sessions/<pid>.json` 的实时登记为准——`hostSessionId` 或 `claude-desktop` entrypoint 把它与终端 CLI 区分，PID、真实可执行文件与启动时间（允许 5 秒登记延迟）核验用于清理崩溃残留；status 为 busy 即运行中，转为 idle 且会话已有名称时记一轮结束，全新空会话不误报。`claude-code-sessions` 下的 `local_*.json` 提供含已退出会话的标题与最近活动，已归档的不展示。桌面版托管的 CLI 进程（`Application Support/Claude*/claude-code/` 下）不再计入 Claude Code 的进程数，桌面会话的转写（带 `entrypoint: claude-desktop` 标记）也不再参与 Claude Code 的忙碌、结束与最近判定——以转写尾部最后一条 entrypoint 判定当前宿主，之后在终端恢复的会话仍归 Claude Code；同一会话不会在两个分组重复出现。token 用量与 Claude Code 同源（`~/.claude/projects`），不单独展示。普通聊天页没有可靠的本地忙碌信号，不据此判忙。
 
 菜单栏采用单色灵眸图标与运行任务总数，未读事件或读取异常以小角标提示，悬停可查看分工具状态。下拉菜单与桌面面板共用按 Harness 分组的会话列表，每组同时展示当前会话和最近结果，其余会话放在本组子菜单中；空闲或已退出的工具有记录时仍展示。未读会话以小圆点标记。桌面面板入口、显示模式、置顶与全屏隐藏统一位于「桌面显示」子菜单。
 
