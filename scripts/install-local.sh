@@ -38,6 +38,19 @@ fi
 rm -rf "${INSTALLED_APP}"
 cp -R "$SRC_APP" "${INSTALLED_APP}"
 
-# 4) 启动新版本（同 bundle id + 同签名身份 → TCC 授权延续）
+# 4) 校验并启动新版本（同 bundle id + 同签名身份 → TCC 授权延续）
+codesign --verify --deep --strict "$INSTALLED_APP"
 open "${INSTALLED_APP}"
+
+# 5) 安装成功后只保留正式版，避免 Spotlight 被构建副本占满。
+# 校验或启动失败时保留构建产物以供排查；不创建时间戳备份。
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+if [[ -x "$LSREGISTER" ]]; then
+  "$LSREGISTER" -u "$SRC_APP" >/dev/null 2>&1 || true
+fi
+rm -rf "$SRC_APP"
+if [[ -x "$LSREGISTER" ]]; then
+  "$LSREGISTER" -f "$INSTALLED_APP" >/dev/null 2>&1 || true
+fi
+mdimport "$INSTALLED_APP" >/dev/null 2>&1 || true
 echo "✅ 已安装并启动: ${INSTALLED_APP}"

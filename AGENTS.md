@@ -15,8 +15,8 @@ The floating ball's ink and blue wash styles are drawn procedurally in `BallInkD
 ./scripts/with-xcode.sh swift run lingmou-collector --json
 ./scripts/check-open-source.sh
 bash scripts/test-experience-visuals.sh
-./AIStatusBar/build.sh
-open "AIStatusBar/灵眸.app"
+./scripts/install-local.sh
+open "/Applications/灵眸.app"
 ./scripts/build-dmg.sh
 ```
 
@@ -25,6 +25,8 @@ The first three commands validate collector output, tests, privacy checks, and S
 Owner-approved signing identity (recorded at the owner's request on 2026-10-09): `Developer ID Application: rongyu zhang (H7FC4T962X)`, Apple Developer Team ID `H7FC4T962X`. This machine stores that exact name in `~/.ai-statusbar/signing-identity`; keep using it for subsequent builds and local installs, and do not silently revert to `Lingmou Local` or ad-hoc signing. The app Bundle ID is `io.github.stubsx.lingmou`. The installed universal app and embedded collector were verified with this Developer ID, Hardened Runtime, secure timestamps and strict signature checks; the app was relaunched and the collector's JSON output checked. Apple notarization has not been performed for this build; signing alone must not be described as notarization.
 
 After each completed work stage, run `./scripts/install-local.sh` to rebuild, replace `/Applications/灵眸.app`, and relaunch it, so the user always runs the latest build without being asked. It rebuilds first and never touches the running instance when the build fails.
+
+Owner-requested single-copy rule (2026-10-19): after every local build/install stage, keep only `/Applications/灵眸.app` as the runnable app. `AIStatusBar/灵眸.app` is temporary build output: after the installed copy passes signature verification and launches successfully, unregister the build copy from LaunchServices and remove it, then refresh registration of the installed copy. Do not leave timestamped `.app` backups, `install-backup*`, `previous-installed.app`, `previous-preview*.app`, or test/preview apps in `output/` or elsewhere; remove temporary packaging/test bundles after use. Unless the owner explicitly requests a backup, use Git history for source rollback rather than retaining app copies. Keep user settings, pets, usage records and signing configuration intact. At completion, verify Spotlight's exact bundle-ID query returns only `/Applications/灵眸.app`, so searching for 灵眸/lingmou finds the real app.
 
 ## Coding Style & Naming Conventions
 
