@@ -32,7 +32,11 @@ enum NotificationRouter {
                                           kimiWebAvailable: Bool = false) -> Bool {
         if conversationURL(forToolKey: key, sessionId: sessionId) != nil { return true }
         guard key == "kimi", sessionId.map(KimiWebInstance.validID) == true else { return false }
-        return kimiCodeApplicationURL() == nil ? kimiWebAvailable : prefersKimiDesktopSessionNavigation()
+        if let applicationURL = kimiCodeApplicationURL() {
+            return prefersKimiDesktopSessionNavigation()
+                || kimiCodeSupportsWorkspaceDeepLink(applicationURL)
+        }
+        return kimiWebAvailable
     }
 
     static func supportsApplicationNavigation(forToolKey key: String) -> Bool {
@@ -47,9 +51,12 @@ enum NotificationRouter {
         case "zcode": return "打开 ZCode 应用或宿主"
         case "hermes": return "打开 Hermes 应用或宿主"
         case "kimi":
-            if kimiCodeApplicationURL() != nil {
+            if let applicationURL = kimiCodeApplicationURL() {
                 if prefersKimiDesktopSessionNavigation(), sessionId.map(KimiWebInstance.validID) == true {
                     return "尝试在 Kimi Code 中打开这条会话，失败时打开应用"
+                }
+                if sessionId != nil, kimiCodeSupportsWorkspaceDeepLink(applicationURL) {
+                    return "在 Kimi Code 中打开该会话所在的工作区（新对话）"
                 }
                 return "打开 Kimi Code 应用（会话需在应用内选择）"
             }
@@ -115,6 +122,39 @@ enum NotificationRouter {
             openKimiWebOrHost(sessionId: sessionId)
             return
         }
+        // Official workspace deep link (Kimi Code 1.1.0+): a session row lands in
+        // its project (new chat). The opt-in debug bridge still wins — it resumes
+        // the actual session instead of opening the workspace.
+        if let sessionId, !prefersKimiDesktopSessionNavigation(),
+            kimiCodeSupportsWorkspaceDeepLink(applicationURL),
+            let root = kimiSessionWorkspace(sessionId),
+            let url = kimiWorkspaceDeepLink(root: root)
+        {
+            let app = NSRunningApplication.runningApplications(withBundleIdentifier: kimiCodeBundleID)
+                .first
+            app?.unhide()
+            if #available(macOS 14, *) {
+                NSApp.yieldActivation(toApplicationWithBundleIdentifier: kimiCodeBundleID)
+            }
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            configuration.createsNewApplicationInstance = false
+            configuration.allowsRunningApplicationSubstitution = false
+            NSWorkspace.shared.open([url], withApplicationAt: applicationURL,
+                                    configuration: configuration)
+            { _, error in
+                DispatchQueue.main.async {
+                    if error == nil { resolvingKimi = false } else {
+                        openKimiApplication(applicationURL, sessionId: sessionId)
+                    }
+                }
+            }
+            return
+        }
+        openKimiApplication(applicationURL, sessionId: sessionId)
+    }
+
+    private static func openKimiApplication(_ applicationURL: URL, sessionId: String?) {
         let app = NSRunningApplication.runningApplications(withBundleIdentifier: kimiCodeBundleID).first
         app?.unhide()
         if #available(macOS 14, *) {
@@ -147,6 +187,48 @@ enum NotificationRouter {
                 }
             }
         }
+    }
+
+    /// Kimi Code 1.1.0 added kimi-code://open?root=<abs path> (validated by the app).
+    private static func kimiCodeSupportsWorkspaceDeepLink(_ applicationURL: URL) -> Bool {
+        guard let version = Bundle(url: applicationURL)?
+            .infoDictionary?["CFBundleShortVersionString"] as? String
+        else { return false }
+        let parts = version.split(separator: ".").compactMap { Int($0) }
+        return parts.count >= 2 && (parts[0] > 1 || (parts[0] == 1 && parts[1] >= 1))
+    }
+
+    private static func kimiWorkspaceDeepLink(root: String) -> URL? {
+        var components = URLComponents()
+        components.scheme = "kimi-code"
+        components.host = "open"
+        components.queryItems = [URLQueryItem(name: "root", value: root)]
+        return components.url
+    }
+
+    /// A session row carries its directory name under ~/.kimi-code/sessions/<group>/;
+    /// state.json records the workspace as cwd/workDir. The deep link can only use
+    /// a workspace that still exists.
+    private static func kimiSessionWorkspace(_ sessionId: String) -> String? {
+        guard KimiWebInstance.validID(sessionId) else { return nil }
+        let root = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".kimi-code/sessions")
+        guard let groups = try? FileManager.default.contentsOfDirectory(atPath: root.path)
+        else { return nil }
+        for group in groups {
+            let state = root.appendingPathComponent(group)
+                .appendingPathComponent(sessionId).appendingPathComponent("state.json")
+            guard let data = FileManager.default.contents(atPath: state.path),
+                let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { continue }
+            for key in ["cwd", "workDir"] {
+                guard let dir = object[key] as? String, dir.hasPrefix("/"),
+                    !dir.contains("\0"), FileManager.default.fileExists(atPath: dir)
+                else { continue }
+                return dir
+            }
+        }
+        return nil
     }
 
     private static func openKimiWebOrHost(sessionId: String?) {
