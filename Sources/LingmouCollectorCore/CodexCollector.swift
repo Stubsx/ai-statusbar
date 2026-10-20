@@ -12,9 +12,12 @@ struct CodexCollector {
     let processes: ProcessSupport
 
     private struct ThreadInfo {
-        let title: String
+        /// 清洗后的标题；为 nil 时需要从会话日志推导或按子代理标注。
+        let title: String?
         let updated: TimeInterval
         let kind: String
+        /// 子代理线程的昵称（如 Heisenberg），非子代理为 nil。
+        let subagentName: String?
     }
 
     func collect() -> CodexResult {
@@ -52,27 +55,41 @@ struct CodexCollector {
             let sorted = segments.sorted { $0.modified > $1.modified }
             guard let newest = sorted.first else { continue }
             let stored = threads[id]
+            // 标题优先级：线程库清洗后的标题 → 子代理标注 → 从日志推导的首条真实用户消息。
+            let title = stored?.title
+                ?? stored?.subagentName.map { $0.isEmpty ? "子代理会话" : "子代理·\($0)" }
+                ?? derivedTitle(segments: sorted)
+                ?? "(未命名会话)"
             let info = ThreadInfo(
-                title: stored?.title ?? "(未命名会话)", updated: stored?.updated ?? newest.modified,
-                kind: sorted.lazy.compactMap(\.kind).first ?? stored?.kind ?? "ide")
+                title: title, updated: stored?.updated ?? newest.modified,
+                kind: sorted.lazy.compactMap(\.kind).first ?? stored?.kind ?? "ide",
+                subagentName: nil)
             let timestamp = info.updated > 0 ? info.updated : newest.modified
-            let latest = LatestItem(title: info.title, timestamp: timestamp, sessionId: id)
-            let signal = sessionSignal(segments: sorted, sessionID: id, title: info.title,
+            let latest = LatestItem(title: title, timestamp: timestamp, sessionId: id)
+            let signal = sessionSignal(segments: sorted, sessionID: id, title: title,
                                        processAlive: info.kind == "cli" ? cliCount > 0 : appCount > 0,
                                        cache: cache)
+            // 子代理线程的结束/中断只是父会话的内部步骤，不作为独立会话展示；
+            // 仍在运行的子代理保留，反映真实进行中的工作。
+            let activity: TaskActivity? = signal.activity.flatMap {
+                guard stored?.subagentName != nil,
+                    $0.phase == "ended" || $0.phase == "interrupted"
+                else { return $0 }
+                return nil
+            }
             if info.kind == "cli" {
                 update(&result.cli, latest: latest, modified: newest.modified)
-                if let activity = signal.activity { result.cli.activities.append(activity) }
+                if let activity { result.cli.activities.append(activity) }
                 if signal.unreadable { result.cli.sourceError = "部分会话日志不可读取" }
                 if signal.busy {
-                    result.cli.busy.append(BusyItem(id: id, title: info.title))
+                    result.cli.busy.append(BusyItem(id: id, title: title))
                 }
             } else {
                 update(&result.ide, latest: latest, modified: newest.modified)
-                if let activity = signal.activity { result.ide.activities.append(activity) }
+                if let activity { result.ide.activities.append(activity) }
                 if signal.unreadable { result.ide.sourceError = "部分会话日志不可读取" }
                 if signal.busy {
-                    result.ide.busy.append(BusyItem(id: id, title: info.title))
+                    result.ide.busy.append(BusyItem(id: id, title: title))
                 }
             }
         }
@@ -84,24 +101,33 @@ struct CodexCollector {
         let databasePath =
             files.latest(matchingPrefix: "state_", suffix: ".sqlite", in: codexDirectory)
             ?? environment.path(".codex", "state_5.sqlite")
+        // name 是 Codex App 生成、侧边栏展示的简明标题；title 只是首条用户消息原文。
+        // 旧库可能还没有 name / agent_nickname 列，按实际列动态拼 SELECT。
         if let database = try? SQLiteDatabase(path: databasePath, readOnly: true),
             let columns = try? database.columns(in: "threads"),
-            Set(["id", "title", "updated_at", "source"]).isSubset(of: columns),
-            let rows = try? database.query(
-                "SELECT id, title, updated_at, source FROM threads WHERE archived=0"
-            )
+            Set(["id", "title", "updated_at", "source"]).isSubset(of: columns)
         {
-            let values = rows.reduce(into: [String: ThreadInfo]()) { result, row in
-                guard let id = row["id"]?.string, !id.isEmpty else { return }
-                let source = row["source"]?.string ?? ""
-                let title = row["title"]?.string.flatMap { $0.isEmpty ? nil : $0 } ?? "(未命名会话)"
-                result[id] = ThreadInfo(
-                    title: title,
-                    updated: row["updated_at"]?.double ?? 0,
-                    kind: ["cli", "exec"].contains(source) ? "cli" : "ide"
-                )
+            let hasName = columns.contains("name")
+            let hasNickname = columns.contains("agent_nickname")
+            let select = ["id", "title", "updated_at", "source",
+                          hasName ? "name" : nil,
+                          hasNickname ? "agent_nickname" : nil]
+                .compactMap { $0 }.joined(separator: ", ")
+            if let rows = try? database.query("SELECT \(select) FROM threads WHERE archived=0") {
+                let values = rows.reduce(into: [String: ThreadInfo]()) { result, row in
+                    guard let id = row["id"]?.string, !id.isEmpty else { return }
+                    let source = row["source"]?.string ?? ""
+                    result[id] = ThreadInfo(
+                        title: Self.cleanedTitle(row["name"]?.string)
+                            ?? Self.cleanedTitle(row["title"]?.string),
+                        updated: row["updated_at"]?.double ?? 0,
+                        kind: ["cli", "exec"].contains(source) ? "cli" : "ide",
+                        subagentName: row["agent_nickname"]?.string.flatMap { $0.isEmpty ? nil : $0 }
+                            ?? Self.subagentName(from: source)
+                    )
+                }
+                if !values.isEmpty { return values }
             }
-            if !values.isEmpty { return values }
         }
 
         let index = environment.path(".codex", "session_index.jsonl")
@@ -109,11 +135,74 @@ struct CodexCollector {
             result, row in
             guard let id = JSONValue.string(row["id"]), !id.isEmpty else { return }
             result[id] = ThreadInfo(
-                title: JSONValue.string(row["thread_name"]) ?? "(未命名会话)",
+                title: Self.cleanedTitle(JSONValue.string(row["thread_name"])),
                 updated: DateSupport.timestamp(row["updated_at"]) ?? 0,
-                kind: "cli"
+                kind: "cli",
+                subagentName: nil
             )
         }
+    }
+
+    /// Codex 把首条用户消息原样存为线程标题，其中常带上下文块
+    ///（剪贴板图片说明、AGENTS.md 注入等）。真正的请求跟在 "## My request:" 之后；
+    /// 纯上下文块没有请求正文，返回 nil 让调用方从日志推导。
+    static func cleanedTitle(_ raw: String?) -> String? {
+        guard var text = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty
+        else { return nil }
+        if let range = text.range(of: Self.requestMarker) {
+            text = text[range.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+        } else if Self.preambleMarkers.contains(where: { text.hasPrefix($0) }) {
+            return nil
+        }
+        return text.isEmpty ? nil : text
+    }
+
+    private static let requestMarker = "## My request:"
+    private static let preambleMarkers = [
+        "# Files mentioned by the user:",
+        "# AGENTS.md instructions",
+        "<environment_context>",
+        "<INSTRUCTIONS>",
+    ]
+
+    /// 线程库的 source 字段对子代理线程是 JSON：
+    /// {"subagent":{"thread_spawn":{...,"agent_nickname":"Heisenberg"}}} 或
+    /// {"subagent":{"other":"guardian"}}。普通来源是 "cli"/"vscode" 等裸字符串。
+    static func subagentName(from source: String) -> String? {
+        guard source.hasPrefix("{"), let object = JSONValue.object(from: source),
+            let subagent = object["subagent"] as? JSONObject
+        else { return nil }
+        if let spawn = subagent["thread_spawn"] as? JSONObject {
+            return JSONValue.string(spawn["agent_nickname"]) ?? ""
+        }
+        if let other = JSONValue.string(subagent["other"]) { return other }
+        return ""
+    }
+
+    /// 线程库没有标题（或标题只是上下文块）时，从最新分段的头部按序找第一条
+    /// 真实用户消息：跳过 AGENTS.md 注入、environment_context 等前导块。
+    private func derivedTitle(segments: [SessionFile]) -> String? {
+        for segment in segments.prefix(3) {
+            guard let handle = FileHandle(forReadingAtPath: segment.path) else { continue }
+            let data = (try? handle.read(upToCount: 1 << 19)) ?? Data()
+            try? handle.close()
+            for line in String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline)
+            where line.contains("\"message\"") {
+                guard let object = JSONValue.object(from: String(line)),
+                    JSONValue.string(object["type"]) == "response_item",
+                    let payload = object["payload"] as? JSONObject,
+                    JSONValue.string(payload["type"]) == "message",
+                    JSONValue.string(payload["role"]) == "user",
+                    let content = payload["content"] as? [JSONObject]
+                else { continue }
+                let joined = content.compactMap { JSONValue.string($0["text"]) }
+                    .joined(separator: " ")
+                if let title = Self.cleanedTitle(joined) {
+                    return title.count > 100 ? String(title.prefix(100)) + "…" : title
+                }
+            }
+        }
+        return nil
     }
 
     private struct SessionFile {

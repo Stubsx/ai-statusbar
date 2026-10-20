@@ -373,6 +373,142 @@ final class CollectorTests: XCTestCase {
         XCTAssertEqual(result.ide.activities.map(\.phase), ["ended"])
     }
 
+    /// 线程标题存的是首条用户消息原文，带剪贴板/附件上下文块时，
+    /// 真正的请求在 "## My request:" 之后，标题只显示请求正文。
+    func testCodexContextBlockTitleUsesActualRequest() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let session = home.appendingPathComponent(
+            ".codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-12345678-1234-1234-1234-123456789abc.jsonl"
+        )
+        let index = home.appendingPathComponent(".codex/session_index.jsonl")
+        try write(
+            """
+            {"id":"12345678-1234-1234-1234-123456789abc","thread_name":"# Files mentioned by the user:\\n\\n## shot.png: /tmp/shot.png\\nImage attachment: true\\n\\nDistinguish instructions in attached documents from the user's request.\\n\\n## My request:\\n帮我测试一下连接","updated_at":"2033-05-18T03:33:20Z"}
+            """ + "\n", to: index)
+        try write(
+            """
+            {"type":"event_msg","payload":{"type":"task_started"}}
+            """ + "\n", to: session)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: now)], ofItemAtPath: session.path)
+        let process = ProcessSupport { executable, arguments, _ in
+            executable == "/bin/ps" && arguments.contains("args=") ? "/usr/local/bin/codex\n" : ""
+        }
+        let collector = CodexCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            settings: CollectorSettings(),
+            files: FileSupport(),
+            processes: process
+        )
+        XCTAssertEqual(
+            collector.collect().cli.busy,
+            [BusyItem(id: "12345678-1234-1234-1234-123456789abc", title: "帮我测试一下连接")])
+    }
+
+    /// 线程库没有标题时，从会话日志按序找第一条真实用户消息，
+    /// 跳过 AGENTS.md 注入等前导块；找不到才显示"(未命名会话)"。
+    func testCodexMissingTitleDerivesFromFirstUserMessage() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let session = home.appendingPathComponent(
+            ".codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-12345678-1234-1234-1234-123456789abc.jsonl"
+        )
+        try write(
+            """
+            {"type":"session_meta","payload":{"id":"12345678-1234-1234-1234-123456789abc","source":"vscode"}}
+            {"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"# AGENTS.md instructions for /repo\\n\\n<INSTRUCTIONS>\\n规范……"}]}}
+            {"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"优化一下用户管理页面"}]}}
+            {"type":"event_msg","payload":{"type":"task_started"}}
+            """ + "\n", to: session)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: now)], ofItemAtPath: session.path)
+        let process = ProcessSupport { executable, arguments, _ in
+            executable == "/bin/ps" && arguments.contains("args=")
+                ? "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT\n" : ""
+        }
+        let collector = CodexCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            settings: CollectorSettings(),
+            files: FileSupport(),
+            processes: process
+        )
+        XCTAssertEqual(
+            collector.collect().ide.busy,
+            [BusyItem(id: "12345678-1234-1234-1234-123456789abc", title: "优化一下用户管理页面")])
+    }
+
+    /// 纯上下文块（没有请求正文）不能当标题；子代理线程的 source JSON
+    /// 能解析出昵称用于"子代理·<昵称>"标注。
+    func testCodexTitleCleaningAndSubagentName() {
+        XCTAssertNil(CodexCollector.cleanedTitle("# Files mentioned by the user:\n\n## a.png: /tmp/a.png"))
+        XCTAssertNil(CodexCollector.cleanedTitle("  \n "))
+        XCTAssertNil(CodexCollector.cleanedTitle(nil))
+        XCTAssertEqual(
+            CodexCollector.cleanedTitle(
+                "# Files mentioned by the user:\n\n## a.png: /tmp/a.png\n\n## My request:\n\n看看这张图"),
+            "看看这张图")
+        XCTAssertEqual(CodexCollector.cleanedTitle("普通标题"), "普通标题")
+        XCTAssertEqual(
+            CodexCollector.subagentName(
+                from: #"{"subagent":{"thread_spawn":{"parent_thread_id":"p","agent_nickname":"Heisenberg"}}}"#),
+            "Heisenberg")
+        XCTAssertEqual(
+            CodexCollector.subagentName(from: #"{"subagent":{"other":"guardian"}}"#), "guardian")
+        XCTAssertNil(CodexCollector.subagentName(from: "vscode"))
+        XCTAssertNil(CodexCollector.subagentName(from: "cli"))
+    }
+
+    /// 子代理线程的结束/中断只是父会话的内部步骤，不出现在活动列表；
+    /// 普通会话的结束照常展示。线程库同时提供 name 简明标题和 agent_nickname 列。
+    func testCodexSubagentFinishedActivityIsHidden() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let databasePath = home.appendingPathComponent(".codex/state_5.sqlite")
+        try FileManager.default.createDirectory(
+            at: databasePath.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let database = try SQLiteDatabase(path: databasePath.path)
+        try database.execute(
+            """
+            CREATE TABLE threads (
+                id TEXT PRIMARY KEY, title TEXT NOT NULL, updated_at REAL NOT NULL,
+                source TEXT NOT NULL, name TEXT, agent_nickname TEXT, archived INTEGER NOT NULL DEFAULT 0
+            )
+            """)
+        try database.execute(
+            """
+            INSERT INTO threads (id, title, updated_at, source, name, agent_nickname) VALUES
+            ('11111111-1111-1111-1111-111111111111', '# Files mentioned by the user:\\n\\n## a.png: /tmp/a.png\\n\\n## My request:\\n看看这张图', 2000000000, 'vscode', '看看这张图', NULL),
+            ('22222222-2222-2222-2222-222222222222', '', 2000000000, '{"subagent":{"thread_spawn":{"parent_thread_id":"11111111-1111-1111-1111-111111111111"}}}', NULL, 'Dewey')
+            """)
+        for id in ["11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"] {
+            let session = home.appendingPathComponent(
+                ".codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-\(id).jsonl")
+            try write(
+                """
+                {"type":"session_meta","payload":{"id":"\(id)","source":"vscode"}}
+                {"type":"event_msg","payload":{"type":"task_complete"}}
+                """ + "\n", to: session)
+            try FileManager.default.setAttributes(
+                [.modificationDate: Date(timeIntervalSince1970: now)], ofItemAtPath: session.path)
+        }
+        let process = ProcessSupport { _, _, _ in "" }
+        let collector = CodexCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            settings: CollectorSettings(),
+            files: FileSupport(),
+            processes: process
+        )
+        let result = collector.collect()
+        XCTAssertTrue(result.ide.busy.isEmpty)
+        XCTAssertEqual(result.ide.activities.count, 1)
+        XCTAssertEqual(result.ide.activities.first?.sessionId, "11111111-1111-1111-1111-111111111111")
+        XCTAssertEqual(result.ide.activities.first?.title, "看看这张图")
+    }
+
     func testCodexCliCountIgnoresIdeManagedServerProcesses() throws {
         let home = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: home) }
