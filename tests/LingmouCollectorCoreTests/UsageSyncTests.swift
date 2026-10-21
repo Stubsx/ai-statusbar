@@ -47,10 +47,27 @@ final class UsageSyncTests: XCTestCase {
         XCTAssertEqual(merged.byTool["2026-08-15"]?["zcode"]?.input, 5)
         XCTAssertEqual(merged.byTool["2026-08-14"]?["kimi"]?.input, 7)
         XCTAssertNil(merged.byTool["2026-08-13"])
-        // 模型视图：kimi-code/k3 归一为 k3，跨设备同键求和
-        XCTAssertEqual(merged.byModel["2026-08-15"]?["k3"]?.input, 11)
-        XCTAssertEqual(merged.byModel["2026-08-15"]?["k3"]?.cache, 33)
-        XCTAssertEqual(merged.byModel["2026-08-14"]?["k3"]?.input, 7)
+        // 模型视图：kimi-code/k3 归一为 kimi-k3，跨设备同键求和
+        XCTAssertEqual(merged.byModel["2026-08-15"]?["kimi-k3"]?.input, 11)
+        XCTAssertEqual(merged.byModel["2026-08-15"]?["kimi-k3"]?.cache, 33)
+        XCTAssertEqual(merged.byModel["2026-08-14"]?["kimi-k3"]?.input, 7)
+    }
+
+    /// 同一模型的不同叫法合并为一个键：Kimi K3 在 Kimi Code 记作 k3（或
+    /// kimi-code/k3）、Hermes 记作 kimi-k3、Kimi Work 记作 k3-agent。
+    func testMergedDailyMergesK3Aliases() {
+        let merged = UsageSync.mergedDaily([
+            [
+                day("2026-08-15", "kimi", model: "kimi-code/k3", input: 10, output: 0, cache: 0),
+                day("2026-08-15", "claude", model: "k3", input: 1, output: 2, cache: 3),
+                day("2026-08-15", "hermes", model: "kimi-k3", input: 100, output: 0, cache: 0),
+                day("2026-08-15", "kimi-work", model: "k3-agent", input: 1000, output: 0, cache: 0),
+            ]
+        ])
+        XCTAssertEqual(merged.byModel["2026-08-15"]?["kimi-k3"]?.input, 1111)
+        XCTAssertEqual(merged.byModel["2026-08-15"]?["kimi-k3"]?.cache, 3)
+        XCTAssertNil(merged.byModel["2026-08-15"]?["k3"])
+        XCTAssertNil(merged.byModel["2026-08-15"]?["k3-agent"])
     }
 
     /// 模型名归一：大小写与路径前缀合并为同一键，空名归入未知桶

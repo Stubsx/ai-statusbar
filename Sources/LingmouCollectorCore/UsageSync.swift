@@ -179,11 +179,20 @@ enum UsageSync {
 
     /// 模型名归一：去空白、取路径最后一段（kimi-code/k3 → k3）、统一小写，
     /// 让不同工具记录的同名模型（如 GLM-5.3 / glm-5.3）合并为一个键；空名归入未知桶。
+    /// 同一模型的不同叫法再归一到规范名：Kimi K3 在 Kimi Code 里记作 k3、
+    /// Hermes 里记作 kimi-k3、Kimi Work 里记作 k3-agent，实质是同一个模型。
     static func normalizedModelKey(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let base = trimmed.split(separator: "/").last.map(String.init) ?? trimmed
-        return base.isEmpty ? "未知模型" : base.lowercased()
+        guard !base.isEmpty else { return "未知模型" }
+        let key = base.lowercased()
+        return modelAliases[key] ?? key
     }
+
+    private static let modelAliases: [String: String] = [
+        "k3": "kimi-k3",
+        "k3-agent": "kimi-k3",
+    ]
 }
 
 /// 按 date → 键 → 计数 的合并结果：工具视图与模型视图共用一套行数据。
