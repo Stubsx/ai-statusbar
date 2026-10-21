@@ -653,6 +653,69 @@ func renderExperience() throws {
                      scheme: scheme)
         }
     }
+    // 用量图表视图:多模型占比条 + 今日构成条 / 近七日与近30日柱状图 / 明细回退
+    settings.priceEstimatesEnabled = true
+    let chartStore = StatusStore(
+        collectorPath: nil, settings: settings,
+        storageDirectory: temporary.appendingPathComponent("chart"))
+    let chartDayFormatter = DateFormatter()
+    chartDayFormatter.dateFormat = "yyyy-MM-dd"
+    let heatJSON = (0..<35).map { offset -> String in
+        let date = Calendar.current.date(byAdding: .day, value: offset - 34, to: Date())!
+        let total = [120_000, 450_000, 80_000, 980_000, 1_500_000, 300_000, 640_000][offset % 7]
+            + offset * 7_000
+        return "{\"date\":\"\(chartDayFormatter.string(from: date))\",\"total\":\(total),\"future\":false}"
+    }.joined(separator: ",")
+    func scaled(_ factor: Int) -> String { """
+        "tools":{"codex":{"input":\(900_000*factor),"output":\(120_000*factor),"cache":\(5_200_000*factor)},
+          "kimi":{"input":\(420_000*factor),"output":\(80_000*factor),"cache":\(1_800_000*factor)},
+          "claude":{"input":\(260_000*factor),"output":\(60_000*factor),"cache":\(900_000*factor)},
+          "zcode":{"input":\(40_000*factor),"output":\(5_000*factor),"cache":\(120_000*factor)}},
+        "models":{"gpt-6.1-sol":{"input":\(900_000*factor),"output":\(120_000*factor),"cache":\(5_200_000*factor)},
+          "kimi-k3":{"input":\(420_000*factor),"output":\(80_000*factor),"cache":\(1_800_000*factor)},
+          "glm-5.3":{"input":\(260_000*factor),"output":\(60_000*factor),"cache":\(900_000*factor)},
+          "codex-auto-review":{"input":\(30_000*factor),"output":\(2_000*factor),"cache":\(100_000*factor)},
+          "glm-5.3-flash":{"input":\(10_000*factor),"output":\(3_000*factor),"cache":\(20_000*factor)}},
+        "total":{"input":\(1_620_000*factor),"output":\(265_000*factor),"cache":\(8_020_000*factor)}
+        """
+    }
+    let chartFixture = """
+        {"updated_at":"12:00:00","tools":[],
+         "usage":{"date":"\(chartDayFormatter.string(from: Date()))",\(scaled(1)),
+           "heatmap":[\(heatJSON)],
+           "weekly":{\(scaled(5))},"monthly":{\(scaled(20))}},
+         "cost":{"source":"OpenRouter","price_updated_at":1790128800,
+           "usd_to_cny":7.1,"exchange_rate_source":"Frankfurter",
+           "exchange_rate_date":"2026-10-20","exchange_rate_updated_at":1790128800,
+           "local":{"today":{"amount_usd":3.86,"priced_tokens":9000000,"total_tokens":9905000,
+             "by_model_usd":{"gpt-6.1-sol":2.91,"kimi-k3":0.62,"glm-5.3":0.33},
+             "unpriced_models":["codex-auto-review","glm-5.3-flash"]},
+             "weekly":{"amount_usd":19.3,"priced_tokens":45000000,"total_tokens":49525000,
+             "by_model_usd":{"gpt-6.1-sol":14.55,"kimi-k3":3.1,"glm-5.3":1.65},
+             "unpriced_models":["codex-auto-review","glm-5.3-flash"]},
+             "monthly":{"amount_usd":77.2,"priced_tokens":180000000,"total_tokens":198100000,
+             "by_model_usd":{"gpt-6.1-sol":58.2,"kimi-k3":12.4,"glm-5.3":6.6},
+             "unpriced_models":["codex-auto-review","glm-5.3-flash"]}}}}
+        """
+    chartStore.data = try decoder.decode(StatusData.self, from: Data(chartFixture.utf8))
+    for (name, range, breakdown, mode, scheme) in [
+        ("usage-chart-today-light", "today", "models", "chart", ColorScheme.light),
+        ("usage-chart-tools-dark", "today", "tools", "chart", ColorScheme.dark),
+        ("usage-chart-7d-dark", "7d", "models", "chart", ColorScheme.dark),
+        ("usage-chart-30d-light", "30d", "models", "chart", ColorScheme.light),
+        ("usage-list-light", "today", "models", "list", ColorScheme.light),
+    ] {
+        let suite = "io.github.stubsx.lingmou.visual.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set("usage", forKey: "panelTab")
+        defaults.set(range, forKey: "usageRange")
+        defaults.set(breakdown, forKey: "usageBreakdown")
+        defaults.set(mode, forKey: "usageViewMode")
+        try save(name, content: PanelView(store: chartStore).defaultAppStorage(defaults)
+            .background(scheme == .light ? Color.white : Color(red: 0.09, green: 0.11, blue: 0.16)),
+                 scheme: scheme)
+    }
     settings.priceEstimatesEnabled = false
     let overviewStore = StatusStore(collectorPath: nil, settings: settings,
                                    storageDirectory: temporary.appendingPathComponent("overview"))

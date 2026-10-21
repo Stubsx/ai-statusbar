@@ -18,6 +18,8 @@ struct PanelView: View {
     @AppStorage("usageRange") private var usageRange = "today"
     @AppStorage("usageBreakdown") private var usageBreakdown = "tools"
     @AppStorage("usageCurrency") private var usageCurrency = "cny"
+    /// 用量内容区:chart=图表(默认) list=明细列表
+    @AppStorage("usageViewMode") private var usageViewMode = "chart"
     @State private var kimiWebAvailable = false
 
     private var page: PanelPage { PanelPage.restored(tab) }
@@ -282,32 +284,99 @@ struct PanelView: View {
                     .foregroundColor(.secondary.opacity(0.7))
                     .padding(.top, 3)
                     .padding(.bottom, 5)
-                usageRow("总计", entries.total,
-                         estimatedUSD: rangeCost?.amountUsd,
-                         showEstimate: store.settings.priceEstimatesEnabled)
-                Divider().background(Color.primary.opacity(0.1))
-                // 按工具总用量（输入+缓存+输出）从高到低排序
-                let sortedTools = (usageBreakdown == "models" ? (rangeModels ?? [:]) : entries.tools).sorted { lhs, rhs in
-                    let l = lhs.value.input + lhs.value.output + lhs.value.cache
-                    let r = rhs.value.input + rhs.value.output + rhs.value.cache
-                    return l > r
+                if usageViewMode == "chart" {
+                    usageChart(entries: entries)
+                } else {
+                    Button(action: { usageViewMode = "chart" }) {
+                        HStack(spacing: 3) {
+                            Image(systemName: "chevron.left")
+                            Text("返回图表")
+                        }
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.bottom, 2)
+                    usageList(entries: entries)
                 }
-                ForEach(sortedTools, id: \.key) { key, e in
-                    usageRow(
-                        usageBreakdown == "models" ? key : usageName(key), e,
-                        estimatedUSD: usageBreakdown == "models" ? rangeCost?.byModelUsd[key] : nil,
-                        showEstimate: usageBreakdown == "models" && store.settings.priceEstimatesEnabled)
-                }
-                if usageBreakdown == "models" && (rangeModels ?? [:]).isEmpty {
-                    Text("此时间范围暂无模型明细").font(.system(size: 11)).foregroundColor(.secondary)
-                }
-                syncSummary
             } else {
                 Text("统计中…（首次全量索引约需几秒）")
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
             }
         }
+    }
+
+    /// 用量明细列表(原数字行视图)
+    private func usageList(entries: (tools: [String: UsageEntry], total: UsageEntry)) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            usageRow("总计", entries.total,
+                     estimatedUSD: rangeCost?.amountUsd,
+                     showEstimate: store.settings.priceEstimatesEnabled)
+            Divider().background(Color.primary.opacity(0.1))
+            // 按工具总用量（输入+缓存+输出）从高到低排序
+            let sortedTools = (usageBreakdown == "models" ? (rangeModels ?? [:]) : entries.tools).sorted { lhs, rhs in
+                let l = lhs.value.input + lhs.value.output + lhs.value.cache
+                let r = rhs.value.input + rhs.value.output + rhs.value.cache
+                return l > r
+            }
+            ForEach(sortedTools, id: \.key) { key, e in
+                usageRow(
+                    usageBreakdown == "models" ? key : usageName(key), e,
+                    estimatedUSD: usageBreakdown == "models" ? rangeCost?.byModelUsd[key] : nil,
+                    showEstimate: usageBreakdown == "models" && store.settings.priceEstimatesEnabled)
+            }
+            if usageBreakdown == "models" && (rangeModels ?? [:]).isEmpty {
+                Text("此时间范围暂无模型明细").font(.system(size: 11)).foregroundColor(.secondary)
+            }
+            syncSummary
+        }
+    }
+
+    /// 用量图表视图:占比堆叠条 + 图例 + 每日柱状图;点击切换到明细
+    private func usageChart(entries: (tools: [String: UsageEntry], total: UsageEntry)) -> some View {
+        let source = usageBreakdown == "models" ? (rangeModels ?? [:]) : entries.tools
+        let sorted = source.sorted {
+            ($0.value.input + $0.value.output + $0.value.cache)
+                > ($1.value.input + $1.value.output + $1.value.cache)
+        }
+        let showCost = store.settings.priceEstimatesEnabled
+        let rows = sorted.map { key, entry in
+            UsageChartCard.Row(
+                id: key,
+                name: usageBreakdown == "models" ? key : usageName(key),
+                tokens: entry.input + entry.output + entry.cache,
+                cost: showCost
+                    ? (usageBreakdown == "models"
+                        ? rangeCost?.byModelUsd[key].map { estimatedCostText($0) } : nil)
+                    : nil)
+        }
+        let totalTokens = entries.total.input + entries.total.output + entries.total.cache
+        var summary = "总计 \(fmt(totalTokens)) tokens"
+        if showCost, let cost = rangeCost {
+            summary += " · \(estimatedCostText(cost.amountUsd))"
+        }
+        let heat = (usageForDisplay?.heatmap ?? []).filter { !$0.future }
+            .sorted { $0.date < $1.date }
+        let windowDays = usageRange == "today" ? [] : Array(heat.suffix(usageRange == "7d" ? 7 : 30))
+        return VStack(alignment: .leading, spacing: 0) {
+            UsageChartCard(
+                summary: summary,
+                rows: rows,
+                composition: usageRange == "today" ? entries.total : nil,
+                days: windowDays,
+                todayKey: todayKey,
+                showWeekdayLabels: usageRange == "7d",
+                format: { fmt($0) })
+            Text("点击查看明细 →")
+                .font(.system(size: 9))
+                .foregroundColor(.secondary.opacity(0.6))
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.top, 6)
+            syncSummary
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { usageViewMode = "list" }
     }
 
     private func usageRow(
