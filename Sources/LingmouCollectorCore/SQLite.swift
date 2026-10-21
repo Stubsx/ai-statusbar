@@ -67,6 +67,9 @@ final class SQLiteDatabase {
             if let handle { sqlite3_close(handle) }
             throw SQLiteError.message(message)
         }
+        // 宿主（如 Codex）以 WAL 模式持续写入；短暂等待锁释放，
+        // 避免一次瞬时 SQLITE_BUSY 就让整个读取降级。
+        sqlite3_busy_timeout(handle, 250)
     }
 
     deinit { if let handle { sqlite3_close(handle) } }

@@ -459,6 +459,12 @@ final class CollectorTests: XCTestCase {
             CodexCollector.subagentName(from: #"{"subagent":{"other":"guardian"}}"#), "guardian")
         XCTAssertNil(CodexCollector.subagentName(from: "vscode"))
         XCTAssertNil(CodexCollector.subagentName(from: "cli"))
+        XCTAssertTrue(
+            CodexCollector.isInternalSubagent(source: #"{"subagent":{"other":"guardian"}}"#))
+        XCTAssertFalse(
+            CodexCollector.isInternalSubagent(
+                source: #"{"subagent":{"thread_spawn":{"parent_thread_id":"p","agent_nickname":"Heisenberg"}}}"#))
+        XCTAssertFalse(CodexCollector.isInternalSubagent(source: "cli"))
     }
 
     /// 子代理线程的结束/中断只是父会话的内部步骤，不出现在活动列表；
@@ -529,6 +535,133 @@ final class CollectorTests: XCTestCase {
             processes: process
         )
         XCTAssertEqual(collector.collect().cli.detail, "1 个进程")
+    }
+
+    /// guardian 评审是 Codex 自动审批的内部子步骤：线程库读取失败、
+    /// 只能走 session_index.jsonl 降级（全部标成 cli）时，也要凭会话头里的
+    /// source 对象 / thread_source 识别出来，完全不进入 CLI 会话列表。
+    func testCodexGuardianReviewHiddenWithoutThreadDatabase() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let guardian = "22222222-2222-2222-2222-222222222222"
+        let normal = "11111111-1111-1111-1111-111111111111"
+        let index = home.appendingPathComponent(".codex/session_index.jsonl")
+        try write(
+            """
+            {"id":"\(guardian)","thread_name":"Guardian review","updated_at":"2033-05-18T03:33:20Z"}
+            {"id":"\(normal)","thread_name":"正常 CLI 会话","updated_at":"2033-05-18T03:33:20Z"}
+            """ + "\n", to: index)
+        let guardianSession = home.appendingPathComponent(
+            ".codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-\(guardian).jsonl")
+        try write(
+            """
+            {"type":"session_meta","payload":{"id":"\(guardian)","source":{"subagent":{"other":"guardian"}},"thread_source":"guardian_review"}}
+            {"type":"event_msg","payload":{"type":"task_complete"}}
+            """ + "\n", to: guardianSession)
+        let normalSession = home.appendingPathComponent(
+            ".codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-\(normal).jsonl")
+        try write(
+            """
+            {"type":"session_meta","payload":{"id":"\(normal)","source":"cli"}}
+            {"type":"event_msg","payload":{"type":"task_complete"}}
+            """ + "\n", to: normalSession)
+        for path in [guardianSession, normalSession] {
+            try FileManager.default.setAttributes(
+                [.modificationDate: Date(timeIntervalSince1970: now)], ofItemAtPath: path.path)
+        }
+        let process = ProcessSupport { _, _, _ in "" }
+        let collector = CodexCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            settings: CollectorSettings(),
+            files: FileSupport(),
+            processes: process
+        )
+        let result = collector.collect()
+        XCTAssertTrue(result.cli.busy.isEmpty)
+        XCTAssertEqual(result.cli.activities.count, 1)
+        XCTAssertEqual(result.cli.activities.first?.sessionId, normal)
+        XCTAssertEqual(result.cli.latest?.sessionId, normal)
+        XCTAssertTrue(result.ide.activities.isEmpty)
+        XCTAssertTrue(result.ide.busy.isEmpty)
+    }
+
+    /// 运行中的 guardian 评审同样不占用忙碌列表——它是父会话的内部步骤，
+    /// 否则每次自动审批都会冒出一个"Guardian review"会话并在结束后留下记录。
+    func testCodexRunningGuardianReviewIsNotBusy() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let guardian = "22222222-2222-2222-2222-222222222222"
+        let session = home.appendingPathComponent(
+            ".codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-\(guardian).jsonl")
+        try write(
+            """
+            {"type":"session_meta","payload":{"id":"\(guardian)","source":{"subagent":{"other":"guardian"}},"thread_source":"guardian_review"}}
+            {"type":"event_msg","payload":{"type":"task_started"}}
+            """ + "\n", to: session)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: now)], ofItemAtPath: session.path)
+        let process = ProcessSupport { executable, arguments, _ in
+            executable == "/bin/ps" && arguments.contains("args=") ? "/usr/local/bin/codex\n" : ""
+        }
+        let collector = CodexCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            settings: CollectorSettings(),
+            files: FileSupport(),
+            processes: process
+        )
+        let result = collector.collect()
+        XCTAssertTrue(result.cli.busy.isEmpty)
+        XCTAssertTrue(result.cli.activities.isEmpty)
+        XCTAssertTrue(result.ide.busy.isEmpty)
+        XCTAssertTrue(result.ide.activities.isEmpty)
+    }
+
+    /// 线程库可达时 guardian 线程（source 为 {"subagent":{"other":"guardian"}}）
+    /// 同样整体隐藏；有昵称的委派子代理保留原行为（结束不展示、运行保留）。
+    func testCodexGuardianReviewHiddenWithThreadDatabase() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let databasePath = home.appendingPathComponent(".codex/state_5.sqlite")
+        try FileManager.default.createDirectory(
+            at: databasePath.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let database = try SQLiteDatabase(path: databasePath.path)
+        try database.execute(
+            """
+            CREATE TABLE threads (
+                id TEXT PRIMARY KEY, title TEXT NOT NULL, updated_at REAL NOT NULL,
+                source TEXT NOT NULL, name TEXT, agent_nickname TEXT, archived INTEGER NOT NULL DEFAULT 0
+            )
+            """)
+        try database.execute(
+            """
+            INSERT INTO threads (id, title, updated_at, source, name, agent_nickname) VALUES
+            ('22222222-2222-2222-2222-222222222222', 'Guardian review', 2000000000, '{"subagent":{"other":"guardian"}}', 'Guardian review', NULL)
+            """)
+        let guardian = "22222222-2222-2222-2222-222222222222"
+        let session = home.appendingPathComponent(
+            ".codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-\(guardian).jsonl")
+        try write(
+            """
+            {"type":"session_meta","payload":{"id":"\(guardian)","source":{"subagent":{"other":"guardian"}},"thread_source":"guardian_review"}}
+            {"type":"event_msg","payload":{"type":"task_complete"}}
+            """ + "\n", to: session)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: now)], ofItemAtPath: session.path)
+        let process = ProcessSupport { _, _, _ in "" }
+        let collector = CodexCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            settings: CollectorSettings(),
+            files: FileSupport(),
+            processes: process
+        )
+        let result = collector.collect()
+        XCTAssertTrue(result.cli.activities.isEmpty)
+        XCTAssertTrue(result.ide.activities.isEmpty)
+        XCTAssertNil(result.cli.latest)
+        XCTAssertNil(result.ide.latest)
     }
 
     func testExpiredKimiCredentialsRemainUnchanged() throws {

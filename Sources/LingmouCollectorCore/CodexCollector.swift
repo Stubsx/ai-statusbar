@@ -18,6 +18,8 @@ struct CodexCollector {
         let kind: String
         /// 子代理线程的昵称（如 Heisenberg），非子代理为 nil。
         let subagentName: String?
+        /// guardian 评审等内部子步骤：不是用户会话，完全不展示。
+        let internalSubagent: Bool
     }
 
     func collect() -> CodexResult {
@@ -49,21 +51,33 @@ struct CodexCollector {
             }
             let header = sessionHeader(path)
             let id = header.id.flatMap { $0.isEmpty ? nil : $0 } ?? sessionID(from: path)
-            groups[id, default: []].append(SessionFile(path: path, modified: modified, kind: header.kind))
+            groups[id, default: []].append(
+                SessionFile(path: path, modified: modified, kind: header.kind,
+                            subagentName: header.subagentName,
+                            internalSubagent: header.internalSubagent))
         }
         for (id, segments) in groups {
             let sorted = segments.sorted { $0.modified > $1.modified }
             guard let newest = sorted.first else { continue }
             let stored = threads[id]
+            // 子代理身份优先信线程库；库读不到（锁定、schema 迁移）时用会话头兜底，
+            // 避免 guardian 评审这类内部线程被当成普通 CLI 会话。
+            let subagentName = stored?.subagentName
+                ?? sorted.lazy.compactMap(\.subagentName).first
+            let internalSubagent = (stored?.internalSubagent ?? false)
+                || sorted.contains(where: \.internalSubagent)
+            // guardian 评审是父会话内部的 safety 步骤（用户从未把它当会话），
+            // 不进 latest/busy/活动列表，也不会触发"已结束"历史记录。
+            if internalSubagent { continue }
             // 标题优先级：线程库清洗后的标题 → 子代理标注 → 从日志推导的首条真实用户消息。
             let title = stored?.title
-                ?? stored?.subagentName.map { $0.isEmpty ? "子代理会话" : "子代理·\($0)" }
+                ?? subagentName.map { $0.isEmpty ? "子代理会话" : "子代理·\($0)" }
                 ?? derivedTitle(segments: sorted)
                 ?? "(未命名会话)"
             let info = ThreadInfo(
                 title: title, updated: stored?.updated ?? newest.modified,
                 kind: sorted.lazy.compactMap(\.kind).first ?? stored?.kind ?? "ide",
-                subagentName: nil)
+                subagentName: nil, internalSubagent: false)
             let timestamp = info.updated > 0 ? info.updated : newest.modified
             let latest = LatestItem(title: title, timestamp: timestamp, sessionId: id)
             let signal = sessionSignal(segments: sorted, sessionID: id, title: title,
@@ -72,7 +86,7 @@ struct CodexCollector {
             // 子代理线程的结束/中断只是父会话的内部步骤，不作为独立会话展示；
             // 仍在运行的子代理保留，反映真实进行中的工作。
             let activity: TaskActivity? = signal.activity.flatMap {
-                guard stored?.subagentName != nil,
+                guard subagentName != nil,
                     $0.phase == "ended" || $0.phase == "interrupted"
                 else { return $0 }
                 return nil
@@ -123,7 +137,8 @@ struct CodexCollector {
                         updated: row["updated_at"]?.double ?? 0,
                         kind: ["cli", "exec"].contains(source) ? "cli" : "ide",
                         subagentName: row["agent_nickname"]?.string.flatMap { $0.isEmpty ? nil : $0 }
-                            ?? Self.subagentName(from: source)
+                            ?? Self.subagentName(from: source),
+                        internalSubagent: Self.isInternalSubagent(source: source)
                     )
                 }
                 if !values.isEmpty { return values }
@@ -138,7 +153,8 @@ struct CodexCollector {
                 title: Self.cleanedTitle(JSONValue.string(row["thread_name"])),
                 updated: DateSupport.timestamp(row["updated_at"]) ?? 0,
                 kind: "cli",
-                subagentName: nil
+                subagentName: nil,
+                internalSubagent: false
             )
         }
     }
@@ -169,14 +185,31 @@ struct CodexCollector {
     /// {"subagent":{"thread_spawn":{...,"agent_nickname":"Heisenberg"}}} 或
     /// {"subagent":{"other":"guardian"}}。普通来源是 "cli"/"vscode" 等裸字符串。
     static func subagentName(from source: String) -> String? {
-        guard source.hasPrefix("{"), let object = JSONValue.object(from: source),
-            let subagent = object["subagent"] as? JSONObject
+        guard source.hasPrefix("{"), let object = JSONValue.object(from: source)
         else { return nil }
+        return subagentName(from: object)
+    }
+
+    static func subagentName(from object: JSONObject) -> String? {
+        guard let subagent = object["subagent"] as? JSONObject else { return nil }
         if let spawn = subagent["thread_spawn"] as? JSONObject {
             return JSONValue.string(spawn["agent_nickname"]) ?? ""
         }
         if let other = JSONValue.string(subagent["other"]) { return other }
         return ""
+    }
+
+    /// {"subagent":{"other":...}} 是 Codex 自己的内部步骤（目前是 guardian 安全评审），
+    /// 与用户在侧边栏能看到的有昵称委派子代理（thread_spawn）不同，不作为会话展示。
+    static func isInternalSubagent(source: String) -> Bool {
+        guard source.hasPrefix("{"), let object = JSONValue.object(from: source)
+        else { return false }
+        return isInternalSubagent(source: object)
+    }
+
+    static func isInternalSubagent(source object: JSONObject) -> Bool {
+        guard let subagent = object["subagent"] as? JSONObject else { return false }
+        return subagent["other"] != nil
     }
 
     /// 线程库没有标题（或标题只是上下文块）时，从最新分段的头部按序找第一条
@@ -209,6 +242,8 @@ struct CodexCollector {
         let path: String
         let modified: TimeInterval
         let kind: String?
+        let subagentName: String?
+        let internalSubagent: Bool
     }
 
     /// The session header identifies the actual thread and source even while the
@@ -216,19 +251,33 @@ struct CodexCollector {
     /// recently touched. Compaction continuation files are named
     /// rollout-…-<线程id>_<新rolloutid>.jsonl, so the thread id can only come
     /// from the header, not the filename.
-    private func sessionHeader(_ path: String) -> (id: String?, kind: String?) {
-        guard let handle = FileHandle(forReadingAtPath: path) else { return (nil, nil) }
+    /// source 对子代理线程是对象（{"subagent":…}）而非字符串，这里一并解析，
+    /// 线程库读取失败时仍能识别 guardian 评审等内部线程。
+    private func sessionHeader(_ path: String)
+        -> (id: String?, kind: String?, subagentName: String?, internalSubagent: Bool)
+    {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return (nil, nil, nil, false) }
         defer { try? handle.close() }
         let data = (try? handle.read(upToCount: 65_536)) ?? Data()
         guard let line = String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline).first,
               let object = JSONValue.object(from: String(line)),
               JSONValue.string(object["type"]) == "session_meta",
-              let payload = object["payload"] as? JSONObject else { return (nil, nil) }
+              let payload = object["payload"] as? JSONObject else { return (nil, nil, nil, false) }
         let id = JSONValue.string(payload["id"]) ?? JSONValue.string(payload["session_id"])
-        let kind = JSONValue.string(payload["source"]).map {
-            ["cli", "exec"].contains($0) ? "cli" : "ide"
+        var kind: String?
+        var subagentName: String?
+        var internalSubagent = false
+        if let source = JSONValue.string(payload["source"]) {
+            kind = ["cli", "exec"].contains(source) ? "cli" : "ide"
+        } else if let source = payload["source"] as? JSONObject {
+            subagentName = Self.subagentName(from: source)
+            internalSubagent = Self.isInternalSubagent(source: source)
         }
-        return (id, kind)
+        if JSONValue.string(payload["thread_source"]) == "guardian_review" {
+            internalSubagent = true
+            subagentName = subagentName ?? "guardian"
+        }
+        return (id, kind, subagentName, internalSubagent)
     }
 
     private func sessionID(from path: String) -> String {
