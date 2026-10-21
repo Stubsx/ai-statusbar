@@ -287,17 +287,9 @@ struct PanelView: View {
                 if usageViewMode == "chart" {
                     usageChart(entries: entries)
                 } else {
-                    Button(action: { usageViewMode = "chart" }) {
-                        HStack(spacing: 3) {
-                            Image(systemName: "chevron.left")
-                            Text("返回图表")
-                        }
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundColor(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.bottom, 2)
                     usageList(entries: entries)
+                        .contentShape(Rectangle())
+                        .onTapGesture { usageViewMode = "chart" }
                 }
             } else {
                 Text("统计中…（首次全量索引约需几秒）")
@@ -329,6 +321,11 @@ struct PanelView: View {
             if usageBreakdown == "models" && (rangeModels ?? [:]).isEmpty {
                 Text("此时间范围暂无模型明细").font(.system(size: 11)).foregroundColor(.secondary)
             }
+            Text("点击返回图表 →")
+                .font(.system(size: 9))
+                .foregroundColor(.secondary.opacity(0.6))
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.top, 6)
             syncSummary
         }
     }
