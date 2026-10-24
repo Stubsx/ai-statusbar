@@ -48,18 +48,24 @@ final class BallAnimationMonitor {
     deinit { stop() }
 }
 
+enum BallOrbitRole {
+    case light, orbit
+}
+
 /// Keep the existing SwiftUI drawing static; only its native container rotates.
 /// SwiftUI repeatForever otherwise keeps the hosting layout active on every frame.
 struct BallOrbitRotation<Content: View>: View {
     let duration: TimeInterval
     let reduceMotion: Bool
+    var resting = false
+    var role: BallOrbitRole = .orbit
     @ViewBuilder let content: () -> Content
 
     var body: some View {
         if reduceMotion {
             content()
         } else {
-            BallOrbitHost(content: content(), duration: duration)
+            BallOrbitHost(content: content(), duration: duration, resting: resting, role: role)
         }
     }
 }
@@ -67,15 +73,19 @@ struct BallOrbitRotation<Content: View>: View {
 private struct BallOrbitHost<Content: View>: NSViewRepresentable {
     let content: Content
     let duration: TimeInterval
+    let resting: Bool
+    let role: BallOrbitRole
 
     func makeNSView(context: Context) -> BallOrbitView {
         let hosted = NSHostingView(rootView: content)
         if #available(macOS 13.0, *) { hosted.sizingOptions = [] }
-        return BallOrbitView(content: hosted, duration: duration)
+        return BallOrbitView(content: hosted, duration: duration, resting: resting, role: role)
     }
 
     func updateNSView(_ view: BallOrbitView, context: Context) {
         (view.content as? NSHostingView<Content>)?.rootView = content
+        view.setDuration(duration)
+        view.setResting(resting)
     }
 
     static func dismantleNSView(_ view: BallOrbitView, coordinator: ()) { view.stop() }
@@ -83,17 +93,24 @@ private struct BallOrbitHost<Content: View>: NSViewRepresentable {
 
 final class BallOrbitView: NSView {
     let content: NSView
+    let role: BallOrbitRole
     private let rotor = NSView()
     private var clock: BallInkFlowClock
+    private var resting: Bool
     private var visibilityObserver: NSObjectProtocol?
     private var visibilityObservation: NSKeyValueObservation?
     private var animationSize = CGSize.zero
     private var attached = false
-    let playbackMonitor = BallAnimationMonitor(effect: "orbit")
+    let playbackMonitor: BallAnimationMonitor
 
-    init(content: NSView, duration: TimeInterval) {
+    var animationKey: String { role == .light ? "ball-light" : "ball-orbit" }
+
+    init(content: NSView, duration: TimeInterval, resting: Bool = false, role: BallOrbitRole = .orbit) {
         self.content = content
+        self.role = role
+        self.resting = resting
         clock = BallInkFlowClock(duration: duration)
+        playbackMonitor = BallAnimationMonitor(effect: role == .light ? "light" : "orbit")
         super.init(frame: .zero)
         wantsLayer = true
         rotor.wantsLayer = true
@@ -132,6 +149,19 @@ final class BallOrbitView: NSView {
     override func viewDidHide() { super.viewDidHide(); updatePlayback() }
     override func viewDidUnhide() { super.viewDidUnhide(); updatePlayback() }
 
+    func setDuration(_ value: TimeInterval) {
+        guard value != clock.duration else { return }
+        clock.setDuration(value, at: CACurrentMediaTime())
+        animationSize = .zero
+        updatePlayback()
+    }
+
+    func setResting(_ value: Bool) {
+        guard resting != value else { return }
+        resting = value
+        updatePlayback()
+    }
+
     private func updatePlayback() {
         guard canPlay else { pause(); return }
         guard bounds.width > 0, bounds.height > 0, let layer = rotor.layer else { return }
@@ -144,7 +174,7 @@ final class BallOrbitView: NSView {
             return Double(transform.m11).bitPattern ^ Double(transform.m12).bitPattern
         }, draw: { [weak self] in self?.drawFallback() })
         if playbackMonitor.usesFallback { drawFallback(); return }
-        guard layer.animation(forKey: "ball-orbit") == nil || animationSize != bounds.size else { return }
+        guard layer.animation(forKey: animationKey) == nil || animationSize != bounds.size else { return }
         // AppKit owns backing-layer anchorPoint (0,0), so changing it is undone
         // on the next layout. Rotate around the center in the transform itself.
         let animation = CAKeyframeAnimation(keyPath: "transform")
@@ -155,7 +185,7 @@ final class BallOrbitView: NSView {
         animation.duration = clock.duration
         animation.repeatCount = .infinity
         animation.beginTime = layer.convertTime(now, from: nil) - clock.phase(at: now) * clock.duration
-        layer.add(animation, forKey: "ball-orbit")
+        layer.add(animation, forKey: animationKey)
         animationSize = bounds.size
     }
 
@@ -166,7 +196,7 @@ final class BallOrbitView: NSView {
     }
 
     private var canPlay: Bool {
-        guard attached, let window else { return false }
+        guard attached, let window, !resting else { return false }
         return window.isVisible && window.occlusionState.contains(.visible) && !isHiddenOrHasHiddenAncestor
     }
 
@@ -174,7 +204,7 @@ final class BallOrbitView: NSView {
         guard canPlay else { pause(); return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        rotor.layer?.removeAnimation(forKey: "ball-orbit")
+        rotor.layer?.removeAnimation(forKey: animationKey)
         rotor.layer?.transform = rotation(phase: clock.phase(at: CACurrentMediaTime()))
         CATransaction.commit()
     }
@@ -185,7 +215,7 @@ final class BallOrbitView: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         rotor.layer?.transform = rotation(phase: clock.phase(at: CACurrentMediaTime()))
-        rotor.layer?.removeAnimation(forKey: "ball-orbit")
+        rotor.layer?.removeAnimation(forKey: animationKey)
         CATransaction.commit()
     }
 
@@ -202,215 +232,61 @@ final class BallOrbitView: NSView {
     deinit { stop() }
 }
 
-/// 原生层播放程序生成的墨层帧，不通过 SwiftUI 时间线逐帧触发布局。
-struct BallInkFlow: NSViewRepresentable {
+/// 静态主体与柔光共用同一布局；预览相位只用于离线导出，不参与常规播放。
+struct BallInkFlow: View {
     let working: Bool
     var palette: BallInkDrawing.Palette = .ink
     var resting = false
+    var previewPhase: Double? = nil
 
-    func makeNSView(context: Context) -> BallInkFlowView {
-        BallInkFlowView(working: working, palette: palette, resting: resting)
-    }
-
-    func updateNSView(_ view: BallInkFlowView, context: Context) {
-        view.setWorking(working)
-        view.setResting(resting)
-    }
-
-    static func dismantleNSView(_ view: BallInkFlowView, coordinator: ()) {
-        view.stop()
+    var body: some View {
+        ZStack {
+            if let image = palette.still {
+                Image(decorative: image, scale: 1)
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+            } else {
+                Circle().fill(palette == .ink ? Color(white: 0.16) : Color(red: 0.18, green: 0.56, blue: 0.99))
+            }
+            if let previewPhase {
+                BallLightSweep(palette: palette)
+                    .rotationEffect(.degrees(previewPhase * 360))
+            } else {
+                BallOrbitRotation(duration: palette.flowDuration(working: working),
+                                  reduceMotion: false, resting: resting, role: .light) {
+                    BallLightSweep(palette: palette)
+                }
+            }
+        }
+        .clipShape(Circle())
     }
 }
 
-/// 由系统合成缓存帧，色层自然流动，不响应指针扰动。
-final class BallInkFlowView: NSView {
-    private let palette: BallInkDrawing.Palette
-    private let paint = CALayer()
-    private var frames: [CGImage] = []
-    private var loading = false
-    private var visibilityObserver: NSObjectProtocol?
-    private var visibilityObservation: NSKeyValueObservation?
-    private var clock: BallInkFlowClock
-    private var resting: Bool
-    private var attached = false
-    let playbackMonitor = BallAnimationMonitor(effect: "flow")
+private struct BallLightSweep: View {
+    let palette: BallInkDrawing.Palette
 
-    init(working: Bool, palette: BallInkDrawing.Palette = .ink, resting: Bool = false) {
-        self.palette = palette
-        self.resting = resting
-        clock = BallInkFlowClock(duration: palette.flowDuration(working: working))
-        super.init(frame: .zero)
-        wantsLayer = true
-        layer = CALayer()
-        paint.contents = palette.still
-        paint.contentsGravity = .resizeAspect
-        paint.minificationFilter = .linear
-        paint.magnificationFilter = .linear
-        layer?.addSublayer(paint)
+    var body: some View {
+        Circle()
+            .stroke(
+                AngularGradient(
+                    stops: [
+                        .init(color: .clear, location: 0),
+                        .init(color: .clear, location: 0.46),
+                        .init(color: .white.opacity(palette == .blue ? 0.08 : 0.04), location: 0.56),
+                        .init(color: .white.opacity(palette == .blue ? 0.38 : 0.24), location: 0.70),
+                        .init(color: .white.opacity(palette == .blue ? 0.08 : 0.04), location: 0.82),
+                        .init(color: .clear, location: 0.92)
+                    ],
+                    center: .center
+                ),
+                lineWidth: 6
+            )
+            .blur(radius: 1.6)
+            .padding(4)
+            .frame(width: 56, height: 56)
+            .clipShape(Circle())
     }
-
-    required init?(coder: NSCoder) { return nil }
-    override var isFlipped: Bool { true }
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
-
-    override func layout() {
-        super.layout()
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        paint.frame = bounds
-        CATransaction.commit()
-    }
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        stop()
-        guard let window else { return }
-        attached = true
-        visibilityObservation = window.observe(\.isVisible) { [weak self] _, _ in self?.updatePlayback() }
-        visibilityObserver = NotificationCenter.default.addObserver(
-            forName: NSWindow.didChangeOcclusionStateNotification,
-            object: window, queue: .main
-        ) { [weak self] _ in self?.updatePlayback() }
-        updatePlayback()
-    }
-
-    override func viewDidHide() { super.viewDidHide(); updatePlayback() }
-    override func viewDidUnhide() { super.viewDidUnhide(); updatePlayback() }
-
-    func setWorking(_ working: Bool) {
-        let duration = palette.flowDuration(working: working)
-        guard duration != clock.duration else { return }
-        clock.setDuration(duration, at: CACurrentMediaTime())
-        if clock.playing {
-            if playbackMonitor.usesFallback { drawFallback() } else { installAnimation() }
-        }
-    }
-
-    func setResting(_ value: Bool) {
-        guard resting != value else { return }
-        resting = value
-        updatePlayback()
-    }
-
-    private var canPlay: Bool {
-        guard attached, let window else { return false }
-        return window.isVisible && window.occlusionState.contains(.visible) && !isHiddenOrHasHiddenAncestor
-    }
-
-    private func updatePlayback() {
-        guard canPlay else {
-            pause()
-            return
-        }
-        if resting {
-            playbackMonitor.stop()
-            clock.pause(at: CACurrentMediaTime())
-            showBaseFrame()
-            return
-        }
-        guard !frames.isEmpty else {
-            prepareFrames()
-            return
-        }
-        if !clock.playing { clock.resume(at: CACurrentMediaTime()) }
-        playbackMonitor.start(inspect: { [weak self] in
-            guard let self else { return nil }
-            self.updatePlayback()
-            return self.presentationSignature()
-        }, draw: { [weak self] in self?.drawFallback() })
-        if playbackMonitor.usesFallback { drawFallback(); return }
-        if paint.animation(forKey: "ink-flow") == nil { installAnimation() }
-    }
-
-    private func prepareFrames() {
-        guard !loading else { return }
-        loading = true
-        let palette = self.palette
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let startup = palette.startupFrames
-            DispatchQueue.main.async { [weak self] in self?.acceptFrames(startup, final: false) }
-            let frames = palette.frames
-            DispatchQueue.main.async { [weak self] in self?.acceptFrames(frames, final: true) }
-        }
-    }
-
-    private func acceptFrames(_ frames: [CGImage], final: Bool) {
-        if final { loading = false }
-        guard !frames.isEmpty else { return }
-        self.frames = frames
-        paint.removeAnimation(forKey: "ink-flow")
-        // 替换缓存不重置相位；隐藏/销毁期间完成的后台任务不能重新开播。
-        updatePlayback()
-    }
-
-    private func presentationSignature() -> UInt64? {
-        guard let contents = paint.presentation()?.contents,
-              let data = (contents as! CGImage).dataProvider?.data,
-              let bytes = CFDataGetBytePtr(data) else { return nil }
-        let count = CFDataGetLength(data)
-        guard count > 0 else { return nil }
-        var hash: UInt64 = 14695981039346656037
-        // 分散取样内部颜色，无需复制/遍历整帧像素。
-        for index in stride(from: 0, to: count, by: max(1, count / 257)) {
-            hash = (hash ^ UInt64(bytes[index])) &* 1099511628211
-        }
-        return hash
-    }
-
-    private func drawFallback() {
-        guard canPlay, !resting else { pause(); return }
-        showBaseFrame()
-    }
-
-    private func installAnimation() {
-        guard let first = frames.first else { return }
-        let now = CACurrentMediaTime()
-        let phase = clock.phase(at: now)
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        paint.contents = frames[min(frames.count - 1, Int(phase * Double(frames.count)))]
-        let animation = CAKeyframeAnimation(keyPath: "contents")
-        animation.values = frames + [first]
-        animation.keyTimes = (0...frames.count).map { NSNumber(value: Double($0) / Double(frames.count)) }
-        animation.calculationMode = .discrete
-        animation.duration = clock.duration
-        animation.repeatCount = .infinity
-        animation.beginTime = paint.convertTime(now, from: nil) - phase * clock.duration
-        paint.add(animation, forKey: "ink-flow")
-        CATransaction.commit()
-    }
-
-    private func pause() {
-        playbackMonitor.stop()
-        let now = CACurrentMediaTime()
-        clock.pause(at: now)
-        showBaseFrame()
-    }
-
-    private func currentFrame(at time: TimeInterval) -> CGImage? {
-        guard !frames.isEmpty else { return palette.still }
-        return frames[min(frames.count - 1, Int(clock.phase(at: time) * Double(frames.count)))]
-    }
-
-    private func showBaseFrame() {
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        paint.contents = currentFrame(at: CACurrentMediaTime())
-        paint.removeAnimation(forKey: "ink-flow")
-        CATransaction.commit()
-    }
-
-    func stop() {
-        attached = false
-        pause()
-        visibilityObservation = nil
-        if let visibilityObserver {
-            NotificationCenter.default.removeObserver(visibilityObserver)
-            self.visibilityObserver = nil
-        }
-    }
-
-    deinit { stop() }
 }
 
 /// 用单调时钟保持首尾循环、速度变化与暂停恢复连续。

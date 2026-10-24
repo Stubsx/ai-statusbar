@@ -149,10 +149,17 @@ func runChecks() throws {
         assert(transparent > texture.width * texture.height / 5)
         assert(translucent > 0 && translucent < texture.width * texture.height / 40,
                "Only a narrow antialiased edge should be translucent")
-        assert(lightest - darkest > 70, "Washes need visible concentration changes, not a flat tint")
+        assert(lightest - darkest > (palette == .ink ? 60 : 25),
+               "Color planes need visible depth without noisy texture")
         if palette == .blue { assert(darkest > 20, "Keep the blue face bright enough") }
     }
     assert(BallInkDrawing.dark === BallInkDrawing.dark)
+    for palette in [BallInkDrawing.Palette.ink, .blue] {
+        let first = BallInkDrawing.render(size: 64, phase: 0, palette: palette)!
+        let later = BallInkDrawing.render(size: 64, phase: 0.5, palette: palette)!
+        assert(first.dataProvider?.data as Data? == later.dataProvider?.data as Data?,
+               "Static artwork must not depend on the light phase")
+    }
     let appearanceSuite = "lingmou.ink-migration.\(UUID().uuidString)"
     let appearanceDefaults = UserDefaults(suiteName: appearanceSuite)!
     defer { appearanceDefaults.removePersistentDomain(forName: appearanceSuite) }
@@ -164,49 +171,7 @@ func runChecks() throws {
     assert(appearanceDefaults.string(forKey: "floatingBallAppearance") == "blue")
     print(String(format: "PASS: cached ink/blue washes, transparency, premultiplied color and tonal range (%.2fs)",
                  Date().timeIntervalSince(inkStarted)))
-    let inkFrames = BallInkDrawing.flowFrames
-    let blueFrames = BallInkDrawing.blueFlowFrames
-    for palette in [BallInkDrawing.Palette.ink, .blue] {
-        let startup = palette.startupFrames
-        assert(startup.count == 24 && startup.first?.width == 112)
-        assert(startup.first === palette.startupFrames.first)
-        let startupAlpha = startup.map { image -> [UInt8] in
-            let bytes = image.dataProvider!.data! as Data
-            return stride(from: 3, to: bytes.count, by: 4).map { bytes[$0] }
-        }
-        assert(startupAlpha.dropFirst().allSatisfy { $0 == startupAlpha[0] },
-               "Startup playback must keep the same circular silhouette")
-        let frames = palette.frames
-        assert(frames.count == BallInkDrawing.flowFrameCount)
-        assert(frames.first === palette.frames.first)
-        let frameBytes = frames.map { image -> Data in
-            assert(image.width == 160 && image.height == 160)
-            return image.dataProvider!.data! as Data
-        }
-        for bytes in frameBytes {
-            for pixel in stride(from: 0, to: bytes.count, by: 4) {
-                for channel in 0..<3 {
-                    assert(bytes[pixel + channel] <= bytes[pixel + 3], "Animated washes must keep valid transparent edges")
-                }
-                assert(bytes[pixel + 3] == frameBytes[0][pixel + 3],
-                       "Internal pigment flow must not move or roughen the outline")
-                let row = pixel / 4 / 160, column = pixel / 4 % 160
-                if row == 0 || column == 0 || row == 159 || column == 159 {
-                    assert(bytes[pixel + 3] == 0, "Circle edges must not touch the frame")
-                }
-            }
-        }
-        func difference(_ lhs: Data, _ rhs: Data) -> Double {
-            zip(lhs, rhs).reduce(0.0) { $0 + Double(abs(Int($1.0) - Int($1.1))) } / Double(lhs.count)
-        }
-        let largestStep = (1..<frameBytes.count).map { difference(frameBytes[$0 - 1], frameBytes[$0]) }.max()!
-        let seam = difference(frameBytes.last!, frameBytes.first!)
-        let excursion = difference(frameBytes[0], frameBytes[frameBytes.count / 2])
-        assert(seam <= largestStep * 1.5 + 0.01, "The loop seam must be as smooth as neighboring frames")
-        assert(largestStep < 2.5 && excursion > 1, "Washes should flow gradually without flickering or staying still")
-        print(String(format: "PASS: %@ flow, %d cached frames, step %.3f / seam %.3f / motion %.3f",
-                     String(describing: palette), frames.count, largestStep, seam, excursion))
-    }
+    print("PASS: cached static color planes are phase-independent")
     var flowClock = BallInkFlowClock(duration: 14)
     flowClock.resume(at: 100)
     assert(abs(flowClock.phase(at: 103.5) - 0.25) < 0.00001)
@@ -216,12 +181,12 @@ func runChecks() throws {
     assert(abs(flowClock.phase(at: 1000) - 0.5) < 0.00001)
     flowClock.resume(at: 1000)
     assert(abs(flowClock.phase(at: 1004)) < 0.00001)
-    let flowView = BallInkFlowView(working: true)
+    let flowView = BallOrbitView(content: NSView(), duration: 7, role: .light)
     assert(flowView.hitTest(.zero) == nil)
-    assert(flowView.layer?.sublayers?.first?.animation(forKey: "ink-flow") == nil)
+    assert(flowView.subviews.first?.layer?.animation(forKey: "ball-light") == nil)
     flowView.stop()
     flowView.stop()
-    print("PASS: continuous speed and pause; native animation hit-test passthrough")
+    print("PASS: continuous speed and pause; native light animation hit-test passthrough")
     let samples: [(String, PetMood, CGSize)] = [
         ("居中", .idle, .zero),
         ("运行 1 个", .working(taskCount: 1), CGSize(width: -3.5, height: -3.5)),
@@ -332,7 +297,7 @@ func runChecks() throws {
                                     .scaleEffect(2).frame(width: 128, height: 128)
                                 VStack(alignment: .leading, spacing: 6) {
                                     Text(appearance.title).font(.system(size: 22, weight: .medium))
-                                    Text(appearance == .ink ? "浓淡相生 · 一笔灵眸" : "天蓝叠染 · 水色流动")
+                                    Text(appearance == .ink ? "克制单色 · 轨道流光" : "清透色面 · 轨道流光")
                                         .font(.system(size: 11)).foregroundColor(.secondary)
                                 }
                             }
@@ -369,7 +334,6 @@ func runChecks() throws {
     }
     try renderAppearances([.blue, .ink], detailAppearance: .ink, filename: "ink-appearance-preview.png")
     for appearance in [FloatingBallAppearance.ink, .blue] {
-        let frames = appearance == .ink ? inkFrames : blueFrames
         let duration = (appearance == .ink ? BallInkDrawing.Palette.ink : .blue).flowDuration(working: true)
         let prefix = appearance == .ink ? "ink" : "blue"
         let portraitContent = HStack(spacing: 0) {
@@ -402,19 +366,21 @@ func runChecks() throws {
         else { fatalError("Ink portrait rendering failed") }
         try portraitPNG.write(to: output.appendingPathComponent("\(prefix)-polished-preview.png"))
         let gifURL = output.appendingPathComponent("\(prefix)-flow-preview.gif")
+        let frameCount = 48
         guard let gif = CGImageDestinationCreateWithURL(gifURL as CFURL, "com.compuserve.gif" as CFString,
-                                                        frames.count, nil) else { fatalError("GIF creation failed") }
+                                                        frameCount, nil) else { fatalError("GIF creation failed") }
         CGImageDestinationSetProperties(gif, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]] as CFDictionary)
-        for (frameIndex, frame) in frames.enumerated() {
+        for frameIndex in 0..<frameCount {
+            let phase = Double(frameIndex) / Double(frameCount)
             let content = HStack(spacing: 0) {
                 ForEach(0..<2) { row in
                     VStack(spacing: 16) {
-                        Text("\(appearance.title) · 流动").font(.system(size: 17, weight: .medium))
+                        Text("\(appearance.title) · 流光").font(.system(size: 17, weight: .medium))
                         FloatingBallArtwork(mood: .working(taskCount: 1), gaze: .zero, hovered: false,
-                                            reduceMotion: true, appearance: appearance, washFrame: frame)
+                                            reduceMotion: true, appearance: appearance, motionPhase: phase)
                             .scaleEffect(2.5).frame(width: 160, height: 160)
                         FloatingBallArtwork(mood: .idle, gaze: .zero, hovered: false,
-                                            reduceMotion: true, appearance: appearance, washFrame: frame)
+                                            reduceMotion: true, appearance: appearance, motionPhase: phase)
                     }
                     .padding(24)
                     .background(Color(white: row == 0 ? 0.97 : 0.10))
@@ -425,8 +391,8 @@ func runChecks() throws {
             renderer.scale = 2
             guard let image = renderer.cgImage else { fatalError("Flow frame rendering failed") }
             // GIF 只能存百分之一秒，分配余数以保持与原生层相同的循环时长。
-            let delay = (floor(Double(frameIndex + 1) * duration * 100 / Double(frames.count))
-                         - floor(Double(frameIndex) * duration * 100 / Double(frames.count))) / 100
+            let delay = (floor(Double(frameIndex + 1) * duration * 100 / Double(frameCount))
+                         - floor(Double(frameIndex) * duration * 100 / Double(frameCount))) / 100
             CGImageDestinationAddImage(gif, image, [kCGImagePropertyGIFDictionary: [
                 kCGImagePropertyGIFDelayTime: delay,
                 kCGImagePropertyGIFUnclampedDelayTime: delay

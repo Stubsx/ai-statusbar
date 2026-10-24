@@ -133,8 +133,8 @@ struct FloatingBallArtwork: View {
     var appearance: FloatingBallAppearance = .blue
     var lowEnergyMode = false
     var tracksPointer = false
-    /// 导出动效预览时指定一帧，常规显示由原生动画层播放。
-    var washFrame: CGImage? = nil
+    /// 导出动效预览时指定流光相位，常规显示由原生动画层播放。
+    var motionPhase: Double? = nil
 
     private var palette: BallInkDrawing.Palette { appearance == .ink ? .ink : .blue }
     private var staticEffects: Bool { reduceMotion || lowEnergyMode }
@@ -166,12 +166,11 @@ struct FloatingBallArtwork: View {
 
             ZStack {
                 Group {
-                    if let washFrame {
-                        BallWashBody(image: washFrame, palette: palette)
-                    } else if staticEffects {
+                    if staticEffects && motionPhase == nil {
                         BallWashBody(image: palette.still, palette: palette)
                     } else {
-                        BallInkFlow(working: working, palette: palette, resting: mood == .sleeping)
+                        BallInkFlow(working: working, palette: palette, resting: mood == .sleeping,
+                                    previewPhase: motionPhase)
                             .id(appearance)
                     }
                 }
@@ -240,47 +239,31 @@ private struct BallInkOrbit: View {
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        BallOrbitRotation(duration: 3.6, reduceMotion: reduceMotion) { artwork }
+        BallOrbitRotation(duration: 4.8, reduceMotion: reduceMotion) { artwork }
             .frame(width: 58, height: 58)
             .allowsHitTesting(false)
     }
 
     private var artwork: some View {
-        ZStack {
-            ForEach(0..<3) { band in
-                BallInkArc(band: band)
-                    .fill(LinearGradient(
-                        colors: [Color(white: 0.55).opacity(0.25),
-                                 Color(white: colorScheme == .dark ? 0.82 : 0.18).opacity(0.75),
-                                 Color(white: 0.45).opacity(0.45)],
-                        startPoint: .topLeading, endPoint: .bottomTrailing))
-                    .opacity(band == 0 ? 1 : 0.48)
-            }
-        }
-        .frame(width: 58, height: 58)
+        BallInkArc()
+            .fill(Color(white: colorScheme == .dark ? 0.88 : 0.16).opacity(0.78))
+            .frame(width: 58, height: 58)
     }
 }
 
-/// 不规则笔锋和分叉枯笔共用固定噪声场，转动时整笔旋转。
+/// 一条有起收笔的开放墨弧；整条弧由原生层旋转。
 private struct BallInkArc: Shape {
-    var band = 0
-
     func path(in rect: CGRect) -> Path {
         let unit = Double(min(rect.width, rect.height))
         var outer: [CGPoint] = []
         var inner: [CGPoint] = []
-        let start = [-51.0, 110.0, 126.0][band]
-        let sweep = [222.0, 51.0, 35.0][band]
-        for step in 0...160 {
-            let t = Double(step) / 160
-            let angle = (start + t * sweep) * .pi / 180
+        for step in 0...96 {
+            let t = Double(step) / 96
+            let angle = (-55 + t * 215) * .pi / 180
             let nx = cos(angle), ny = sin(angle)
-            let flow = BallInkDrawing.field(nx * 4 + 13, ny * 4 - 9)
-            let bristle = BallInkDrawing.noise(t * 11, Double(band) + 19)
-            let radius = unit * (0.454 + Double(band) * 0.012 + flow * 0.009)
-            let pressure = pow(max(0, sin(t * .pi)), 1.3)
-            let halfWidth = unit * (0.001 + (band == 0 ? 0.018 : 0.004) * pressure)
-                * (0.70 + bristle * 0.50)
+            let radius = unit * 0.454
+            let pressure = pow(max(0, sin(t * .pi)), 1.25)
+            let halfWidth = unit * (0.001 + 0.015 * pressure)
             outer.append(CGPoint(x: Double(rect.midX) + nx * (radius + halfWidth),
                                  y: Double(rect.midY) + ny * (radius + halfWidth)))
             inner.append(CGPoint(x: Double(rect.midX) + nx * (radius - halfWidth),
@@ -348,23 +331,12 @@ private struct BallOrbitGlow: View {
     let reduceMotion: Bool
 
     var body: some View {
-        BallOrbitRotation(duration: 2.8, reduceMotion: reduceMotion) { artwork }
+        BallOrbitRotation(duration: 3.6, reduceMotion: reduceMotion) { artwork }
             .frame(width: 54, height: 54)
             .allowsHitTesting(false)
     }
 
     private var artwork: some View {
-        ZStack {
-            ring(lineWidth: 5.2)
-                .blur(radius: 2.4)
-                .opacity(0.7)
-            ring(lineWidth: 1.8)
-                .opacity(0.95)
-        }
-        .frame(width: 54, height: 54)
-    }
-
-    private func ring(lineWidth: CGFloat) -> some View {
         Circle()
             .stroke(
                 AngularGradient(
@@ -378,8 +350,9 @@ private struct BallOrbitGlow: View {
                     ],
                     center: .center
                 ),
-                lineWidth: lineWidth
+                lineWidth: 1.8
             )
+            .frame(width: 54, height: 54)
     }
 }
 
