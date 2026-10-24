@@ -29,13 +29,16 @@ func renderExperience() throws {
     setbuf(stdout, nil)
     _ = NSApplication.shared
     let applicationLookup = NotificationRouter.kimiCodeApplicationURL
+    let dshApplicationLookup = NotificationRouter.dshApplicationURL
     let desktopPreference = NotificationRouter.prefersKimiDesktopSessionNavigation
     defer {
         NotificationRouter.kimiCodeApplicationURL = applicationLookup
+        NotificationRouter.dshApplicationURL = dshApplicationLookup
         NotificationRouter.prefersKimiDesktopSessionNavigation = desktopPreference
     }
     NotificationRouter.prefersKimiDesktopSessionNavigation = { false }
     NotificationRouter.kimiCodeApplicationURL = { nil }
+    NotificationRouter.dshApplicationURL = { nil }
     let codexID = "01234567-89ab-4cde-8fab-0123456789ab"
     assert(NotificationRouter.conversationURL(forToolKey: "codex-ide", sessionId: codexID)?.absoluteString
            == "codex://threads/\(codexID)")
@@ -56,6 +59,16 @@ func renderExperience() throws {
         assert(!NotificationRouter.supportsSessionNavigation(forToolKey: key, sessionId: codexID, kimiWebAvailable: true))
     }
     assert(!NotificationRouter.supportsApplicationNavigation(forToolKey: "unknown"))
+    assert(NotificationRouter.destinationLabel(forToolKey: "dsh") == "打开 DSH 页面")
+    NotificationRouter.dshApplicationURL = { URL(fileURLWithPath: "/fixture/DeepSeek Harness.app") }
+    for id in [nil, "session-fixture"] as [String?] {
+        assert(NotificationRouter.destinationLabel(forToolKey: "dsh", sessionId: id)
+               == "打开 DSH 应用（会话需在应用内选择）")
+        assert(!NotificationRouter.supportsSessionNavigation(forToolKey: "dsh", sessionId: id),
+               "Application-level DSH routing must not claim session deep links")
+    }
+    NotificationRouter.dshApplicationURL = { nil }
+    print("PASS: DSH desktop routing preserves Web fallback labels without claiming session deep links")
     let webLabel = NotificationRouter.destinationLabel(forToolKey: "kimi", sessionId: "web-session")
     NotificationRouter.kimiCodeApplicationURL = { URL(fileURLWithPath: "/fixture/Kimi Code.app") }
     for id in [nil, "web-session", "../bad"] as [String?] {

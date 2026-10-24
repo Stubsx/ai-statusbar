@@ -94,6 +94,10 @@ final class CollectorTests: XCTestCase {
              "hermes", "zcode", "dsh"])
     }
 
+    func testDshNavigationCapabilityIsDesktopFirst() {
+        XCTAssertEqual(ToolSupport.capabilities(for: "dsh").navigation, "application")
+    }
+
     func testPrivateJSONPermissions() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

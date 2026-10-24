@@ -26,6 +26,18 @@ enum NotificationRouter {
             Bundle(url: $0)?.bundleIdentifier == kimiCodeBundleID
         }
     }
+    private static let dshBundleID = "com.deepseek.dsh"
+    /// DeepSeek Harness 0.2.1-rc.2 only exposes application-level dsh://open links.
+    static var dshApplicationURL: () -> URL? = {
+        let running = NSRunningApplication.runningApplications(withBundleIdentifier: dshBundleID)
+            .first(where: { !$0.isTerminated })?.bundleURL
+        let candidates = [running, URL(fileURLWithPath: "/Applications/DeepSeek Harness.app"),
+                          FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications/DeepSeek Harness.app"),
+                          NSWorkspace.shared.urlForApplication(withBundleIdentifier: dshBundleID)]
+        return candidates.compactMap { $0 }.first {
+            Bundle(url: $0)?.bundleIdentifier == dshBundleID
+        }
+    }
 
     /// Rendering must never probe local servers or infer a session route from an app route.
     static func supportsSessionNavigation(forToolKey key: String, sessionId: String?,
@@ -63,7 +75,8 @@ enum NotificationRouter {
             return sessionId == nil ? "打开 Kimi 网页或宿主" : "打开对应 Kimi 会话或宿主"
         case "codex-cli", "claude": return "打开宿主终端或编辑器"
         case "claude-desktop": return "打开 Claude 应用"
-        case "dsh": return "打开 DSH 页面"
+        case "dsh":
+            return dshApplicationURL() == nil ? "打开 DSH 页面" : "打开 DSH 应用（会话需在应用内选择）"
         default: return "暂不支持自动打开"
         }
     }
@@ -105,13 +118,30 @@ enum NotificationRouter {
                 if activateRunningApp(bundleID: "com.nousresearch.hermes", named: []) { return }
                 if openHost(of: "hermes", reportMissing: false) { return }
                 openApplication(bundleID: "com.nousresearch.hermes", path: hermesDesktopAppPath())
-            case "dsh":
-                if !NSWorkspace.shared.open(URL(string: "http://127.0.0.1:3080/")!) {
-                    explain("无法打开 DSH 页面", detail: "请确认本机 DSH Web 服务和默认浏览器可用。")
-                }
+            case "dsh": openDSH()
             default:
                 explain("这个工具暂不支持自动打开", detail: "请回到原工具查看对应任务。")
             }
+        }
+    }
+
+    private static func openDSH() {
+        guard let applicationURL = dshApplicationURL() else {
+            openDSHWeb()
+            return
+        }
+        let app = NSRunningApplication.runningApplications(withBundleIdentifier: dshBundleID)
+            .first(where: { !$0.isTerminated })
+        app?.unhide()
+        if #available(macOS 14, *) {
+            NSApp.yieldActivation(toApplicationWithBundleIdentifier: dshBundleID)
+        }
+        openApplication(at: applicationURL, fallback: app, onFailure: openDSHWeb)
+    }
+
+    private static func openDSHWeb() {
+        if !NSWorkspace.shared.open(URL(string: "http://127.0.0.1:3080/")!) {
+            explain("无法打开 DSH 页面", detail: "请确认本机 DSH Web 服务和默认浏览器可用。")
         }
     }
 
@@ -418,7 +448,8 @@ enum NotificationRouter {
         openApplication(at: url)
     }
 
-    private static func openApplication(at url: URL, fallback: NSRunningApplication? = nil) {
+    private static func openApplication(at url: URL, fallback: NSRunningApplication? = nil,
+                                        onFailure: (() -> Void)? = nil) {
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
         configuration.hides = false
@@ -428,7 +459,11 @@ enum NotificationRouter {
             DispatchQueue.main.async {
                 if error != nil || app == nil {
                     if let fallback, requestActivation(fallback) { return }
-                    explain("应用打开失败", detail: "请从访达打开原应用后重试。")
+                    if let onFailure {
+                        onFailure()
+                    } else {
+                        explain("应用打开失败", detail: "请从访达打开原应用后重试。")
+                    }
                 }
             }
         }

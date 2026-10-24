@@ -13,7 +13,9 @@
 | Kimi Code | 主代理 step.end.finishReason=end_turn，且无未闭合子代理 | 暂不支持 | 暂不支持 | 暂不支持 | 优先 Kimi Code App 工作区深链（1.1.0+）；回退 Web 会话 / 宿主 |
 | Kimi Work | 同 Kimi Code | 暂不支持 | 暂不支持 | 暂不支持 | App |
 | Hermes | 无有效租约，且末条 assistant 明确 stop/end_turn/length | 明确 error/agent_error/content_filter | 暂不支持 | 暂不支持 | 已运行应用或宿主 |
-| DSH | 暂不支持 | 暂不支持 | 暂不支持 | 暂不支持 | 本机默认 3080 端口 Web 页面 |
+| DSH | 投影缓存 turnBoundary.lastStepBoundary.kind=end | 暂不支持 | 暂不支持 | 暂不支持 | 优先 DeepSeek Harness App（应用内选择会话）；回退本机默认 3080 Web 页面 |
+
+DeepSeek Harness 的工具名称、会话行和单条通知点击优先打开官方桌面版，按 `com.deepseek.dsh` 识别并复用运行实例，通过系统重开请求恢复窗口；未安装或启动失败时回退到本机默认 3080 端口 Web 页面。当前核验的桌面版 0.2.1-rc.2 只提供应用级 `dsh://open`，没有按会话 ID 选择会话的外部深链或路由，因此点击后仍需在应用内选择目标会话，不会拼接未经支持的链接，也不申请辅助功能权限。
 
 ZCode 3.x（本机核验版本 3.14.0）仍从 `~/.zcode/cli/db/db.sqlite` 的 `turn_usage` 读取回合状态，从 `model_usage` 读取用量。真实用户消息可在运行记录落库前触发忙碌；同为 `role=user` 的后台提醒、压缩摘要和隐藏系统消息不算新追问，已关联到结束回合的晚到消息也不重开任务。`session_input` 中立即执行的已接收输入，以及已提升执行但尚未写入消息的排队输入，参与短时开始检测；仅排队、引导中或已取消／丢弃／失败的输入不单独触发忙碌。运行记录仍是主要依据，应用退出后不以残留输入维持运行。缺少新字段或输入表的旧版本保留原有消息／日志回退。核验包含本地结构读取及合成样例的运行、结束、取消与退出测试，未自动发送真实模型请求。
 
