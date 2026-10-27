@@ -19,10 +19,11 @@ struct ExchangeRateCache: Codable {
     let sourceDate: String?
 }
 
-/// OpenRouter publishes USD per token. Only exact catalog IDs are used; a
+/// Public catalogs provide USD estimates. Only exact catalog IDs are used; a
 /// subscription or a different provider may charge a different actual amount.
 enum ModelPricing {
     static let catalogURL = URL(string: "https://openrouter.ai/api/v1/models")!
+    static let modelsDevCatalogURL = URL(string: "https://models.dev/api.json")!
     static let exchangeURL = URL(string: "https://api.frankfurter.app/latest?from=USD&to=CNY")!
     static let refreshInterval: TimeInterval = 86_400
     static let retryInterval: TimeInterval = 3_600
@@ -122,6 +123,60 @@ enum ModelPricing {
         return prices
     }
 
+    static func modelsDevCachePath(home: String) -> String {
+        (home as NSString).appendingPathComponent(".ai-statusbar/model-prices-models-dev.json")
+    }
+
+    static func collectModelsDev(
+        environment: CollectorEnvironment,
+        files: FileSupport,
+        enabled: Bool,
+        request: (() -> Data?)? = nil
+    ) -> ModelPriceCache? {
+        guard enabled else { return nil }
+        let path = modelsDevCachePath(home: environment.homeDirectory)
+        let cached = files.read(path).flatMap { try? JSONDecoder().decode(ModelPriceCache.self, from: $0) }
+        let now = environment.now
+        if let cached, now - cached.fetchedAt < refreshInterval { return cached }
+        if let cached, now - cached.lastAttemptAt < retryInterval {
+            return cached.prices.isEmpty ? nil : cached
+        }
+
+        let data = request?() ?? (request == nil ? download(modelsDevCatalogURL, timeout: 20) : nil)
+        if let data, let prices = parseModelsDevCatalog(data), !prices.isEmpty {
+            let fresh = ModelPriceCache(fetchedAt: now, lastAttemptAt: now, prices: prices)
+            save(fresh, to: path, files: files)
+            return fresh
+        }
+        let failed = ModelPriceCache(
+            fetchedAt: cached?.fetchedAt ?? 0, lastAttemptAt: now,
+            prices: cached?.prices ?? [:])
+        save(failed, to: path, files: files)
+        return failed.prices.isEmpty ? nil : failed
+    }
+
+    static func parseModelsDevCatalog(_ data: Data) -> [String: ModelUnitPrice]? {
+        guard let providers = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        var prices: [String: ModelUnitPrice] = [:]
+        for (providerID, value) in providers {
+            guard let provider = value as? [String: Any],
+                  let models = provider["models"] as? [String: Any] else { continue }
+            for value in models.values {
+                guard let model = value as? [String: Any],
+                      let id = model["id"] as? String, !id.isEmpty,
+                      let cost = model["cost"] as? [String: Any],
+                      let input = rate(cost["input"]),
+                      let output = rate(cost["output"]) else { continue }
+                prices["\(providerID)/\(id)"] = ModelUnitPrice(
+                    input: input / 1_000_000, output: output / 1_000_000,
+                    cacheRead: rate(cost["cache_read"]).map { $0 / 1_000_000 })
+            }
+        }
+        return prices
+    }
+
     private static func rate(_ value: Any?) -> Double? {
         let number: Double?
         if let value = value as? String {
@@ -135,9 +190,10 @@ enum ModelPricing {
         return number
     }
 
-    private static func download(_ url: URL) -> Data? {
-        var request = URLRequest(url: url, timeoutInterval: 8)
+    private static func download(_ url: URL, timeout: TimeInterval = 8) -> Data? {
+        var request = URLRequest(url: url, timeoutInterval: timeout)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Lingmou/1.0", forHTTPHeaderField: "User-Agent")
         let result = LockedBox<Data?>(nil)
         let semaphore = DispatchSemaphore(value: 0)
         let task = URLSession.shared.dataTask(with: request) { data, response, _ in
@@ -148,7 +204,7 @@ enum ModelPricing {
             semaphore.signal()
         }
         task.resume()
-        if semaphore.wait(timeout: .now() + 9) == .timedOut { task.cancel() }
+        if semaphore.wait(timeout: .now() + timeout + 1) == .timedOut { task.cancel() }
         return result.get()
     }
 
@@ -172,8 +228,10 @@ enum ModelPricing {
             preferred = "z-ai/\(key)"
         } else if key.hasPrefix("deepseek-") {
             preferred = "deepseek/\(key)"
-        } else if key == "k3" {
+        } else if key == "k3" || key == "kimi-k3" {
             preferred = "moonshotai/kimi-k3"
+        } else if key == "k3.1-pro" || key == "k3.1-pro-highspeed" {
+            preferred = "moonshotai/kimi-\(key)"
         } else {
             preferred = nil
         }
@@ -214,24 +272,37 @@ enum ModelPricing {
 
     static func periods(for usage: UsageData?, prices: [String: ModelUnitPrice]) -> CostPeriods? {
         guard let usage, let today = usage.models else { return nil }
+        let daily = usage.dailyModels?.map { date, models in
+            CostDay(date: date, estimate: estimate(models: models, prices: prices))
+        }.sorted { $0.date < $1.date }
         return CostPeriods(
             today: estimate(models: today, prices: prices),
             weekly: usage.weekly?.models.map { estimate(models: $0, prices: prices) },
-            monthly: usage.monthly?.models.map { estimate(models: $0, prices: prices) })
+            monthly: usage.monthly?.models.map { estimate(models: $0, prices: prices) },
+            daily: daily)
     }
 
     static func costData(
         local: UsageData?, merged: UsageData?, cache: ModelPriceCache?,
-        exchangeRate: ExchangeRateCache?
+        modelsDevCache: ModelPriceCache? = nil, exchangeRate: ExchangeRateCache?
     ) -> CostData? {
-        guard let cache, !cache.prices.isEmpty else { return nil }
+        var prices = modelsDevCache?.prices ?? [:]
+        if let cache {
+            for (id, price) in cache.prices { prices[id] = price }
+        }
+        guard !prices.isEmpty else { return nil }
+        var sources: [String] = []
+        if cache?.prices.isEmpty == false { sources.append("OpenRouter") }
+        if modelsDevCache?.prices.isEmpty == false { sources.append("models.dev") }
+        let priceUpdatedAt = [cache?.fetchedAt, modelsDevCache?.fetchedAt]
+            .compactMap { $0 }.max() ?? 0
         return CostData(
-            source: "OpenRouter", priceUpdatedAt: cache.fetchedAt,
+            source: sources.joined(separator: " + "), priceUpdatedAt: priceUpdatedAt,
             usdToCny: exchangeRate?.rateCnyPerUsd,
             exchangeRateSource: exchangeRate?.rateCnyPerUsd == nil ? nil : "Frankfurter",
             exchangeRateDate: exchangeRate?.sourceDate,
             exchangeRateUpdatedAt: exchangeRate?.rateCnyPerUsd == nil ? nil : exchangeRate?.fetchedAt,
-            local: periods(for: local, prices: cache.prices),
-            merged: periods(for: merged, prices: cache.prices))
+            local: periods(for: local, prices: prices),
+            merged: periods(for: merged, prices: prices))
     }
 }

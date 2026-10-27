@@ -6,27 +6,58 @@ struct ParsedUsage: Equatable {
     let output: Int
     let cache: Int
     var model: String = ""
+    var requestID: String?
+    var requestStartedAt: TimeInterval?
+    var firstTokenAt: TimeInterval?
+    var countsTowardDaily = true
+    var metricKind: String?
 }
 
-/// 跨行解析状态：Codex 的 token_count 事件不带模型名，需记住最近一次 turn_context
-/// 声明的模型。状态随 offsets 断点持久化，增量恢复后才能继续正确归属。
+/// 跨行解析状态同时保留模型与当前请求边界，供增量断点恢复后继续归属。
 final class UsageParseState {
     var model: String?
+    var requestID: String?
+    var requestStartedAt: TimeInterval?
+    var requestOutput = 0
 }
 
 typealias UsageParser = (String, UsageParseState) -> ParsedUsage?
 
 struct UsageParsers {
     static func codex(_ line: String, _ state: UsageParseState) -> ParsedUsage? {
-        // turn_context 与 token_count 都要解析，其余行（含大体积消息行）不做 JSON 解析
-        guard line.contains("turn_context") || line.contains("token_count"),
+        // turn_context、token_count 与 task_complete 都要解析，其余大体积消息行直接跳过。
+        guard line.contains("turn_context") || line.contains("token_count")
+                || line.contains("task_complete"),
             let object = JSONValue.object(from: line)
         else { return nil }
         if JSONValue.string(object["type"]) == "turn_context",
-            let payload = object["payload"] as? JSONObject,
-            let model = JSONValue.string(payload["model"]), !model.isEmpty
+            let payload = object["payload"] as? JSONObject
         {
-            state.model = model
+            state.model = JSONValue.string(payload["model"]) ?? state.model
+            state.requestID = JSONValue.string(payload["turn_id"])
+            state.requestStartedAt = DateSupport.timestamp(object["timestamp"])
+            state.requestOutput = 0
+        }
+        if JSONValue.string(object["type"]) == "event_msg",
+            let payload = object["payload"] as? JSONObject,
+            JSONValue.string(payload["type"]) == "task_complete",
+            let completedAt = JSONValue.double(payload["completed_at"])
+                ?? DateSupport.timestamp(object["timestamp"])
+        {
+            let startedAt = JSONValue.double(payload["started_at"]) ?? state.requestStartedAt
+            let ttft = JSONValue.double(payload["time_to_first_token_ms"])
+            let firstTokenAt = startedAt.flatMap { started in
+                ttft.flatMap { value in
+                    value >= 0 && completedAt > started + value / 1_000
+                        ? started + value / 1_000 : nil
+                }
+            }
+            return ParsedUsage(
+                timestamp: completedAt, input: 0, output: state.requestOutput, cache: 0,
+                model: state.model ?? "",
+                requestID: JSONValue.string(payload["turn_id"]) ?? state.requestID,
+                requestStartedAt: firstTokenAt == nil ? nil : startedAt, firstTokenAt: firstTokenAt,
+                countsTowardDaily: false, metricKind: firstTokenAt == nil ? nil : "effective")
         }
         guard JSONValue.string(object["type"]) == "event_msg",
             let payload = object["payload"] as? JSONObject,
@@ -37,27 +68,66 @@ struct UsageParsers {
         else { return nil }
         let input = JSONValue.int(usage["input_tokens"]) ?? 0
         let cache = JSONValue.int(usage["cached_input_tokens"]) ?? 0
+        let output = JSONValue.int(usage["output_tokens"]) ?? 0
+        state.requestOutput += max(0, output)
         return ParsedUsage(
             timestamp: timestamp,
             input: max(0, input - cache),
-            output: JSONValue.int(usage["output_tokens"]) ?? 0,
+            output: output,
             cache: cache,
-            model: state.model ?? ""
+            model: state.model ?? "",
+            requestID: state.requestID
         )
     }
 
     static func kimi(_ line: String, _ state: UsageParseState) -> ParsedUsage? {
-        guard line.contains("usage.record"), let object = JSONValue.object(from: line),
-            JSONValue.string(object["type"]) == "usage.record",
+        guard line.contains("usage.record") || line.contains("turn.prompt")
+                || line.contains("step.begin") || line.contains("step.end"),
+            let object = JSONValue.object(from: line)
+        else { return nil }
+        let type = JSONValue.string(object["type"])
+        if type == "turn.prompt" {
+            state.requestID = nil
+            state.requestStartedAt = nil
+            return nil
+        }
+        if type == "context.append_loop_event",
+            let event = object["event"] as? JSONObject,
+            JSONValue.string(event["type"]) == "step.begin"
+        {
+            state.requestID = JSONValue.string(event["uuid"])
+            state.requestStartedAt = JSONValue.double(object["time"]).map { $0 / 1_000 }
+            return nil
+        }
+        if type == "context.append_loop_event",
+            let event = object["event"] as? JSONObject,
+            JSONValue.string(event["type"]) == "step.end",
+            let milliseconds = JSONValue.double(object["time"]), milliseconds > 0,
+            let usage = event["usage"] as? JSONObject
+        {
+            let finishedAt = milliseconds / 1_000
+            let streamDuration = JSONValue.double(event["llmStreamDurationMs"]) ?? 0
+            let uuid = JSONValue.string(event["uuid"])
+            return ParsedUsage(
+                timestamp: finishedAt, input: 0,
+                output: JSONValue.int(usage["output"]) ?? 0, cache: 0,
+                model: state.model ?? "", requestID: uuid,
+                requestStartedAt: uuid == state.requestID ? state.requestStartedAt : nil,
+                firstTokenAt: streamDuration > 0 ? finishedAt - streamDuration / 1_000 : nil,
+                countsTowardDaily: false)
+        }
+        guard type == "usage.record",
             let milliseconds = JSONValue.double(object["time"]), milliseconds > 0,
             let usage = object["usage"] as? JSONObject
         else { return nil }
+        state.model = JSONValue.string(object["model"])
         return ParsedUsage(
             timestamp: milliseconds / 1_000,
             input: JSONValue.int(usage["inputOther"]) ?? 0,
             output: JSONValue.int(usage["output"]) ?? 0,
             cache: JSONValue.int(usage["inputCacheRead"]) ?? 0,
-            model: JSONValue.string(object["model"]) ?? ""
+            model: state.model ?? "",
+            requestID: state.requestID
         )
     }
 
@@ -163,9 +233,13 @@ struct UsageCollector {
             }
             collectHermes(database: database)
             collectDsh(database: database)
+            try UsageSpeedStore.prune(
+                database: database, retentionDays: settings.usageRequestRetentionDays,
+                now: environment.now)
             let rows = try localDaily(database: database)
             let local = Self.usageData(
-                from: UsageSync.mergedDaily([rows]), now: environment.now)
+                from: UsageSync.mergedDaily([rows]), now: environment.now,
+                speed: try UsageSpeedStore.load(database: database))
             guard settings.usageSyncEnabled else { return (local, nil, nil) }
             let synced = try syncUsage(localRows: rows)
             return (local, synced.merged, synced.status)
@@ -222,7 +296,9 @@ struct UsageCollector {
 
     /// 由 date → 工具/模型 → 计数 构建 UsageData：今日分工具与分模型视图 + 滚动窗口聚合 + 热力图。
     /// 本机 sqlite 与多设备合并共用这一入口，保证两套视图的口径一致。
-    static func usageData(from daily: MergedDaily, now: TimeInterval) -> UsageData {
+    static func usageData(
+        from daily: MergedDaily, now: TimeInterval, speed: UsageSpeedData? = nil
+    ) -> UsageData {
         let today = DateSupport.localDay(now)
         var tools: [String: UsageEntry] = [:]
         var models: [String: UsageEntry] = [:]
@@ -246,7 +322,9 @@ struct UsageCollector {
             heatmax: heat.maximum,
             models: models,
             weekly: rollingRange(days: 7, from: daily, now: now),
-            monthly: rollingRange(days: 30, from: daily, now: now)
+            monthly: rollingRange(days: 30, from: daily, now: now),
+            dailyModels: daily.byModel,
+            speed: speed
         )
     }
 
@@ -325,6 +403,18 @@ struct UsageCollector {
         if !(try database.columns(in: "offsets")).contains("last_model") {
             try database.execute("ALTER TABLE offsets ADD COLUMN last_model TEXT")
         }
+        if !(try database.columns(in: "offsets")).contains("last_request_id") {
+            try database.execute("ALTER TABLE offsets ADD COLUMN last_request_id TEXT")
+        }
+        if !(try database.columns(in: "offsets")).contains("last_request_started") {
+            try database.execute("ALTER TABLE offsets ADD COLUMN last_request_started REAL")
+        }
+        if !(try database.columns(in: "offsets")).contains("last_request_output") {
+            try database.execute("ALTER TABLE offsets ADD COLUMN last_request_output INT")
+        }
+        try UsageSpeedStore.createSchema(database: database)
+        try database.execute(
+            "CREATE TABLE IF NOT EXISTS speed_backfills(path TEXT PRIMARY KEY)")
         return database
     }
 
@@ -344,6 +434,23 @@ struct UsageCollector {
             ])
     }
 
+    private func sessionID(tool: String, path: String) -> String? {
+        switch tool {
+        case "kimi", "kimi-work":
+            let id = URL(fileURLWithPath: path)
+                .deletingLastPathComponent().deletingLastPathComponent()
+                .deletingLastPathComponent().lastPathComponent
+            return id.isEmpty ? nil : id
+        case "codex":
+            let name = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+            let parts = name.split(separator: "-")
+            guard parts.count >= 5 else { return nil }
+            return parts.suffix(5).joined(separator: "-")
+        default:
+            return nil
+        }
+    }
+
     private func scan(
         path: String,
         tool: String,
@@ -354,16 +461,42 @@ struct UsageCollector {
             environment.now - modified <= maximumAge
         else { return }
         let previous = try database.query(
-            "SELECT offset, mtime, last_key, last_model FROM offsets WHERE path=?",
+            """
+            SELECT offset, mtime, last_key, last_model, last_request_id, last_request_started,
+                last_request_output
+            FROM offsets WHERE path=?
+            """,
             binds: [.text(path)]
         ).first
         var offset = UInt64(max(0, previous?["offset"]?.int ?? 0))
         var lastKey = previous?["last_key"]?.string
-        // 恢复上次的"当前模型"状态：Codex 断点后的第一条 token_count 才能归属正确
         let state = UsageParseState()
         state.model = previous?["last_model"]?.string
-        if offset == size, previous?["mtime"]?.double == modified { return }
-        if size < offset { offset = 0 }
+        state.requestID = previous?["last_request_id"]?.string
+        state.requestStartedAt = previous?["last_request_started"]?.double
+        state.requestOutput = previous?["last_request_output"]?.int ?? 0
+        var backfillOnly = false
+        if tool == "codex", previous != nil {
+            backfillOnly = try database.query(
+                "SELECT path FROM speed_backfills WHERE path=?", binds: [.text(path)]).isEmpty
+        }
+        if backfillOnly {
+            offset = 0
+            lastKey = nil
+            state.model = nil
+            state.requestID = nil
+            state.requestStartedAt = nil
+            state.requestOutput = 0
+        } else {
+            if offset == size, previous?["mtime"]?.double == modified { return }
+            if size < offset {
+                offset = 0
+                state.model = nil
+                state.requestID = nil
+                state.requestStartedAt = nil
+                state.requestOutput = 0
+            }
+        }
         guard let handle = FileHandle(forReadingAtPath: path) else { return }
         defer { try? handle.closeFile() }
         try handle.seek(toOffset: offset)
@@ -373,25 +506,54 @@ struct UsageCollector {
         let complete = raw.prefix(upTo: newline)
         for line in String(decoding: complete, as: UTF8.self).split(whereSeparator: \.isNewline) {
             guard let usage = parser(String(line), state) else { continue }
-            let key = "\(usage.model):\(usage.input):\(usage.output):\(usage.cache)"
-            if key != lastKey {
+            let key = "\(usage.requestID ?? ""):\(usage.model):\(usage.input):\(usage.output):\(usage.cache)"
+            let isNewRequest = !usage.countsTowardDaily || key != lastKey
+            if usage.countsTowardDaily, isNewRequest, !backfillOnly {
                 try add(usage, tool: tool, database: database)
                 lastKey = key
             }
+            if isNewRequest {
+                let source = "\(path):\(usage.requestID ?? ""):\(usage.timestamp):\(key)"
+                try UsageSpeedStore.add(
+                    UsageRequest(
+                        id: UsageSpeedStore.identifier(tool: tool, source: source), tool: tool,
+                        model: usage.model, sessionId: sessionID(tool: tool, path: path),
+                        startedAt: usage.requestStartedAt,
+                        firstTokenAt: usage.firstTokenAt, finishedAt: usage.timestamp,
+                        outputTokens: usage.output, metricKind: usage.metricKind), database: database)
+            }
+        }
+        if backfillOnly {
+            try database.execute(
+                "INSERT OR IGNORE INTO speed_backfills(path) VALUES(?)", binds: [.text(path)])
+            return
         }
         let nextOffset = offset + UInt64(raw.distance(from: raw.startIndex, to: newline)) + 1
         try database.execute(
             """
-            INSERT INTO offsets(path, offset, mtime, last_key, last_model) VALUES(?,?,?,?,?)
+            INSERT INTO offsets(
+                path, offset, mtime, last_key, last_model, last_request_id, last_request_started,
+                last_request_output)
+            VALUES(?,?,?,?,?,?,?,?)
             ON CONFLICT(path) DO UPDATE SET
                 offset=excluded.offset, mtime=excluded.mtime,
-                last_key=excluded.last_key, last_model=excluded.last_model
+                last_key=excluded.last_key, last_model=excluded.last_model,
+                last_request_id=excluded.last_request_id,
+                last_request_started=excluded.last_request_started,
+                last_request_output=excluded.last_request_output
             """,
             binds: [
                 .text(path), .integer(Int64(nextOffset)), .real(modified),
                 lastKey.map(SQLiteBind.text) ?? .null,
                 state.model.map(SQLiteBind.text) ?? .null,
+                state.requestID.map(SQLiteBind.text) ?? .null,
+                state.requestStartedAt.map(SQLiteBind.real) ?? .null,
+                .integer(Int64(state.requestOutput)),
             ])
+        if tool == "codex" {
+            try database.execute(
+                "INSERT OR IGNORE INTO speed_backfills(path) VALUES(?)", binds: [.text(path)])
+        }
     }
 
     /// ZCode 用量：读 db.sqlite 的 model_usage 表（每次请求一行，completed 后数值不再变）。
@@ -414,11 +576,19 @@ struct UsageCollector {
             }
             let zcode = try SQLiteDatabase(
                 path: environment.path(".zcode", "cli", "db", "db.sqlite"), readOnly: true)
+            let usageColumns = try zcode.columns(in: "model_usage")
+            let completedColumn = usageColumns.contains("completed_at")
+                ? "completed_at" : "NULL AS completed_at"
+            let firstTokenColumn = usageColumns.contains("first_token_at")
+                ? "first_token_at" : "NULL AS first_token_at"
+            let sessionColumn = usageColumns.contains("session_id")
+                ? "session_id" : "NULL AS session_id"
             let window = Int64((environment.now - maximumAge) * 1000)
             let rows = try zcode.query(
                 """
                 SELECT id, model_id, input_tokens, output_tokens,
-                    cache_read_input_tokens, started_at
+                    cache_read_input_tokens, started_at, \(completedColumn), \(firstTokenColumn),
+                    \(sessionColumn)
                 FROM model_usage
                 WHERE status='completed' AND started_at >= ?
                 """,
@@ -433,6 +603,12 @@ struct UsageCollector {
                     )
                 }
             }
+            let knownSpeedIDs = Set(try database.query(
+                """
+                SELECT id FROM requests WHERE session_id IS NOT NULL
+                UNION SELECT id FROM request_exclusions
+                """
+            ).compactMap { $0["id"]?.string })
             for row in rows {
                 guard let id = row["id"]?.string, let startedMs = row["started_at"]?.double,
                     startedMs > 0
@@ -441,6 +617,15 @@ struct UsageCollector {
                 let input = max(0, (row["input_tokens"]?.int ?? 0) - cache)
                 let output = row["output_tokens"]?.int ?? 0
                 let previous = snapshot[id] ?? (input: 0, output: 0, cache: 0)
+                if !knownSpeedIDs.contains("zcode:\(id)") {
+                    try UsageSpeedStore.add(
+                        UsageRequest(
+                            id: "zcode:\(id)", tool: "zcode", model: row["model_id"]?.string ?? "",
+                            sessionId: row["session_id"]?.string, startedAt: startedMs / 1_000,
+                            firstTokenAt: row["first_token_at"]?.double.map { $0 / 1_000 },
+                            finishedAt: (row["completed_at"]?.double ?? 0) / 1_000,
+                            outputTokens: output), database: database)
+                }
                 guard input != previous.input || output != previous.output
                     || cache != previous.cache
                 else { continue }

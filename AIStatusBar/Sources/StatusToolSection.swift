@@ -105,7 +105,8 @@ struct StatusToolSection: View {
             ? NotificationRouter.destinationLabel(forToolKey: tool.key, sessionId: conversation.sessionId)
             : NotificationRouter.destinationLabel(forToolKey: tool.key)
         let age = conversation.timestamp.map { " · " + ExperienceFormat.age($0) } ?? ""
-        return "\(displayTitle(conversation.title))\n\(conversation.label)\(age)\n\(route)"
+        let speed = conversation.speedText.map { "\n最近完成请求：\($0)" } ?? ""
+        return "\(displayTitle(conversation.title))\n\(conversation.label)\(age)\(speed)\n\(route)"
             + (conversation.needsAttention ? "，并清除此会话的提醒" : "")
     }
 
@@ -137,6 +138,10 @@ struct StatusToolSection: View {
             if conversation.needsAttention {
                 Circle().fill(Color.accentColor).frame(width: 4, height: 4)
                     .accessibilityLabel("未读")
+            }
+            if let speed = conversation.speedText {
+                Text(speed).font(.system(size: 8).monospacedDigit())
+                    .foregroundColor(.secondary).fixedSize()
             }
             Text(conversation.label).font(.system(size: 9))
                 .foregroundColor(statusColor(conversation)).fixedSize()

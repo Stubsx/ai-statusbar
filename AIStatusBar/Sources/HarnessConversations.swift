@@ -10,8 +10,16 @@ struct HarnessConversation: Identifiable {
     let timestamp: TimeInterval?
     let eventIDs: [String]
     let needsAttention: Bool
+    var usageRequest: UsageRequest? = nil
 
     var current: Bool { ["working", "waiting_input", "waiting_permission"].contains(phase) }
+    var speedText: String? {
+        guard let usageRequest, let value = usageRequest.generationTps ?? usageRequest.averageTps
+        else { return nil }
+        let kind = usageRequest.metricKind == "effective"
+            ? "有效" : (usageRequest.generationTps != nil ? "生成" : "平均")
+        return String(format: "%.1f t/s · %@", value, kind)
+    }
     var label: String {
         switch phase {
         case "working": return "运行中"
@@ -65,7 +73,9 @@ enum HarnessConversations {
         return (tool.activeItems ?? tool.busyItems).filter { !$0.id.isEmpty && seen.insert($0.id).inserted }
     }
 
-    static func groups(tools: [ToolStatus], events: [TaskRecord]) -> [HarnessConversationGroup] {
+    static func groups(
+        tools: [ToolStatus], events: [TaskRecord], requests: [UsageRequest] = []
+    ) -> [HarnessConversationGroup] {
         let byTool = Dictionary(grouping: events, by: \.toolKey)
         var allTools = tools
         let known = Set(tools.map(\.key))
@@ -76,7 +86,7 @@ enum HarnessConversations {
                                        latestAge: nil, quota: nil))
         }
         return allTools.compactMap { tool in
-            let rows = conversations(tool: tool, events: byTool[tool.key] ?? [])
+            let rows = conversations(tool: tool, events: byTool[tool.key] ?? [], requests: requests)
             guard tool.state != "off" || tool.health?.state == "error" || !rows.isEmpty else { return nil }
             return HarnessConversationGroup(tool: tool, conversations: rows)
         }.sorted {
@@ -90,10 +100,20 @@ enum HarnessConversations {
         }
     }
 
-    static func conversations(tool: ToolStatus, events: [TaskRecord]) -> [HarnessConversation] {
+    static func conversations(
+        tool: ToolStatus, events: [TaskRecord], requests: [UsageRequest] = []
+    ) -> [HarnessConversation] {
         // Unknown IDs must not merge unrelated records into one conversation.
         func identity(_ record: TaskRecord) -> String {
             record.sessionId.isEmpty ? "event:\(record.id)" : "session:\(record.sessionId)"
+        }
+        func speed(_ sessionId: String?) -> UsageRequest? {
+            guard let sessionId else { return nil }
+            return requests.first {
+                $0.sessionId == sessionId
+                    && ($0.tool != "codex" || $0.metricKind == "effective")
+                    && ($0.tool == tool.key || ($0.tool == "codex" && tool.key.hasPrefix("codex")))
+            }
         }
         let records = events.filter { $0.toolKey == tool.key }.sorted {
             $0.timestamp == $1.timestamp ? $0.id < $1.id : $0.timestamp > $1.timestamp
@@ -108,7 +128,8 @@ enum HarnessConversations {
             let history = bySession[id] ?? []
             rows.append(HarnessConversation(id: id, toolKey: tool.key, sessionId: item.id,
                                              title: item.title, phase: "working", timestamp: nil,
-                                             eventIDs: history.map(\.id), needsAttention: false))
+                                             eventIDs: history.map(\.id), needsAttention: false,
+                                             usageRequest: speed(item.id)))
         }
         for record in records {
             let id = identity(record)
@@ -121,7 +142,7 @@ enum HarnessConversations {
                                              sessionId: record.sessionId.isEmpty ? nil : record.sessionId,
                                              title: record.title, phase: record.phase, timestamp: record.timestamp,
                                              eventIDs: history.map(\.id),
-                                             needsAttention: true))
+                                             needsAttention: true, usageRequest: speed(record.sessionId)))
         }
         // Keep waiting conversations visible before running work, then recent results.
         return rows.filter { $0.current && $0.phase != "working" }

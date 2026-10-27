@@ -83,7 +83,7 @@ func renderExperience() throws {
     assert(NotificationRouter.supportsSessionNavigation(forToolKey: "kimi", sessionId: "session_fixture"))
     assert(!NotificationRouter.supportsSessionNavigation(forToolKey: "kimi", sessionId: "../bad"))
     assert(NotificationRouter.destinationLabel(forToolKey: "kimi", sessionId: "session_fixture")
-           == "尝试在 Kimi Code 中打开这条会话，失败时打开应用")
+           == "在 Kimi Code 中打开这条会话，失败时提供恢复选项")
     NotificationRouter.prefersKimiDesktopSessionNavigation = { false }
     NotificationRouter.kimiCodeApplicationURL = { nil }
     assert(NotificationRouter.destinationLabel(forToolKey: "kimi", sessionId: "web-session") == webLabel)
@@ -199,6 +199,9 @@ func renderExperience() throws {
     assert(!SourceChangeMonitor.isStatusSource("/fixture/.ai-statusbar/collector-cache.json"))
     print("PASS: native filesystem events detect atomic session writes without collector feedback loops")
     let settings = SettingsStore(path: temporary.appendingPathComponent("settings.json").path, systemEffects: false)
+    settings.usageRequestRetentionDays = 365
+    assert(SettingsStore(path: temporary.appendingPathComponent("settings.json").path,
+                         systemEffects: false).usageRequestRetentionDays == 365)
     // A source event just before the old periodic tick must reset the fallback,
     // while the fallback must still scan later in the absence of further writes.
     let schedulingDirectory = temporary.appendingPathComponent("scheduling")
@@ -246,7 +249,9 @@ func renderExperience() throws {
       {"key":"claude","letter":"L","name":"Claude Code","state":"idle","busy_count":0,"busy_items":[],"detail":"1 个进程",
        "health":{"state":"ready","message":"本地状态读取正常","checked_at":\(now),"quota_state":"unsupported"},
        "capabilities":{"event_phases":["ended"],"usage":true,"quota":false,"navigation":"host"}}
-    ],"usage":{"date":"2026-09-11","tools":{"codex":{"input":125000,"output":31000,"cache":480000}},"models":{"sample-model":{"input":125000,"output":31000,"cache":480000}},"total":{"input":125000,"output":31000,"cache":480000}}}
+    ],"usage":{"date":"2026-09-11","tools":{"codex":{"input":125000,"output":31000,"cache":480000}},"models":{"sample-model":{"input":125000,"output":31000,"cache":480000}},"total":{"input":125000,"output":31000,"cache":480000},
+      "speed":{"recent":[{"id":"speed-1","tool":"codex","model":"gpt","session_id":"s1","started_at":100,"first_token_at":101,"finished_at":105,"output_tokens":40,"metric_kind":"effective"},
+        {"id":"speed-2","tool":"codex","model":"gpt","session_id":"s2","started_at":100,"first_token_at":null,"finished_at":110,"output_tokens":50}],"models":[]}}}
     """
     let sessionIDs = (1...7).map { "01234567-89ab-4cde-8fab-0123456789a\($0)" }
     let sessionJSON = sessionIDs.enumerated().reduce(json) { value, entry in
@@ -277,7 +282,7 @@ func renderExperience() throws {
     }
     let menuTarget = NSObject()
     let toolMenu = NSMenu()
-    MenuBarPresentation.appendTools(to: toolMenu, tools: store.data!.tools, target: menuTarget,
+    MenuBarPresentation.appendTools(to: toolMenu, tools: store.data!.tools, requests: store.data!.usage?.speed?.recent ?? [], target: menuTarget,
                                     openTool: Selector(("openTool:")), openConnections: Selector(("openConnections")),
                                     displayTitle: { store.displayTitle($0) })
     let destinations = menuItems(toolMenu).compactMap { $0.representedObject as? HarnessConversation }
@@ -286,7 +291,7 @@ func renderExperience() throws {
     assert(destinations.allSatisfy { $0.toolKey == "codex-ide" })
     settings.experience.privacyMode = true
     let privateMenu = NSMenu()
-    MenuBarPresentation.appendTools(to: privateMenu, tools: store.data!.tools, target: menuTarget,
+    MenuBarPresentation.appendTools(to: privateMenu, tools: store.data!.tools, requests: store.data!.usage?.speed?.recent ?? [], target: menuTarget,
                                     openTool: Selector(("openTool:")), openConnections: Selector(("openConnections")),
                                     displayTitle: { store.displayTitle($0) })
     for item in menuItems(privateMenu) where item.representedObject is HarnessConversation {
@@ -673,11 +678,28 @@ func renderExperience() throws {
         storageDirectory: temporary.appendingPathComponent("chart"))
     let chartDayFormatter = DateFormatter()
     chartDayFormatter.dateFormat = "yyyy-MM-dd"
-    let heatJSON = (0..<35).map { offset -> String in
+    let chartDays = (0..<35).map { offset -> (date: String, total: Int) in
         let date = Calendar.current.date(byAdding: .day, value: offset - 34, to: Date())!
         let total = [120_000, 450_000, 80_000, 980_000, 1_500_000, 300_000, 640_000][offset % 7]
             + offset * 7_000
-        return "{\"date\":\"\(chartDayFormatter.string(from: date))\",\"total\":\(total),\"future\":false}"
+        return (chartDayFormatter.string(from: date), total)
+    }
+    let heatJSON = chartDays.map { day in
+        "{\"date\":\"\(day.date)\",\"total\":\(day.total),\"future\":false}"
+    }.joined(separator: ",")
+    let dailyModelsJSON = chartDays.map { day in
+        let gpt = day.total * 3 / 4
+        return """
+            "\(day.date)":{"gpt-6.1-sol":{"input":\(gpt),"output":0,"cache":0},
+            "kimi-k3":{"input":\(day.total - gpt),"output":0,"cache":0}}
+            """
+    }.joined(separator: ",")
+    let dailyCostsJSON = chartDays.map { day in
+        let amount = Double(day.total) / 1_000_000 * 2.5
+        return """
+            {"date":"\(day.date)","estimate":{"amount_usd":\(amount),"priced_tokens":\(day.total),
+            "total_tokens":\(day.total),"by_model_usd":{"gpt-6.1-sol":\(amount)},"unpriced_models":[]}}
+            """
     }.joined(separator: ",")
     func scaled(_ factor: Int) -> String { """
         "tools":{"codex":{"input":\(900_000*factor),"output":\(120_000*factor),"cache":\(5_200_000*factor)},
@@ -695,8 +717,16 @@ func renderExperience() throws {
     let chartFixture = """
         {"updated_at":"12:00:00","tools":[],
          "usage":{"date":"\(chartDayFormatter.string(from: Date()))",\(scaled(1)),
-           "heatmap":[\(heatJSON)],
-           "weekly":{\(scaled(5))},"monthly":{\(scaled(20))}},
+           "heatmap":[\(heatJSON)],"daily_models":{\(dailyModelsJSON)},
+           "weekly":{\(scaled(5))},"monthly":{\(scaled(20))},
+           "speed":{"recent":[{"id":"speed-1","tool":"zcode","model":"glm-5.3",
+             "started_at":1790128790,"first_token_at":1790128792,"finished_at":1790128800,"output_tokens":80},
+             {"id":"speed-2","tool":"kimi","model":"kimi-k3","started_at":1790128760,
+             "first_token_at":null,"finished_at":1790128780,"output_tokens":50}],
+             "models":[{"model":"glm-5.3","generation_tps":10,"average_tps":8,
+             "generation_samples":12,"average_samples":12},
+             {"model":"kimi-k3","generation_tps":null,"average_tps":2.5,
+             "generation_samples":0,"average_samples":8}]}},
          "cost":{"source":"OpenRouter","price_updated_at":1790128800,
            "usd_to_cny":7.1,"exchange_rate_source":"Frankfurter",
            "exchange_rate_date":"2026-10-20","exchange_rate_updated_at":1790128800,
@@ -708,15 +738,20 @@ func renderExperience() throws {
              "unpriced_models":["codex-auto-review","glm-5.3-flash"]},
              "monthly":{"amount_usd":77.2,"priced_tokens":180000000,"total_tokens":198100000,
              "by_model_usd":{"gpt-6.1-sol":58.2,"kimi-k3":12.4,"glm-5.3":6.6},
-             "unpriced_models":["codex-auto-review","glm-5.3-flash"]}}}}
+             "unpriced_models":["codex-auto-review","glm-5.3-flash"]},
+             "daily":[\(dailyCostsJSON)]}}}
         """
     chartStore.data = try decoder.decode(StatusData.self, from: Data(chartFixture.utf8))
-    for (name, range, breakdown, mode, scheme) in [
-        ("usage-chart-today-light", "today", "models", "chart", ColorScheme.light),
-        ("usage-chart-tools-dark", "today", "tools", "chart", ColorScheme.dark),
-        ("usage-chart-7d-dark", "7d", "models", "chart", ColorScheme.dark),
-        ("usage-chart-30d-light", "30d", "models", "chart", ColorScheme.light),
-        ("usage-list-light", "today", "models", "list", ColorScheme.light),
+    assert(chartStore.data?.usage?.dailyModels?.count == 35)
+    assert(chartStore.data?.cost?.local?.daily?.count == 35)
+    for (name, range, breakdown, mode, metric, scheme) in [
+        ("usage-chart-today-light", "today", "models", "chart", "tokens", ColorScheme.light),
+        ("usage-chart-tools-dark", "today", "tools", "chart", "tokens", ColorScheme.dark),
+        ("usage-chart-7d-dark", "7d", "models", "chart", "tokens", ColorScheme.dark),
+        ("usage-chart-7d-cost-light", "7d", "models", "chart", "cost", ColorScheme.light),
+        ("usage-chart-30d-light", "30d", "models", "chart", "tokens", ColorScheme.light),
+        ("usage-chart-30d-cost-dark", "30d", "models", "chart", "cost", ColorScheme.dark),
+        ("usage-list-light", "today", "models", "list", "tokens", ColorScheme.light),
     ] {
         let suite = "io.github.stubsx.lingmou.visual.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
@@ -725,6 +760,7 @@ func renderExperience() throws {
         defaults.set(range, forKey: "usageRange")
         defaults.set(breakdown, forKey: "usageBreakdown")
         defaults.set(mode, forKey: "usageViewMode")
+        defaults.set(metric, forKey: "usageChartMetric")
         try save(name, content: PanelView(store: chartStore).defaultAppStorage(defaults)
             .background(scheme == .light ? Color.white : Color(red: 0.09, green: 0.11, blue: 0.16)),
                  scheme: scheme)
@@ -751,7 +787,8 @@ func renderExperience() throws {
             }
             if scenario != "many-tools-quiet" { overviewStore.recentEvents = store.recentEvents }
         }
-        overviewStore.data = StatusData(updatedAt: "", tools: overviewTools, usage: nil, usageMerged: nil, sync: nil)
+        overviewStore.data = StatusData(updatedAt: "", tools: overviewTools,
+                                        usage: store.data?.usage, usageMerged: nil, sync: nil)
         if scenario == "error" { overviewStore.collectorError = "采集器暂时无法读取本地状态" }
         settings.experience.privacyMode = scenario == "private"
         overviewStore.lastCollectedAt = scenario == "error" ? now - 100 : now

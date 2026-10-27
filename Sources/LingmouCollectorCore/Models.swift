@@ -170,6 +170,10 @@ public struct UsageData: Codable, Hashable, Sendable {
     public let weekly: UsageRange?
     /// 近30日（含今日）聚合
     public let monthly: UsageRange?
+    /// 每日分模型用量，供逐日费用图表；旧版 JSON 无此字段时为 nil
+    public let dailyModels: [String: [String: UsageEntry]]?
+    /// 本机请求级速度；不参与多设备同步，旧版 JSON 无此字段时为 nil
+    public let speed: UsageSpeedData?
 
     public init(
         date: String,
@@ -179,7 +183,9 @@ public struct UsageData: Codable, Hashable, Sendable {
         heatmax: Int?,
         models: [String: UsageEntry]? = nil,
         weekly: UsageRange? = nil,
-        monthly: UsageRange? = nil
+        monthly: UsageRange? = nil,
+        dailyModels: [String: [String: UsageEntry]]? = nil,
+        speed: UsageSpeedData? = nil
     ) {
         self.date = date
         self.tools = tools
@@ -189,6 +195,8 @@ public struct UsageData: Codable, Hashable, Sendable {
         self.heatmax = heatmax
         self.weekly = weekly
         self.monthly = monthly
+        self.dailyModels = dailyModels
+        self.speed = speed
     }
 }
 
@@ -201,10 +209,26 @@ public struct CostEstimate: Codable, Hashable, Sendable {
     public let unpricedModels: [String]
 }
 
+public struct CostDay: Codable, Hashable, Sendable {
+    public let date: String
+    public let estimate: CostEstimate
+}
+
 public struct CostPeriods: Codable, Hashable, Sendable {
     public let today: CostEstimate
     public let weekly: CostEstimate?
     public let monthly: CostEstimate?
+    public let daily: [CostDay]?
+
+    public init(
+        today: CostEstimate, weekly: CostEstimate? = nil, monthly: CostEstimate? = nil,
+        daily: [CostDay]? = nil
+    ) {
+        self.today = today
+        self.weekly = weekly
+        self.monthly = monthly
+        self.daily = daily
+    }
 }
 
 public struct CostData: Codable, Hashable, Sendable {

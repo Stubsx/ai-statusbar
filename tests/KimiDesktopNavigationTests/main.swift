@@ -6,6 +6,14 @@ func check(_ condition: @autoclosure () -> Bool, _ message: String) {
     checks += 1
 }
 let bridge = KimiDesktopNavigation.self
+check(bridge.recoveryActions(canRestart: true, workspaceAvailable: true) == [.restart, .workspace, .cancel],
+      "recovery preserves explicit restart, workspace and cancel choices")
+check(bridge.recoveryActions(canRestart: true, workspaceAvailable: false) == [.restart, .cancel],
+      "missing workspace cannot offer a dead fallback")
+check(bridge.recoveryActions(canRestart: false, workspaceAvailable: true) == [.workspace, .cancel],
+      "cold-start failure cannot loop through another restart")
+check(bridge.recoveryActions(canRestart: false, workspaceAvailable: false) == [.cancel],
+      "unrecoverable navigation still dismisses cleanly")
 let port = 54321
 check(bridge.parseRegistration("54321\n/devtools/browser/fixture-id")?.port == port, "valid registration")
 for invalid in ["", "0\n/devtools/browser/id", "65536\n/devtools/browser/id", "54321\n/devtools/browser/../id",
@@ -40,6 +48,10 @@ for id in ["", "../other", "session?prompt=hello", "x');evil();//", String(repea
 check(bridge.navigationExpression(sessionId: "session_valid-123", serverOrigins: []) != nil, "valid ID")
 check(!bridge.openSession("session_fixture", pid: getpid(), applicationURL: URL(fileURLWithPath: "/Applications/Kimi Code.app"), waitForLaunch: false),
       "unrelated process must not control any debugger")
+check(bridge.sessionResult("session_fixture", pid: getpid(),
+                           applicationURL: URL(fileURLWithPath: "/Applications/Kimi Code.app"),
+                           waitForLaunch: false) == .navigationFailed,
+      "process or navigation failure must not offer a pointless restart")
 print("PASS: \(checks) Kimi desktop bridge checks for process identity, loopback sockets, ambiguous renderers and IDs")
 if CommandLine.arguments.count == 6, CommandLine.arguments[1] == "--live", let pid = Int32(CommandLine.arguments[2]) {
     let app = URL(fileURLWithPath: CommandLine.arguments[3])

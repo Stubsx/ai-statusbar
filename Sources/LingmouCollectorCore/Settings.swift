@@ -16,6 +16,8 @@ public struct CollectorSettings: Sendable {
     public var usageSyncDir: String?
     /// Fetch public model prices. Off by default; no usage or account data is sent.
     public var priceEstimatesEnabled: Bool
+    /// 请求级速度明细保留天数；0=永久，不影响长期保存的每日用量。
+    public var usageRequestRetentionDays: Int
 
     public init(
         defaultBusySeconds: Int = 300,
@@ -26,7 +28,8 @@ public struct CollectorSettings: Sendable {
         kimiTokenRefreshHours: Int = 0,
         usageSyncEnabled: Bool = false,
         usageSyncDir: String? = nil,
-        priceEstimatesEnabled: Bool = false
+        priceEstimatesEnabled: Bool = false,
+        usageRequestRetentionDays: Int = 90
     ) {
         self.defaultBusySeconds = defaultBusySeconds
         self.perToolBusySeconds = perToolBusySeconds
@@ -37,6 +40,8 @@ public struct CollectorSettings: Sendable {
         self.usageSyncEnabled = usageSyncEnabled
         self.usageSyncDir = usageSyncDir
         self.priceEstimatesEnabled = priceEstimatesEnabled
+        self.usageRequestRetentionDays = [0, 30, 90, 365].contains(usageRequestRetentionDays)
+            ? usageRequestRetentionDays : 90
     }
 
     public func busySeconds(for tool: String) -> Int {
@@ -64,7 +69,8 @@ public struct CollectorSettings: Sendable {
             kimiTokenRefreshHours: JSONValue.int(object["kimi_token_refresh_hours"]) ?? 0,
             usageSyncEnabled: JSONValue.bool(sync?["enabled"]) ?? false,
             usageSyncDir: syncDir.isEmpty ? nil : syncDir,
-            priceEstimatesEnabled: JSONValue.bool(object["price_estimates_enabled"]) ?? false
+            priceEstimatesEnabled: JSONValue.bool(object["price_estimates_enabled"]) ?? false,
+            usageRequestRetentionDays: JSONValue.int(object["usage_request_retention_days"]) ?? 90
         )
     }
 }

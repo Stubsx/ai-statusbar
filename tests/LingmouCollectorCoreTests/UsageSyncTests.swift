@@ -209,6 +209,8 @@ final class UsageSyncTests: XCTestCase {
         XCTAssertEqual(
             usage.heatmap?.first { !$0.future && $0.date == yesterday }?.total, 100)
         XCTAssertEqual(usage.heatmax ?? 0, 100)
+        XCTAssertEqual(usage.dailyModels?[today]?["未知模型"]?.input, 11)
+        XCTAssertEqual(usage.dailyModels?[yesterday]?["未知模型"]?.input, 100)
     }
 
     func testUsageDataBuildsWeeklyAndMonthlyRanges() {
@@ -255,6 +257,7 @@ final class UsageSyncTests: XCTestCase {
         XCTAssertTrue(text.contains("\"sync\""))
         XCTAssertTrue(text.contains("\"updated_at\""))
         XCTAssertTrue(text.contains("\"sources\""))
+        XCTAssertTrue(text.contains("\"daily_models\""))
     }
 
     func testSettingsLoadUsageSync() throws {

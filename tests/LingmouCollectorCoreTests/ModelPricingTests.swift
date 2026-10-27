@@ -35,6 +35,92 @@ final class ModelPricingTests: XCTestCase {
         XCTAssertNil(ModelPricing.catalogID(for: "k3-agent", prices: prices))
     }
 
+    func testModelsDevPricesKimiStandardAndHighspeed() throws {
+        let data = Data("""
+            {"moonshotai":{"models":{
+              "kimi-k3.1-pro":{"id":"kimi-k3.1-pro","cost":{
+                "input":2,"output":10,"cache_read":0.2,"cache_write":2}},
+              "kimi-k3.1-pro-highspeed":{"id":"kimi-k3.1-pro-highspeed","cost":{
+                "input":4,"output":20,"cache_read":0.2,"cache_write":4}}
+            }}}
+            """.utf8)
+        let prices = try XCTUnwrap(ModelPricing.parseModelsDevCatalog(data))
+        XCTAssertEqual(prices["moonshotai/kimi-k3.1-pro"]?.input, 0.000002)
+        XCTAssertEqual(prices["moonshotai/kimi-k3.1-pro-highspeed"]?.output, 0.00002)
+        XCTAssertEqual(prices["moonshotai/kimi-k3.1-pro-highspeed"]?.cacheRead ?? 0, 0.0000002,
+                       accuracy: 0.000000000001)
+        XCTAssertEqual(ModelPricing.catalogID(for: "k3.1-pro", prices: prices),
+                       "moonshotai/kimi-k3.1-pro")
+        XCTAssertEqual(ModelPricing.catalogID(for: "k3.1-pro-highspeed", prices: prices),
+                       "moonshotai/kimi-k3.1-pro-highspeed")
+
+        let estimate = ModelPricing.estimate(models: [
+            "k3.1-pro": UsageEntry(input: 1_000_000, output: 100_000, cache: 500_000),
+            "k3.1-pro-highspeed": UsageEntry(input: 1_000_000, output: 100_000, cache: 500_000),
+        ], prices: prices)
+        XCTAssertEqual(estimate.byModelUsd["k3.1-pro"] ?? 0, 3.1, accuracy: 0.0000001)
+        XCTAssertEqual(estimate.byModelUsd["k3.1-pro-highspeed"] ?? 0, 6.1, accuracy: 0.0000001)
+        XCTAssertEqual(estimate.amountUsd, 9.2, accuracy: 0.0000001)
+        XCTAssertEqual(estimate.pricedTokens, 3_200_000)
+        XCTAssertTrue(estimate.unpricedModels.isEmpty)
+    }
+
+    func testModelsDevCacheAndOpenRouterPrecedence() throws {
+        let data = Data("""
+            {"moonshotai":{"models":{
+              "kimi-k3":{"id":"kimi-k3","cost":{"input":30,"output":150,"cache_read":3}},
+              "kimi-k3.1-pro-highspeed":{"id":"kimi-k3.1-pro-highspeed","cost":{
+                "input":4,"output":20,"cache_read":0.2}}
+            }},"other":{"models":{
+              "kimi-k3":{"id":"kimi-k3","cost":{"input":300,"output":1500,"cache_read":30}}
+            }}}
+            """.utf8)
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let files = FileSupport()
+        var calls = 0
+        let first = ModelPricing.collectModelsDev(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: 100_000),
+            files: files, enabled: true, request: { calls += 1; return data })
+        XCTAssertEqual(calls, 1)
+        let cached = ModelPricing.collectModelsDev(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: 100_100),
+            files: files, enabled: true, request: { calls += 1; return nil })
+        XCTAssertEqual(calls, 1)
+        XCTAssertEqual(cached?.fetchedAt, 100_000)
+        let failed = ModelPricing.collectModelsDev(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: 190_000),
+            files: files, enabled: true, request: { calls += 1; return nil })
+        XCTAssertEqual(calls, 2)
+        XCTAssertEqual(failed?.fetchedAt, 100_000)
+        XCTAssertNil(ModelPricing.collectModelsDev(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: 190_200),
+            files: files, enabled: false, request: { calls += 1; return data }))
+        XCTAssertEqual(calls, 2)
+
+        let openRouter = ModelPriceCache(
+            fetchedAt: 100, lastAttemptAt: 100,
+            prices: try XCTUnwrap(ModelPricing.parseCatalog(catalog)))
+        let usage = UsageData(
+            date: "2026-10-27", tools: [:],
+            total: UsageEntry(input: 2_000_000, output: 100_000, cache: 500_000),
+            heatmap: nil, heatmax: nil,
+            models: [
+                "kimi-k3": UsageEntry(input: 1_000_000, output: 0, cache: 0),
+                "k3.1-pro-highspeed": UsageEntry(input: 1_000_000, output: 100_000, cache: 500_000),
+            ])
+        let cost = try XCTUnwrap(ModelPricing.costData(
+            local: usage, merged: nil, cache: openRouter,
+            modelsDevCache: first, exchangeRate: nil))
+        XCTAssertEqual(cost.source, "OpenRouter + models.dev")
+        XCTAssertEqual(cost.priceUpdatedAt, 100_000)
+        XCTAssertEqual(cost.local?.today.byModelUsd["kimi-k3"] ?? 0, 3, accuracy: 0.0000001)
+        XCTAssertEqual(cost.local?.today.byModelUsd["k3.1-pro-highspeed"] ?? 0, 6.1,
+                       accuracy: 0.0000001)
+        XCTAssertEqual(cost.local?.today.amountUsd ?? 0, 9.1, accuracy: 0.0000001)
+        XCTAssertEqual(cost.local?.today.unpricedModels, [])
+    }
+
     func testCatalogCacheAvoidsRepeatedRequestsAndRetainsPricesOnFailure() throws {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: home) }
@@ -137,6 +223,30 @@ final class ModelPricingTests: XCTestCase {
             local: usage, merged: nil, cache: cache, exchangeRate: nil))
         XCTAssertNil(cost.usdToCny)
         XCTAssertEqual(cost.local?.today.amountUsd ?? 0, 0.0002, accuracy: 0.0000001)
+    }
+
+    func testDailyCostsUsePerModelPricesAndRetainUnpricedCoverage() throws {
+        let prices = [
+            "moonshotai/kimi-k3.1-pro": ModelUnitPrice(
+                input: 0.000002, output: 0.00001, cacheRead: 0.0000002),
+            "moonshotai/kimi-k3.1-pro-highspeed": ModelUnitPrice(
+                input: 0.000004, output: 0.00002, cacheRead: 0.0000002),
+        ]
+        let usage = UsageData(
+            date: "2026-10-27", tools: [:], total: UsageEntry(),
+            heatmap: nil, heatmax: nil, models: [:],
+            dailyModels: [
+                "2026-10-26": ["k3.1-pro": UsageEntry(input: 1_000_000)],
+                "2026-10-27": [
+                    "k3.1-pro-highspeed": UsageEntry(input: 1_000_000),
+                    "unknown": UsageEntry(input: 100),
+                ],
+            ])
+        let periods = try XCTUnwrap(ModelPricing.periods(for: usage, prices: prices))
+        XCTAssertEqual(periods.daily?.map(\.date), ["2026-10-26", "2026-10-27"])
+        XCTAssertEqual(periods.daily?[0].estimate.amountUsd ?? 0, 2, accuracy: 0.0000001)
+        XCTAssertEqual(periods.daily?[1].estimate.amountUsd ?? 0, 4, accuracy: 0.0000001)
+        XCTAssertEqual(periods.daily?[1].estimate.unpricedModels, ["unknown"])
     }
 
     func testCostFieldsRoundTripThroughSharedSnakeCaseJSON() throws {

@@ -15,6 +15,8 @@ struct SettingsView: View {
     @State private var showKimiDecryptAlert = false
     @State private var showAdaptiveAlert = false
     @State private var clearHistoryConfirmation = false
+    @State private var clearSpeedConfirmation = false
+    @State private var speedClearError: String?
     @State private var advancedExpanded = false
     /// 系统级通知授权状态（设置窗口打开通知页时查询，用于提示"被系统拒绝"的情况）
     @State private var notifyAuth: UNAuthorizationStatus = .notDetermined
@@ -228,7 +230,7 @@ struct SettingsView: View {
     private func toolSettings(for key: String) -> some View {
         if key == "kimi" {
             settingRow("桌面版精确跳转（实验性）",
-                       detail: "启用可控制 Kimi 页面的本机调试连接。首次开启后，退出 Kimi Code，再从灵眸打开。失败时仅打开应用；关闭后需退出 Kimi Code 再正常启动，才能关闭连接") {
+                       detail: "启用可控制 Kimi 页面的本机调试连接。首次连接失败时，可确认重启 Kimi Code 并继续打开原会话，或改开工作区；不会自动重启。关闭后需退出 Kimi Code 再正常启动，才能关闭连接") {
                 toggle($settings.kimiDesktopSessionNavigation)
             }
             divider
@@ -308,6 +310,31 @@ struct SettingsView: View {
                 }
             }
             divider
+            settingRow("速度记录", detail: "仅保存本机请求时间与 token 数；每日用量长期保留") {
+                valuePicker($settings.usageRequestRetentionDays, options: [
+                    ("30 天", 30), ("90 天", 90), ("365 天", 365), ("永久", 0),
+                ])
+            }
+            divider
+            settingRow("清空速度记录", detail: "删除请求级 TPS 明细，不影响每日 Token 用量") {
+                Button("清空…") { clearSpeedConfirmation = true }
+            }
+            .alert("清空速度记录？", isPresented: $clearSpeedConfirmation) {
+                Button("取消", role: .cancel) {}
+                Button("清空", role: .destructive) {
+                    store.clearSpeedRecords { speedClearError = $0 }
+                }
+            } message: {
+                Text("仅删除请求级 TPS 明细，不影响每日 Token 用量；删除后无法恢复。")
+            }
+            .alert("清空速度记录失败", isPresented: Binding(
+                get: { speedClearError != nil }, set: { if !$0 { speedClearError = nil } })
+            ) {
+                Button("好") { speedClearError = nil }
+            } message: {
+                Text(speedClearError ?? "")
+            }
+            divider
             settingRow("会话记录", detail: "本机保留 7 天 / 200 条，显示在各 Harness 下") {
                 Button("清空…") { clearHistoryConfirmation = true }
                     .disabled(store.recentEvents.isEmpty && store.historyError == nil)
@@ -350,7 +377,7 @@ struct SettingsView: View {
             .font(.system(size: 12, weight: .medium))
 
             section("预估 API 费用") {
-                settingRow("模型报价", detail: "OpenRouter 公开模型目录") {
+                settingRow("模型报价", detail: "OpenRouter 与 models.dev 公开模型目录") {
                     Text(priceTime(store.data?.cost?.priceUpdatedAt))
                         .font(.system(size: 10).monospacedDigit())
                         .foregroundColor(.secondary)
@@ -379,7 +406,7 @@ struct SettingsView: View {
             }
 
             section("计算说明") {
-                priceDetailText("按当前 OpenRouter 普通输入、缓存读取和输出 token 单价估算；仅精确匹配模型。未知模型或缺少单价的用量不计价，金额是已计价部分的下界。")
+                priceDetailText("按当前 OpenRouter 与 models.dev 普通输入、缓存读取和输出 token 单价估算；仅精确匹配模型。未知模型或缺少单价的用量不计价，金额是已计价部分的下界。")
                 divider
                 priceDetailText("人民币按 Frankfurter 最近公布的 USD→CNY 汇率折算。历史用量也按当前报价估算，报价或汇率更新后金额可能变化。")
                 divider

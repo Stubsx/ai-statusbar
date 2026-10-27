@@ -49,6 +49,8 @@ final class SettingsStore: ObservableObject {
     @Published var usageSyncEnabled = false { didSet { save() } }
     @Published var usageSyncDir = "" { didSet { save() } }
     @Published var priceEstimatesEnabled = false { didSet { save() } }
+    /// 请求级速度明细保留天数；0=永久，每日用量仍长期保留。
+    @Published var usageRequestRetentionDays = 90 { didSet { save() } }
     /// 用量数字单位：metric=K/M/B，wan=万/亿
     @Published var numberUnit = "metric" { didSet { save() } }
     /// 启动时后台检查一次新版本；发现更新会提醒，安装仍需用户确认
@@ -123,6 +125,8 @@ final class SettingsStore: ObservableObject {
             if let v = s["dir"] as? String { usageSyncDir = v }
         }
         if let v = obj["price_estimates_enabled"] as? Bool { priceEstimatesEnabled = v }
+        if let v = obj["usage_request_retention_days"] as? Int,
+           [0, 30, 90, 365].contains(v) { usageRequestRetentionDays = v }
         if let v = obj["number_unit"] as? String, ["metric", "wan"].contains(v) { numberUnit = v }
         if let v = obj["auto_update_check"] as? Bool { autoUpdateCheck = v }
         if let value = obj["experience"], let data = try? JSONSerialization.data(withJSONObject: value),
@@ -151,6 +155,7 @@ final class SettingsStore: ObservableObject {
             "kimi_desktop_session_navigation": kimiDesktopSessionNavigation,
             "usage_sync": ["enabled": usageSyncEnabled, "dir": usageSyncDir],
             "price_estimates_enabled": priceEstimatesEnabled,
+            "usage_request_retention_days": usageRequestRetentionDays,
             "number_unit": numberUnit,
             "auto_update_check": autoUpdateCheck,
             "experience": (try? JSONSerialization.jsonObject(with: JSONEncoder().encode(experience))) ?? [:],
@@ -307,7 +312,9 @@ final class StatusStore: ObservableObject {
     }
 
     var harnessGroups: [HarnessConversationGroup] {
-        HarnessConversations.groups(tools: data?.tools ?? [], events: recentEvents)
+        HarnessConversations.groups(
+            tools: data?.tools ?? [], events: recentEvents,
+            requests: data?.usage?.speed?.recent ?? [])
     }
 
     func openConversation(_ conversation: HarnessConversation) {
@@ -344,6 +351,38 @@ final class StatusStore: ObservableObject {
         recentEvents = journal.records
         historyError = journal.storageError
         NotificationCenter.default.post(name: .statusUpdated, object: nil)
+    }
+
+    func clearSpeedRecords(completion: @escaping (String?) -> Void) {
+        guard let collectorPath else {
+            completion("缺少采集器，无法清空速度记录。请重新安装灵眸。")
+            return
+        }
+        DispatchQueue.global(qos: .utility).async {
+            let process = Process()
+            let errors = Pipe()
+            process.executableURL = URL(fileURLWithPath: collectorPath)
+            process.arguments = ["--clear-speed-records"]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = errors
+            do {
+                try process.run()
+                process.waitUntilExit()
+                let message = String(
+                    data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                DispatchQueue.main.async {
+                    if process.terminationStatus == 0 {
+                        self.refreshMetrics()
+                        completion(nil)
+                    } else {
+                        completion(message?.isEmpty == false ? message : "清空速度记录失败。")
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async { completion(error.localizedDescription) }
+            }
+        }
     }
 
     init(collectorPath: String?, settings: SettingsStore, storageDirectory: URL? = nil,

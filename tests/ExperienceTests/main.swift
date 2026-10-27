@@ -142,6 +142,26 @@ do {
     let ended = HarnessConversations.conversations(tool: tool(), events: history)
     check(ended.first { $0.sessionId == "session" }?.title == "new", "Use the latest title and outcome per conversation")
     check(ended.filter { $0.sessionId == "session" }.count == 1, "Multiple completed turns collapse into one row")
+    let speeds = [
+        UsageRequest(id: "speed-new", tool: "codex", model: "gpt", sessionId: "session",
+                     startedAt: now - 10, firstTokenAt: now - 1, finishedAt: now, outputTokens: 100,
+                     metricKind: "effective"),
+        UsageRequest(id: "speed-old", tool: "codex", model: "gpt", sessionId: "session",
+                     startedAt: now - 30, firstTokenAt: nil, finishedAt: now - 20, outputTokens: 10),
+        UsageRequest(id: "speed-other", tool: "codex", model: "gpt", sessionId: "second",
+                     startedAt: now - 5, firstTokenAt: now - 1, finishedAt: now, outputTokens: 40),
+        UsageRequest(id: "speed-effective", tool: "codex", model: "gpt", sessionId: "effective",
+                     startedAt: now - 5, firstTokenAt: now - 1, finishedAt: now, outputTokens: 40,
+                     metricKind: "effective"),
+    ]
+    let withSpeed = HarnessConversations.conversations(
+        tool: tool(), events: history + [record("effective", session: "effective")], requests: speeds)
+    check(withSpeed.first { $0.sessionId == "session" }?.speedText == "100.0 t/s · 有效",
+          "Each conversation uses its own latest completed request speed")
+    check(withSpeed.first { $0.sessionId == "second" }?.speedText == nil,
+          "Codex never falls back to misleading whole-turn averages")
+    check(withSpeed.first { $0.sessionId == "effective" }?.speedText == "40.0 t/s · 有效",
+          "Codex TTFT-derived speed is explicitly labelled effective")
     let states = HarnessConversations.conversations(tool: tool(), events: [
         record("quiet", phase: "inactive"),
         record("resolved", session: "resolved", phase: "waiting_input", resolved: true),

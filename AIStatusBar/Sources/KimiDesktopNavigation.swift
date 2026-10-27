@@ -4,21 +4,48 @@ import Darwin
 /// Opt-in bridge for Kimi Code 1.0.1's Electron renderer. Never runs during collection.
 /// Only a loopback debugging socket owned by the exact Kimi app process is accepted.
 enum KimiDesktopNavigation {
+    enum RecoveryAction: Equatable {
+        case restart
+        case workspace
+        case cancel
+    }
+
+    enum SessionResult: Equatable {
+        case opened
+        case connectionUnavailable
+        case navigationFailed
+    }
+
     static let launchArguments = ["--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0"]
 
+    static func recoveryActions(canRestart: Bool, workspaceAvailable: Bool) -> [RecoveryAction] {
+        var actions: [RecoveryAction] = []
+        if canRestart { actions.append(.restart) }
+        if workspaceAvailable { actions.append(.workspace) }
+        actions.append(.cancel)
+        return actions
+    }
+
     static func openSession(_ id: String, pid: Int32, applicationURL: URL, waitForLaunch: Bool) -> Bool {
-        guard KimiWebInstance.validID(id), let executable = Bundle(url: applicationURL)?.executableURL else { return false }
+        sessionResult(id, pid: pid, applicationURL: applicationURL, waitForLaunch: waitForLaunch) == .opened
+    }
+
+    static func sessionResult(_ id: String, pid: Int32, applicationURL: URL,
+                              waitForLaunch: Bool) -> SessionResult {
+        guard KimiWebInstance.validID(id), let executable = Bundle(url: applicationURL)?.executableURL
+        else { return .navigationFailed }
         let deadline = Date().addingTimeInterval(waitForLaunch ? 6 : 0)
         repeat {
-            guard matchesProcess(pid, executable: executable) else { return false }
-            if let connection = endpoint(pid: pid),
-               let expression = navigationExpression(sessionId: id, serverOrigins: connection.origins) {
-                return evaluate(expression, at: connection.socket)
+            guard matchesProcess(pid, executable: executable) else { return .navigationFailed }
+            if let connection = endpoint(pid: pid) {
+                guard let expression = navigationExpression(sessionId: id, serverOrigins: connection.origins)
+                else { return .navigationFailed }
+                return evaluate(expression, at: connection.socket) ? .opened : .navigationFailed
             }
-            if !waitForLaunch || Date() >= deadline { return false }
+            if !waitForLaunch || Date() >= deadline { return .connectionUnavailable }
             Thread.sleep(forTimeInterval: 0.15)
         } while Date() < deadline
-        return false
+        return .connectionUnavailable
     }
 
     private static func matchesProcess(_ pid: Int32, executable: URL) -> Bool {

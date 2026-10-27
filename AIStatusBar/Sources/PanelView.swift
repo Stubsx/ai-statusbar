@@ -230,15 +230,20 @@ struct PanelView: View {
         }
     }
 
-    private var rangeCost: CostEstimate? {
-        let periods = usageScope == "all" && syncAvailable
+    private var costPeriods: CostPeriods? {
+        usageScope == "all" && syncAvailable
             ? store.data?.cost?.merged : store.data?.cost?.local
+    }
+
+    private var rangeCost: CostEstimate? {
         switch usageRange {
-        case "7d": return periods?.weekly
-        case "30d": return periods?.monthly
-        default: return periods?.today
+        case "7d": return costPeriods?.weekly
+        case "30d": return costPeriods?.monthly
+        default: return costPeriods?.today
         }
     }
+
+    private var rangeDailyCosts: [CostDay]? { costPeriods?.daily }
 
     private func dollars(_ amount: Double) -> String {
         String(format: amount < 0.01 && amount > 0 ? "$%.4f" : "$%.2f", amount)
@@ -271,19 +276,25 @@ struct PanelView: View {
                 HStack(spacing: 0) {
                     segmentButton("按工具", tag: "tools", selection: $usageBreakdown)
                     segmentButton("按模型", tag: "models", selection: $usageBreakdown)
-                    Spacer()
+                    Spacer(minLength: 8)
+                    Button { usageViewMode = usageViewMode == "chart" ? "list" : "chart" } label: {
+                        Text(usageViewMode == "chart" ? "明细" : "图表")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.trailing, store.settings.priceEstimatesEnabled ? 8 : 0)
                     if store.settings.priceEstimatesEnabled {
                         HStack(spacing: 0) {
                             segmentButton("人民币", tag: "cny", selection: $usageCurrency)
                             segmentButton("美元", tag: "usd", selection: $usageCurrency)
                         }
                     }
-                }.padding(.vertical, 8)
+                }.padding(.top, 4).padding(.bottom, 6)
                 Text(rangeSubtitle)
                     .font(.system(size: 9).monospacedDigit())
                     .foregroundColor(.secondary.opacity(0.7))
-                    .padding(.top, 3)
-                    .padding(.bottom, 5)
+                    .padding(.bottom, 3)
                 if usageViewMode == "chart" {
                     usageChart(entries: entries)
                 } else {
@@ -321,16 +332,11 @@ struct PanelView: View {
             if usageBreakdown == "models" && (rangeModels ?? [:]).isEmpty {
                 Text("此时间范围暂无模型明细").font(.system(size: 11)).foregroundColor(.secondary)
             }
-            Text("点击返回图表 →")
-                .font(.system(size: 9))
-                .foregroundColor(.secondary.opacity(0.6))
-                .frame(maxWidth: .infinity, alignment: .center)
-                .padding(.top, 6)
             syncSummary
         }
     }
 
-    /// 用量图表视图:占比堆叠条 + 图例 + 每日柱状图;点击切换到明细
+    /// 用量图表视图:占比堆叠条 + 图例 + 每日 Token／费用柱状图
     private func usageChart(entries: (tools: [String: UsageEntry], total: UsageEntry)) -> some View {
         let source = usageBreakdown == "models" ? (rangeModels ?? [:]) : entries.tools
         let sorted = source.sorted {
@@ -362,14 +368,11 @@ struct PanelView: View {
                 rows: rows,
                 composition: usageRange == "today" ? entries.total : nil,
                 days: windowDays,
+                costDays: rangeDailyCosts,
                 todayKey: todayKey,
                 showWeekdayLabels: usageRange == "7d",
-                format: { fmt($0) })
-            Text("点击查看明细 →")
-                .font(.system(size: 9))
-                .foregroundColor(.secondary.opacity(0.6))
-                .frame(maxWidth: .infinity, alignment: .center)
-                .padding(.top, 6)
+                format: { fmt($0) },
+                formatCost: { estimatedCostText($0) })
             syncSummary
         }
         .contentShape(Rectangle())

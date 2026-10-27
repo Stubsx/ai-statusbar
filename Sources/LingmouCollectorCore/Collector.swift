@@ -36,11 +36,13 @@ public final class LingmouCollector {
         let usage = UsageCollector(environment: environment, settings: settings, files: files).collectWithSync()
         let priceCache = ModelPricing.collect(
             environment: environment, files: files, enabled: settings.priceEstimatesEnabled)
+        let modelsDevPriceCache = ModelPricing.collectModelsDev(
+            environment: environment, files: files, enabled: settings.priceEstimatesEnabled)
         let exchangeRate = ModelPricing.collectExchangeRate(
             environment: environment, files: files, enabled: settings.priceEstimatesEnabled)
         let cost = ModelPricing.costData(
             local: usage.local, merged: usage.merged, cache: priceCache,
-            exchangeRate: exchangeRate)
+            modelsDevCache: modelsDevPriceCache, exchangeRate: exchangeRate)
         return CollectorMetrics(quotas: quota.compactMapValues { $0 }, usage: usage.local,
                                 usageMerged: usage.merged, sync: usage.sync, cost: cost,
                                 collectedAt: environment.now)

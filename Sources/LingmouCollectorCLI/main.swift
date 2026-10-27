@@ -15,6 +15,17 @@ if CommandLine.arguments.contains("--authorize-kimi-keychain") {
 let environment = CollectorEnvironment()
 let cachePath = CollectorCache.path(home: environment.homeDirectory)
 
+if CommandLine.arguments.contains("--clear-speed-records") {
+    guard CommandLine.arguments.count == 2 else { exit(2) }
+    do {
+        try UsageSpeedMaintenance.clear(homeDirectory: environment.homeDirectory)
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data("清空速度记录失败：\(error)\n".utf8))
+        exit(1)
+    }
+}
+
 func collectAndCache() -> Data? {
     do {
         let collector = LingmouCollector(environment: environment)

@@ -65,7 +65,7 @@ enum NotificationRouter {
         case "kimi":
             if let applicationURL = kimiCodeApplicationURL() {
                 if prefersKimiDesktopSessionNavigation(), sessionId.map(KimiWebInstance.validID) == true {
-                    return "尝试在 Kimi Code 中打开这条会话，失败时打开应用"
+                    return "在 Kimi Code 中打开这条会话，失败时提供恢复选项"
                 }
                 if sessionId != nil, kimiCodeSupportsWorkspaceDeepLink(applicationURL) {
                     return "在 Kimi Code 中打开该会话所在的工作区（新对话）"
@@ -156,36 +156,40 @@ enum NotificationRouter {
         // its project (new chat). The opt-in debug bridge still wins — it resumes
         // the actual session instead of opening the workspace.
         if let sessionId, !prefersKimiDesktopSessionNavigation(),
-            kimiCodeSupportsWorkspaceDeepLink(applicationURL),
-            let root = kimiSessionWorkspace(sessionId),
-            let url = kimiWorkspaceDeepLink(root: root)
+            let url = kimiWorkspaceURL(sessionId: sessionId, applicationURL: applicationURL)
         {
-            let app = NSRunningApplication.runningApplications(withBundleIdentifier: kimiCodeBundleID)
-                .first
-            app?.unhide()
-            if #available(macOS 14, *) {
-                NSApp.yieldActivation(toApplicationWithBundleIdentifier: kimiCodeBundleID)
-            }
-            let configuration = NSWorkspace.OpenConfiguration()
-            configuration.activates = true
-            configuration.createsNewApplicationInstance = false
-            configuration.allowsRunningApplicationSubstitution = false
-            NSWorkspace.shared.open([url], withApplicationAt: applicationURL,
-                                    configuration: configuration)
-            { _, error in
-                DispatchQueue.main.async {
-                    if error == nil { resolvingKimi = false } else {
-                        openKimiApplication(applicationURL, sessionId: sessionId)
-                    }
-                }
+            openKimiWorkspace(url, applicationURL: applicationURL) {
+                openKimiApplication(applicationURL, sessionId: sessionId)
             }
             return
         }
         openKimiApplication(applicationURL, sessionId: sessionId)
     }
 
+    private static func openKimiWorkspace(_ url: URL, applicationURL: URL,
+                                          onFailure: @escaping () -> Void) {
+        let app = NSRunningApplication.runningApplications(withBundleIdentifier: kimiCodeBundleID)
+            .first(where: { !$0.isTerminated })
+        app?.unhide()
+        if #available(macOS 14, *) {
+            NSApp.yieldActivation(toApplicationWithBundleIdentifier: kimiCodeBundleID)
+        }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        configuration.createsNewApplicationInstance = false
+        configuration.allowsRunningApplicationSubstitution = false
+        NSWorkspace.shared.open([url], withApplicationAt: applicationURL,
+                                configuration: configuration)
+        { _, error in
+            DispatchQueue.main.async {
+                if error == nil { resolvingKimi = false } else { onFailure() }
+            }
+        }
+    }
+
     private static func openKimiApplication(_ applicationURL: URL, sessionId: String?) {
-        let app = NSRunningApplication.runningApplications(withBundleIdentifier: kimiCodeBundleID).first
+        let app = NSRunningApplication.runningApplications(withBundleIdentifier: kimiCodeBundleID)
+            .first(where: { !$0.isTerminated })
         app?.unhide()
         if #available(macOS 14, *) {
             NSApp.yieldActivation(toApplicationWithBundleIdentifier: kimiCodeBundleID)
@@ -197,8 +201,7 @@ enum NotificationRouter {
         configuration.allowsRunningApplicationSubstitution = false
         let precise = prefersKimiDesktopSessionNavigation()
         if precise && app == nil { configuration.arguments = KimiDesktopNavigation.launchArguments }
-        // A running app is never restarted to enable debugging. A normal reopen
-        // remains the fallback when the opt-in bridge is absent or incompatible.
+        // A running app is never restarted without explicit confirmation.
         NSWorkspace.shared.openApplication(at: applicationURL, configuration: configuration) { opened, error in
             DispatchQueue.main.async {
                 if error == nil, let opened {
@@ -208,15 +211,99 @@ enum NotificationRouter {
                     }
                     let pid = opened.processIdentifier
                     DispatchQueue.global(qos: .userInitiated).async {
-                        _ = KimiDesktopNavigation.openSession(sessionId, pid: pid,
+                        let result = KimiDesktopNavigation.sessionResult(sessionId, pid: pid,
                             applicationURL: applicationURL, waitForLaunch: app == nil)
-                        DispatchQueue.main.async { resolvingKimi = false }
+                        DispatchQueue.main.async {
+                            if result == .opened {
+                                resolvingKimi = false
+                            } else {
+                                presentKimiRecovery(applicationURL: applicationURL, sessionId: sessionId,
+                                    canRestart: app != nil && result == .connectionUnavailable)
+                            }
+                        }
                     }
                 } else {
                     openKimiWebOrHost(sessionId: sessionId)
                 }
             }
         }
+    }
+
+    private static func presentKimiRecovery(applicationURL: URL, sessionId: String, canRestart: Bool) {
+        let workspaceURL = kimiWorkspaceURL(sessionId: sessionId, applicationURL: applicationURL)
+        let actions = KimiDesktopNavigation.recoveryActions(canRestart: canRestart,
+                                                            workspaceAvailable: workspaceURL != nil)
+        let alert = NSAlert()
+        alert.messageText = "未能打开指定 Kimi 会话"
+        alert.informativeText = canRestart
+            ? "首次使用精确跳转时，需要重新启动 Kimi Code 才能建立本机连接。重新启动会关闭当前 Kimi Code 窗口。"
+            : "本机连接不可用、会话不存在或当前 Kimi Code 版本不兼容。"
+        if workspaceURL != nil {
+            alert.informativeText += "也可以改为打开该会话所在的工作区（新对话）。"
+        }
+        for action in actions {
+            switch action {
+            case .restart: alert.addButton(withTitle: "重新启动并打开会话")
+            case .workspace: alert.addButton(withTitle: "打开工作区（新对话）")
+            case .cancel: alert.addButton(withTitle: "取消")
+            }
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        let index = alert.runModal().rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
+        guard actions.indices.contains(index) else {
+            resolvingKimi = false
+            return
+        }
+        switch actions[index] {
+        case .restart:
+            restartKimiForSession(applicationURL: applicationURL, sessionId: sessionId)
+        case .workspace:
+            guard let workspaceURL else {
+                resolvingKimi = false
+                return
+            }
+            openKimiWorkspace(workspaceURL, applicationURL: applicationURL) {
+                resolvingKimi = false
+                explain("无法打开 Kimi 工作区", detail: "请直接在 Kimi Code 中选择该工作区和会话。")
+            }
+        case .cancel:
+            resolvingKimi = false
+        }
+    }
+
+    private static func restartKimiForSession(applicationURL: URL, sessionId: String) {
+        let app = NSRunningApplication.runningApplications(withBundleIdentifier: kimiCodeBundleID)
+            .first(where: { !$0.isTerminated })
+        guard let app else {
+            openKimiApplication(applicationURL, sessionId: sessionId)
+            return
+        }
+        guard app.terminate() else {
+            resolvingKimi = false
+            explain("无法重新启动 Kimi Code", detail: "请先退出 Kimi Code，再从灵眸打开这条会话。")
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let deadline = Date().addingTimeInterval(8)
+            while !app.isTerminated && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            DispatchQueue.main.async {
+                guard app.isTerminated else {
+                    resolvingKimi = false
+                    explain("Kimi Code 尚未退出", detail: "请先手动退出 Kimi Code，再从灵眸打开这条会话。")
+                    return
+                }
+                openKimiApplication(applicationURL, sessionId: sessionId)
+            }
+        }
+    }
+
+    private static func kimiWorkspaceURL(sessionId: String, applicationURL: URL) -> URL? {
+        guard kimiCodeSupportsWorkspaceDeepLink(applicationURL),
+              let root = kimiSessionWorkspace(sessionId)
+        else { return nil }
+        return kimiWorkspaceDeepLink(root: root)
     }
 
     /// Kimi Code 1.1.0 added kimi-code://open?root=<abs path> (validated by the app).

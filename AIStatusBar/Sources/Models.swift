@@ -67,6 +67,42 @@ struct UsageRange: Codable {
     let total: UsageEntry
 }
 
+struct UsageRequest: Codable {
+    let id: String
+    let tool: String
+    let model: String
+    let sessionId: String?
+    let startedAt: TimeInterval?
+    let firstTokenAt: TimeInterval?
+    let finishedAt: TimeInterval
+    let outputTokens: Int
+    var metricKind: String? = nil
+
+    var generationDuration: TimeInterval? {
+        guard let firstTokenAt, finishedAt > firstTokenAt else { return nil }
+        return finishedAt - firstTokenAt
+    }
+    var averageDuration: TimeInterval? {
+        guard let startedAt, finishedAt > startedAt else { return nil }
+        return finishedAt - startedAt
+    }
+    var generationTps: Double? { generationDuration.map { Double(outputTokens) / $0 } }
+    var averageTps: Double? { averageDuration.map { Double(outputTokens) / $0 } }
+}
+
+struct ModelUsageSpeed: Codable {
+    let model: String
+    let generationTps: Double?
+    let averageTps: Double?
+    let generationSamples: Int
+    let averageSamples: Int
+}
+
+struct UsageSpeedData: Codable {
+    let recent: [UsageRequest]
+    let models: [ModelUsageSpeed]
+}
+
 struct UsageData: Codable {
     let date: String
     let tools: [String: UsageEntry]
@@ -76,6 +112,8 @@ struct UsageData: Codable {
     let heatmax: Int?
     let weekly: UsageRange?   // 近七日（含今日）；旧版 JSON 无此字段时为 nil
     let monthly: UsageRange?  // 近30日（含今日）
+    let dailyModels: [String: [String: UsageEntry]]?  // 逐日费用图表；旧版 JSON 为 nil
+    let speed: UsageSpeedData?  // 本机请求级速度；不参与多设备同步
 }
 
 struct CostEstimate: Codable {
@@ -86,10 +124,16 @@ struct CostEstimate: Codable {
     let unpricedModels: [String]
 }
 
+struct CostDay: Codable {
+    let date: String
+    let estimate: CostEstimate
+}
+
 struct CostPeriods: Codable {
     let today: CostEstimate
     let weekly: CostEstimate?
     let monthly: CostEstimate?
+    let daily: [CostDay]?
 }
 
 struct CostData: Codable {

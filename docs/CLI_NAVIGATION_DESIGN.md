@@ -16,7 +16,7 @@
 
 `KimiDesktopNavigation.swift` 仅读取标准桌面配置的 `DevToolsActivePort`，核验进程真实可执行文件、lsof 监听端口、调试 browser ID 和唯一主 renderer；排除截图窗口、浏览器覆盖层、外部地址和歧义页面。不支持自定义 Electron user-data-dir 时保守回退。页面已加载的会话直接走既有路由；未加载的历史先向同进程已验证的本机服务 GET 会话元数据，拒绝缺失、错 ID 或归档记录，防止 Kimi 自行选择其他历史。等待后比较页面路由及 Pinia `kimi.sessions.activeSessionId`，只改 URL 不算成功；预检期间用户已切会话则放弃本次导航。
 
-设置默认关闭。冷启动才加入调试参数，已运行的应用不自动重启；连接失败回退应用级打开。关闭开关不会关闭 Electron 自己的端口，设置和隐私说明明确要求退出并正常重开 Kimi。接口依赖桌面实现，后续版本不兼容时回退，不声称为官方深链。
+设置默认关闭。冷启动才加入调试参数，已运行的应用不自动重启；连接失败会明确提示，并保留原会话 ID 提供工作区兜底。若失败前应用已在运行且失败原因是连接未建立，用户可确认「重新启动并打开会话」（会话不存在等导航失败不提供重启）：灵眸等待原进程正常退出（最多 8 秒）后带调试参数重开并重试，不强制终止，也不把重启或 URL 变化当作精确跳转成功。冷启动后的失败不循环重启。关闭开关不会关闭 Electron 自己的端口，设置和隐私说明明确要求退出并正常重开 Kimi。接口依赖桌面实现，后续版本不兼容时回退，不声称为官方深链。2026-10-27 只读复核本机 1.1.4 的官方深链仍只接受 `open?root=`，没有会话参数。
 
 验证入口：`bash scripts/test-kimi-desktop-navigation.sh` 检查进程身份、回环端口、目标页面和 ID 边界；`--live <pid> <app-path> <session-a> <session-b>` 仅用于已经明确开启调试的真实安装版，切换两条已有会话并拒绝不存在 ID。`--expression <output-path>` 导出生产表达式，可用 `node tests/KimiDesktopNavigationTests/renderer.mjs <output-path>` 验证冷历史预检、用户并发导航及“URL 改了但会话未切换”等回退情况。
 

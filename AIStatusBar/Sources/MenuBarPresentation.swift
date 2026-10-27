@@ -52,14 +52,16 @@ enum MenuBarPresentation {
     }
 
     /// 保留原生菜单的键盘导航、高亮、子菜单与任务路由。
-    static func appendTools(to menu: NSMenu, tools: [ToolStatus], events: [TaskRecord] = [], target: AnyObject,
+    static func appendTools(to menu: NSMenu, tools: [ToolStatus], events: [TaskRecord] = [],
+                            requests: [UsageRequest] = [], target: AnyObject,
                             openTool: Selector, openConnections: Selector,
                             displayTitle: (String) -> String) {
-        let groups = HarnessConversations.groups(tools: tools, events: events)
+        let groups = HarnessConversations.groups(tools: tools, events: events, requests: requests)
 
         func taskItem(_ conversation: HarnessConversation) -> NSMenuItem {
             let title = displayTitle(conversation.title)
-            let item = NSMenuItem(title: "\(fittedTitle(title, maxWidth: 240)) · \(conversation.label)",
+            let speed = conversation.speedText.map { " · \($0)" } ?? ""
+            let item = NSMenuItem(title: "\(fittedTitle(title, maxWidth: 240)) · \(conversation.label)\(speed)",
                                   action: openTool, keyEquivalent: "")
             item.target = target
             item.image = symbol(conversation.symbol, size: 10, template: true)
@@ -67,7 +69,8 @@ enum MenuBarPresentation {
                 .font: NSFont.menuFont(ofSize: 12),
             ])
             item.representedObject = conversation
-            item.toolTip = title + " · " + conversation.label + "\n"
+            item.toolTip = title + " · " + conversation.label + speed + "\n"
+                + (conversation.speedText == nil ? "" : "TPS 来自该会话最近一次已完成请求\n")
                 + NotificationRouter.destinationLabel(forToolKey: conversation.toolKey, sessionId: conversation.sessionId)
                 + (conversation.needsAttention ? "，并清除此会话的提醒" : "")
             if conversation.needsAttention {

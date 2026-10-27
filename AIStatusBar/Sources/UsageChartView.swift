@@ -18,13 +18,19 @@ struct UsageChartCard: View {
     let composition: UsageEntry?
     /// 范围模式的每日用量(已按日期升序、去掉未来日)
     let days: [HeatDay]
+    /// 每日费用；旧数据或关闭估价时为 nil，只展示 Token 模式
+    let costDays: [CostDay]?
     let todayKey: String
     let showWeekdayLabels: Bool
     /// token 数量格式化(复用 PanelView 的 fmt)
     let format: (Int) -> String
+    let formatCost: (Double) -> String
 
+    @AppStorage("usageChartMetric") private var chartMetric = "tokens"
     @State private var hoveredRow: String? = nil
     @State private var hoveredDay: HeatDay? = nil
+
+    private var usesCost: Bool { chartMetric == "cost" && costDays != nil }
 
     /// 类别色板:系统色自动适配深浅色;最后一个是"其他"的灰
     private static let palette: [Color] = [
@@ -51,7 +57,7 @@ struct UsageChartCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
             Text(summary)
                 .font(.system(size: 11, weight: .medium).monospacedDigit())
                 .foregroundColor(.secondary)
@@ -119,7 +125,7 @@ struct UsageChartCard: View {
                         }
                     }
                 }
-                .padding(.vertical, 2)
+                .padding(.vertical, 1)
                 .padding(.horizontal, 4)
                 .background(
                     RoundedRectangle(cornerRadius: 4, style: .continuous)
@@ -173,19 +179,21 @@ struct UsageChartCard: View {
     // MARK: 每日柱状图
 
     private var dailyBars: some View {
-        let peak = max(1, days.map(\.total).max() ?? 1)
-        return VStack(alignment: .leading, spacing: 4) {
+        let costs = Dictionary(uniqueKeysWithValues: (costDays ?? []).map { ($0.date, $0) })
+        let values = days.map { usesCost ? costs[$0.date]?.estimate.amountUsd ?? 0 : Double($0.total) }
+        let peak = max(1, values.max() ?? 1)
+        return VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .bottom, spacing: 2) {
-                ForEach(days, id: \.date) { day in
+                ForEach(Array(days.enumerated()), id: \.element.date) { index, day in
                     RoundedRectangle(cornerRadius: 2, style: .continuous)
-                        .fill(Color(nsColor: .systemBlue)
+                        .fill(Color(nsColor: usesCost ? .systemGreen : .systemBlue)
                             .opacity(day.date == todayKey ? 0.95 : 0.45))
                         .frame(maxWidth: .infinity)
-                        .frame(height: max(3, 44 * CGFloat(day.total) / CGFloat(peak)))
+                        .frame(height: max(3, 40 * values[index] / peak))
                         .onHover { inside in hoveredDay = inside ? day : nil }
                 }
             }
-            .frame(height: 44, alignment: .bottom)
+            .frame(height: 40, alignment: .bottom)
             if showWeekdayLabels {
                 HStack(spacing: 2) {
                     ForEach(days, id: \.date) { day in
@@ -196,17 +204,42 @@ struct UsageChartCard: View {
                     }
                 }
             }
-            // 与活跃热力图同一模式:hover 显示当天详情,否则显示占位(高度固定不跳动)
-            HStack {
+            HStack(spacing: 6) {
+                if costDays != nil {
+                    metricButton("Token", tag: "tokens")
+                    metricButton("费用", tag: "cost")
+                }
+                Spacer(minLength: 4)
                 if let day = hoveredDay {
-                    Text(day.total > 0 ? "\(day.date) · \(format(day.total)) tokens" : "\(day.date) · 无用量")
-                        .font(.system(size: 10, weight: .medium).monospacedDigit())
+                    Text(dailyDetail(day, cost: costs[day.date]))
+                        .font(.system(size: 9, weight: .medium).monospacedDigit())
                         .foregroundColor(.secondary)
+                        .lineLimit(1)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .center)
-            .frame(height: 14)
+            .frame(height: 16)
         }
+    }
+
+    private func metricButton(_ title: String, tag: String) -> some View {
+        let selected = tag == "cost" ? usesCost : !usesCost
+        return Button { chartMetric = tag } label: {
+            Text(title)
+                .font(.system(size: 9, weight: selected ? .semibold : .regular))
+                .foregroundColor(selected ? .primary : .secondary)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 1)
+                .background(Capsule().fill(selected ? Color.primary.opacity(0.12) : .clear))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func dailyDetail(_ day: HeatDay, cost: CostDay?) -> String {
+        guard day.total > 0 else { return "\(day.date) · 无用量" }
+        guard usesCost else { return "\(day.date) · \(format(day.total)) tokens" }
+        guard let cost else { return "\(day.date) · 暂无报价" }
+        guard cost.estimate.amountUsd > 0 else { return "\(day.date) · 未计价" }
+        return "\(day.date) · \(formatCost(cost.estimate.amountUsd))"
     }
 
     private static let weekdayFormatter: DateFormatter = {
