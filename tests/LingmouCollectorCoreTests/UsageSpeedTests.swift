@@ -49,6 +49,60 @@ final class UsageSpeedTests: XCTestCase {
         XCTAssertEqual(speed.recent.count, 2)
     }
 
+    func testSessionAveragesUseAllRetainedRecordsAndSeparateTimingSamples() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let database = try SQLiteDatabase(path: home.appendingPathComponent("speed.sqlite").path)
+        try UsageSpeedStore.createSchema(database: database)
+        let requests = [
+            UsageRequest(id: "first", tool: "zcode", model: "glm", sessionId: "long",
+                startedAt: 100, firstTokenAt: 101, finishedAt: 102, outputTokens: 100),
+            UsageRequest(id: "second", tool: "zcode", model: "glm", sessionId: "long",
+                startedAt: 200, firstTokenAt: 203, finishedAt: 212, outputTokens: 100),
+            UsageRequest(id: "no-first-token", tool: "zcode", model: "glm", sessionId: "long",
+                startedAt: 300, finishedAt: 310, outputTokens: 50),
+            UsageRequest(id: "other-tool", tool: "kimi", model: "kimi", sessionId: "long",
+                startedAt: 400, firstTokenAt: 401, finishedAt: 403, outputTokens: 200),
+            UsageRequest(id: "legacy", tool: "codex", model: "gpt", sessionId: "codex-session",
+                startedAt: 500, finishedAt: 600, outputTokens: 10000),
+            UsageRequest(id: "effective", tool: "codex", model: "gpt", sessionId: "codex-session",
+                startedAt: 500, firstTokenAt: 501, finishedAt: 505, outputTokens: 40,
+                metricKind: "effective"),
+        ]
+        for request in requests { try UsageSpeedStore.add(request, database: database) }
+        for index in 0..<1001 {
+            try UsageSpeedStore.add(UsageRequest(id: "background-\(index)", tool: "zcode",
+                model: "glm", sessionId: "background", startedAt: Double(1000 + index),
+                finishedAt: Double(1001 + index), outputTokens: 1), database: database)
+        }
+        let speed = try UsageSpeedStore.load(database: database)
+        XCTAssertEqual(speed.recent.count, 1000)
+        XCTAssertFalse(speed.recent.contains { $0.sessionId == "long" })
+        let sessions = try XCTUnwrap(speed.sessions)
+        let long = try XCTUnwrap(sessions.first { $0.tool == "zcode" && $0.sessionId == "long" })
+        XCTAssertEqual(long.tps, 20, "Weight by total tokens / duration, not by request TPS")
+        XCTAssertEqual(long.metricKind, "generation")
+        XCTAssertEqual(long.speedSamples, 2, "Do not mix whole-request fallback into generation TPS")
+        XCTAssertEqual(long.firstTokenSeconds, 2)
+        XCTAssertEqual(long.firstTokenSamples, 2, "Missing timing is not a zero-latency sample")
+        XCTAssertEqual(long.requestCount, 3)
+        XCTAssertEqual(long.latest.id, "no-first-token", "Latest request remains available beyond detail cap")
+        let kimi = try XCTUnwrap(sessions.first { $0.tool == "kimi" })
+        XCTAssertEqual(kimi.tps, 100, "Identical session IDs in different tools stay separate")
+        let codex = try XCTUnwrap(sessions.first { $0.tool == "codex" })
+        XCTAssertEqual(codex.requestCount, 1, "Exclude legacy Codex whole-turn averages")
+        XCTAssertEqual(codex.tps, 10)
+        XCTAssertEqual(codex.metricKind, "effective")
+        let fallback = try XCTUnwrap(sessions.first { $0.sessionId == "background" })
+        XCTAssertEqual(fallback.tps, 1)
+        XCTAssertEqual(fallback.speedSamples, 1001)
+        XCTAssertEqual(fallback.metricKind, "average")
+        XCTAssertNil(fallback.firstTokenSeconds)
+        XCTAssertEqual(fallback.firstTokenSamples, 0)
+        try UsageSpeedStore.prune(database: database, retentionDays: 1, now: 90_000)
+        XCTAssertEqual(try UsageSpeedStore.load(database: database).sessions?.count, 0)
+    }
+
     func testZcodeReadsGenerationAndAverageSpeedWithoutDoubleCounting() throws {
         let home = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: home) }
@@ -82,6 +136,7 @@ final class UsageSpeedTests: XCTestCase {
         let request = try XCTUnwrap(first.speed?.recent.first)
         XCTAssertEqual(request.generationTps, 4)
         XCTAssertEqual(request.averageTps, 2)
+        XCTAssertEqual(request.timeToFirstToken, 10)
         XCTAssertEqual(request.sessionId, "session-z")
         XCTAssertEqual(first.speed?.recent.count, 1, "90 天前的请求明细应被清理")
         XCTAssertEqual(first.tools["zcode"]?.output, 40)
@@ -128,10 +183,12 @@ final class UsageSpeedTests: XCTestCase {
             $0.tool == "codex" && $0.metricKind == "effective"
         })
         XCTAssertEqual(codexRequest.averageTps, 2)
+        XCTAssertEqual(codexRequest.timeToFirstToken, 5)
         XCTAssertEqual(try XCTUnwrap(codexRequest.generationTps), 40.0 / 15.0, accuracy: 0.0001)
         XCTAssertEqual(codexRequest.sessionId, "12345678-1234-1234-1234-123456789abc")
         let kimiRequest = try XCTUnwrap(data.speed?.recent.first { $0.tool == "kimi" })
         XCTAssertEqual(kimiRequest.averageTps, 1)
+        XCTAssertEqual(kimiRequest.timeToFirstToken, 6)
         XCTAssertEqual(kimiRequest.generationTps, 2.5)
         XCTAssertEqual(kimiRequest.sessionId, "session")
         XCTAssertEqual(data.tools["kimi"]?.output, 10, "step.end 只补充速度，不得重复计入用量")
@@ -243,6 +300,57 @@ final class UsageSpeedTests: XCTestCase {
             UsageRequest(id: "new", tool: "codex", model: "gpt", startedAt: 40,
                          finishedAt: 50, outputTokens: 10), database: database)
         XCTAssertEqual(try UsageSpeedStore.load(database: database).recent.map(\.id), ["new"])
+    }
+
+    func testFirstTokenTimingRejectsMissingAndInconsistentClocks() {
+        func latency(_ start: Double?, _ first: Double?, _ end: Double = 20) -> Double? {
+            UsageRequest(id: "timing", tool: "zcode", model: "glm", startedAt: start,
+                         firstTokenAt: first, finishedAt: end, outputTokens: 10).timeToFirstToken
+        }
+        XCTAssertEqual(latency(10, 10), 0)
+        XCTAssertEqual(latency(10, 20), 10)
+        XCTAssertNil(latency(nil, 15))
+        XCTAssertNil(latency(10, nil))
+        XCTAssertNil(latency(10, 9))
+        XCTAssertNil(latency(10, 21))
+        XCTAssertNil(latency(.nan, 15))
+        XCTAssertNil(latency(10, .infinity))
+        XCTAssertNil(latency(10, 15, .infinity))
+    }
+
+    func testDshSessionStatsProduceSessionSpeed() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now = try XCTUnwrap(DateSupport.timestamp("2033-05-18T03:33:20Z"))
+        try write(
+            """
+            {"version":5,"record":{"identity":{"createdAt":2000000000000,"cwd":"/tmp/proj"},"rows":{
+                "tokenUsage":{"val":{"totals":{"uncachedInputTokens":100,"outputTokens":20,"cacheReadTokens":40},
+                    "last":{"turn":1,"step":2,"buckets":{"uncachedInputTokens":10,"outputTokens":20,"cacheReadTokens":5}}}},
+                "sessionStats":{"val":{"turns":1,"steps":4,"llmMs":30000,"toolMs":5000,
+                    "ttftMs":9000,"ttftSteps":3,"decodeMs":10000,"decodeTokens":2000}},
+                "sessionListMetadata":{"val":{"lastPromptAt":2000000000000}}}}}
+            """,
+            to: home.appendingPathComponent(
+                ".dsh/storages/session_projcache/sessions/session-speed.json"))
+        let data = try XCTUnwrap(
+            UsageCollector(
+                environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+                files: FileSupport()
+            ).collect())
+        let session = try XCTUnwrap(
+            data.speed?.sessions?.first { $0.tool == "dsh" && $0.sessionId == "session-speed" })
+        XCTAssertEqual(try XCTUnwrap(session.tps), 200, accuracy: 0.0001)
+        XCTAssertEqual(session.metricKind, "generation")
+        XCTAssertEqual(session.speedSamples, 4)
+        XCTAssertEqual(try XCTUnwrap(session.firstTokenSeconds), 3, accuracy: 0.0001)
+        XCTAssertEqual(session.firstTokenSamples, 3)
+        XCTAssertEqual(session.requestCount, 4)
+        XCTAssertEqual(session.latest.outputTokens, 20)
+        XCTAssertEqual(session.latest.finishedAt, 2_000_000_000)
+        XCTAssertTrue(
+            data.speed?.recent.allSatisfy { $0.tool != "dsh" } ?? true,
+            "DSH 统计只进会话聚合，不进逐请求明细")
     }
 
     func testUsageDataDecodesWithoutSpeedField() throws {

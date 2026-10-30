@@ -78,6 +78,13 @@ struct UsageRequest: Codable {
     let outputTokens: Int
     var metricKind: String? = nil
 
+    var timeToFirstToken: TimeInterval? {
+        guard let startedAt, let firstTokenAt,
+            startedAt.isFinite, firstTokenAt.isFinite, finishedAt.isFinite,
+            startedAt <= firstTokenAt, firstTokenAt <= finishedAt
+        else { return nil }
+        return firstTokenAt - startedAt
+    }
     var generationDuration: TimeInterval? {
         guard let firstTokenAt, finishedAt > firstTokenAt else { return nil }
         return finishedAt - firstTokenAt
@@ -98,9 +105,22 @@ struct ModelUsageSpeed: Codable {
     let averageSamples: Int
 }
 
+struct SessionUsageSpeed: Codable {
+    let tool: String
+    let sessionId: String
+    let tps: Double?
+    let metricKind: String
+    let speedSamples: Int
+    let firstTokenSeconds: Double?
+    let firstTokenSamples: Int
+    let requestCount: Int
+    let latest: UsageRequest
+}
+
 struct UsageSpeedData: Codable {
     let recent: [UsageRequest]
     let models: [ModelUsageSpeed]
+    var sessions: [SessionUsageSpeed]? = nil
 }
 
 struct UsageData: Codable {

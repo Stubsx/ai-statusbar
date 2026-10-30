@@ -359,9 +359,13 @@ struct LocalCollectors {
     }
 
     func dsh() -> RawToolState {
-        // 兼容两种安装路径：npx 的 node_modules/.bin/dsh 与直装的 */bin/dsh（如 ~/.local/bin/dsh）
+        // 三种运行形态：桌面端 DeepSeek Harness.app、npx 的 node_modules/.bin/dsh、
+        // 直装的 */bin/dsh（如 ~/.local/bin/dsh）
+        let desktopOn = processes.isAppRunning(executableName: "DeepSeek Harness")
         let count = processes.count(matchingAny: [".bin/dsh", "/bin/dsh"])
-        var result = RawToolState(processOn: count > 0, detail: count > 0 ? "Web 在线" : "无进程")
+        var result = RawToolState(
+            processOn: desktopOn || count > 0,
+            detail: desktopOn ? "桌面端在线" : (count > 0 ? "Web 在线" : "无进程"))
         let window = TimeInterval(settings.busySeconds(for: "dsh"))
         // 投影缓存：dsh web 端实时维护的会话投影（标题/进行中的 step/待回工具调用），
         // 与 session.jsonl.zstd 事件流同步落盘，免解压即可拿到 busy 信号。

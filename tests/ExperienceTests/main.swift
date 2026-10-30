@@ -162,6 +162,51 @@ do {
           "Codex never falls back to misleading whole-turn averages")
     check(withSpeed.first { $0.sessionId == "effective" }?.speedText == "40.0 t/s · 有效",
           "Codex TTFT-derived speed is explicitly labelled effective")
+    check(withSpeed.first { $0.sessionId == "session" }?.metricsText == "最新 100.0 t/s · 有效 · 首词 9.0 s",
+          "Latency and TPS belong to the same latest completed request")
+    check(withSpeed.first { $0.sessionId == "second" }?.firstTokenText == nil,
+          "Unsupported Codex timing must not leak into another session")
+    var timingRow = withSpeed.first { $0.sessionId == "effective" }!
+    timingRow.usageRequest = UsageRequest(id: "subsecond", tool: "zcode", model: "glm", sessionId: nil,
+        startedAt: 100, firstTokenAt: 100.25, finishedAt: 105, outputTokens: 40)
+    check(timingRow.firstTokenText == "首词 250 ms", "Subsecond latency uses milliseconds")
+    for source in ["kimi", "kimi-work"] {
+        timingRow.usageRequest = UsageRequest(id: "estimated", tool: source, model: "kimi", sessionId: nil,
+            startedAt: 100, firstTokenAt: 101, finishedAt: 105, outputTokens: 40)
+        check(timingRow.firstTokenText == "首词约 1.0 s", "Kimi latency must be labelled as estimated")
+        check(timingRow.metricsHelp == timingRow.latestMetricsText, "Tooltip keeps only the latest values")
+    }
+    timingRow.usageRequest = UsageRequest(id: "missing", tool: "zcode", model: "glm", sessionId: nil,
+        startedAt: 100, firstTokenAt: nil, finishedAt: 105, outputTokens: 40)
+    check(timingRow.firstTokenText == nil && timingRow.metricsText == "最新 8.0 t/s · 整轮",
+          "Missing first-token timing preserves TPS without inventing latency")
+    timingRow.usageRequest = UsageRequest(id: "invalid", tool: "zcode", model: "glm", sessionId: nil,
+        startedAt: 100, firstTokenAt: 99, finishedAt: 105, outputTokens: 40)
+    check(timingRow.firstTokenText == nil, "Inconsistent clocks cannot produce negative latency")
+    let average = SessionUsageSpeed(tool: "codex", sessionId: "session", tps: 20,
+        metricKind: "effective", speedSamples: 2, firstTokenSeconds: 2,
+        firstTokenSamples: 2, requestCount: 3, latest: speeds[0])
+    let averagedRows = HarnessConversations.conversations(tool: tool(), events: history,
+        requests: [], sessions: [average])
+    let averaged = averagedRows.first { $0.sessionId == "session" }!
+    check(averaged.metricsText == "平均 20.0 t/s · 有效 · 首词 2.0 s",
+          "Main row uses per-session averages even when raw recent records are absent")
+    check(averaged.metricsHelp?.contains("最新 100.0 t/s · 有效 · 首词 9.0 s") == true,
+          "Tooltip preserves the latest completed request")
+    check(averaged.metricsText(hovered: false) == "平均 20.0 t/s · 有效 · 首词 2.0 s",
+          "Resting rows use one leading average label")
+    check(averaged.metricsText(hovered: true) == "最新 100.0 t/s · 有效 · 首词 9.0 s",
+          "Hover switches inline values to the latest request, not just a tooltip")
+    check(averaged.metricsText(hovered: false) == averaged.metricsText,
+          "Leaving hover restores session averages")
+    check(averaged.metricsHelp == "最新 100.0 t/s · 有效 · 首词 9.0 s\n平均 20.0 t/s · 有效 · 首词 2.0 s",
+          "Tooltip keeps latest and average values without measurement explanations")
+    check(averagedRows.first { $0.sessionId == "second" }?.metricsText == nil,
+          "Session summary never leaks into a different conversation")
+    timingRow.sessionSpeed = SessionUsageSpeed(tool: "kimi", sessionId: "session", tps: 30,
+        metricKind: "generation", speedSamples: 3, firstTokenSeconds: 0.25,
+        firstTokenSamples: 2, requestCount: 3, latest: speeds[0])
+    check(timingRow.firstTokenText == "首词约 250 ms", "Kimi averages retain the estimated qualifier")
     let states = HarnessConversations.conversations(tool: tool(), events: [
         record("quiet", phase: "inactive"),
         record("resolved", session: "resolved", phase: "waiting_input", resolved: true),

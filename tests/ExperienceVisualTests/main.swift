@@ -24,10 +24,81 @@ private final class FixtureWheelEvent: NSEvent {
     override var cgEvent: CGEvent? { source.cgEvent }
 }
 
+private final class FixtureHoverEvent: NSEvent {
+    var area: NSTrackingArea!
+    var entering = true
+    weak var targetWindow: NSWindow?
+    override var type: NSEvent.EventType { entering ? .mouseEntered : .mouseExited }
+    override var trackingArea: NSTrackingArea? { area }
+    override var window: NSWindow? { targetWindow }
+    override var windowNumber: Int { targetWindow?.windowNumber ?? 0 }
+    override var locationInWindow: NSPoint { NSPoint(x: 100, y: 20) }
+    override var modifierFlags: NSEvent.ModifierFlags { [] }
+    override var timestamp: TimeInterval { ProcessInfo.processInfo.systemUptime }
+}
+
+private struct FixtureHoverMetricsProbe: View {
+    let conversation: HarnessConversation
+    let changed: (String?) -> Void
+    @Environment(\.statusRowHovered) private var hovered
+    var body: some View {
+        StatusConversationMetrics(conversation: conversation)
+            .onAppear { changed(conversation.metricsText(hovered: hovered)) }
+            .onChange(of: hovered) { changed(conversation.metricsText(hovered: $0)) }
+    }
+}
+
+@MainActor
+private func checkNativeMetricsHover() {
+    let latest = UsageRequest(id: "hover", tool: "codex", model: "gpt", sessionId: "hover",
+        startedAt: 100, firstTokenAt: 101, finishedAt: 105, outputTokens: 40, metricKind: "effective")
+    let average = SessionUsageSpeed(tool: "codex", sessionId: "hover", tps: 20,
+        metricKind: "effective", speedSamples: 2, firstTokenSeconds: 2,
+        firstTokenSamples: 2, requestCount: 2, latest: latest)
+    let conversation = HarnessConversation(id: "hover", toolKey: "codex-ide", sessionId: "hover",
+        title: "hover", phase: "working", timestamp: nil, eventIDs: [], needsAttention: false,
+        usageRequest: latest, sessionSpeed: average)
+    var observed: String?
+    let hosted = NSHostingView(rootView: Button {} label: {
+        FixtureHoverMetricsProbe(conversation: conversation) { observed = $0 }
+            .frame(width: 280, height: 40)
+    }.buttonStyle(StatusRowButtonStyle()))
+    let window = NSWindow(contentRect: NSRect(x: -10000, y: -10000, width: 330, height: 70),
+        styleMask: [.borderless], backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    window.contentView = hosted
+    window.orderFront(nil)
+    hosted.layoutSubtreeIfNeeded()
+    RunLoop.current.run(until: Date().addingTimeInterval(0.15))
+    func views(_ root: NSView) -> [NSView] { [root] + root.subviews.flatMap(views) }
+    let areas = views(hosted).flatMap(\.trackingAreas).filter { $0.options.contains(.mouseEnteredAndExited) }
+    assert(!areas.isEmpty, "Production row style must install native hover tracking")
+    assert(observed == conversation.metricsText)
+    // Deliver only to this offscreen fixture's tracking owners, never global input.
+    for entering in [true, false] {
+        for area in areas {
+            let event = FixtureHoverEvent()
+            event.area = area
+            event.entering = entering
+            event.targetWindow = window
+            let owner = area.owner as? NSResponder
+            if entering { owner?.mouseEntered(with: event) }
+            else { owner?.mouseExited(with: event) }
+        }
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        assert(observed == conversation.metricsText(hovered: entering),
+               "Native row enter/exit must change inline metrics through the button style")
+    }
+    window.close()
+    print("PASS: native row hover switches average → latest → average through the production button style")
+}
+
 @MainActor
 func renderExperience() throws {
     setbuf(stdout, nil)
     _ = NSApplication.shared
+    checkNativeMetricsHover()
+    if CommandLine.arguments.contains("--hover-only") { return }
     let applicationLookup = NotificationRouter.kimiCodeApplicationURL
     let dshApplicationLookup = NotificationRouter.dshApplicationURL
     let desktopPreference = NotificationRouter.prefersKimiDesktopSessionNavigation
@@ -251,7 +322,9 @@ func renderExperience() throws {
        "capabilities":{"event_phases":["ended"],"usage":true,"quota":false,"navigation":"host"}}
     ],"usage":{"date":"2026-09-11","tools":{"codex":{"input":125000,"output":31000,"cache":480000}},"models":{"sample-model":{"input":125000,"output":31000,"cache":480000}},"total":{"input":125000,"output":31000,"cache":480000},
       "speed":{"recent":[{"id":"speed-1","tool":"codex","model":"gpt","session_id":"s1","started_at":100,"first_token_at":101,"finished_at":105,"output_tokens":40,"metric_kind":"effective"},
-        {"id":"speed-2","tool":"codex","model":"gpt","session_id":"s2","started_at":100,"first_token_at":null,"finished_at":110,"output_tokens":50}],"models":[]}}}
+        {"id":"speed-2","tool":"codex","model":"gpt","session_id":"s2","started_at":100,"first_token_at":null,"finished_at":110,"output_tokens":50}],"models":[],
+        "sessions":[{"tool":"codex","session_id":"s1","tps":20,"metric_kind":"effective","speed_samples":2,"first_token_seconds":2,"first_token_samples":2,"request_count":2,
+          "latest":{"id":"speed-1","tool":"codex","model":"gpt","session_id":"s1","started_at":100,"first_token_at":101,"finished_at":105,"output_tokens":40,"metric_kind":"effective"}}]}}}
     """
     let sessionIDs = (1...7).map { "01234567-89ab-4cde-8fab-0123456789a\($0)" }
     let sessionJSON = sessionIDs.enumerated().reduce(json) { value, entry in
@@ -282,16 +355,24 @@ func renderExperience() throws {
     }
     let menuTarget = NSObject()
     let toolMenu = NSMenu()
-    MenuBarPresentation.appendTools(to: toolMenu, tools: store.data!.tools, requests: store.data!.usage?.speed?.recent ?? [], target: menuTarget,
+    MenuBarPresentation.appendTools(to: toolMenu, tools: store.data!.tools, requests: store.data!.usage?.speed?.recent ?? [],
+                                    sessions: store.data!.usage?.speed?.sessions ?? [], target: menuTarget,
                                     openTool: Selector(("openTool:")), openConnections: Selector(("openConnections")),
                                     displayTitle: { store.displayTitle($0) })
     let destinations = menuItems(toolMenu).compactMap { $0.representedObject as? HarnessConversation }
     assert(Set(destinations.compactMap(\.sessionId)) == Set(sessionIDs),
            "Overflow must use activeItems, not the one-item busyItems preview")
     assert(destinations.allSatisfy { $0.toolKey == "codex-ide" })
+    assert(menuItems(toolMenu).contains { $0.title.contains("平均 20.0 t/s · 有效 · 首词 2.0 s")
+        && $0.toolTip?.contains("最新 10.0 t/s · 有效 · 首词 1.0 s") == true },
+           "Native menu displays session averages and preserves latest request in its tooltip")
+    assert(menuItems(toolMenu).contains { $0.toolTip?.contains(
+        "最新 10.0 t/s · 有效 · 首词 1.0 s\n平均 20.0 t/s · 有效 · 首词 2.0 s") == true },
+           "Menu tooltip separates latest and average with consistent leading labels")
     settings.experience.privacyMode = true
     let privateMenu = NSMenu()
-    MenuBarPresentation.appendTools(to: privateMenu, tools: store.data!.tools, requests: store.data!.usage?.speed?.recent ?? [], target: menuTarget,
+    MenuBarPresentation.appendTools(to: privateMenu, tools: store.data!.tools, requests: store.data!.usage?.speed?.recent ?? [],
+                                    sessions: store.data!.usage?.speed?.sessions ?? [], target: menuTarget,
                                     openTool: Selector(("openTool:")), openConnections: Selector(("openConnections")),
                                     displayTitle: { store.displayTitle($0) })
     for item in menuItems(privateMenu) where item.representedObject is HarnessConversation {
@@ -364,10 +445,20 @@ func renderExperience() throws {
                    title: "导出产品状态与核对结果", phase: "ended", timestamp: now - 120,
                    evidence: "explicit", acknowledged: true, resolved: false)
     ]
+    let sessionRequests = (store.data!.usage?.speed?.recent ?? []) + [
+        UsageRequest(id: "kimi-timing", tool: "kimi", model: "kimi", sessionId: "kimi-web-one",
+                     startedAt: 100, firstTokenAt: 100.25, finishedAt: 105, outputTokens: 40)
+    ]
+    let sessionSpeeds = (store.data!.usage?.speed?.sessions ?? []) + [
+        SessionUsageSpeed(tool: "kimi", sessionId: "kimi-web-one", tps: 8.4,
+            metricKind: "generation", speedSamples: 4, firstTokenSeconds: 0.25,
+            firstTokenSamples: 3, requestCount: 4, latest: sessionRequests.last!)
+    ]
     func sessionSections(webAvailable: Bool) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(HarnessConversations.groups(tools: [store.data!.tools[0], kimiTool, hostTool],
-                                                 events: sessionHistory)) { group in
+                                                 events: sessionHistory, requests: sessionRequests,
+                                                 sessions: sessionSpeeds)) { group in
                 StatusToolSection(group: group, kimiWebAvailable: webAvailable,
                                   displayTitle: { settings.experience.privacyMode ? "任务标题已隐藏" : $0 },
                                   openDestination: { print("SESSION_ROUTE: \($0.toolKey) / \($0.sessionId ?? "application")") },
@@ -379,6 +470,22 @@ func renderExperience() throws {
         try save("session-list-" + (scheme == .light ? "light" : "dark"),
                  content: sessionSections(webAvailable: true)
                     .background(scheme == .light ? Color.white : Color(red: 0.09, green: 0.11, blue: 0.16)), scheme: scheme)
+    }
+    let hoverConversation = store.harnessGroups.flatMap(\.conversations).first {
+        $0.sessionId == sessionIDs[0]
+    }!
+    for scheme in [ColorScheme.light, .dark] {
+        for hovered in [false, true] {
+            try save("session-metrics-" + (hovered ? "latest-" : "average-")
+                     + (scheme == .light ? "light" : "dark"), content:
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(hoverConversation.title).font(.system(size: 11))
+                    StatusConversationMetrics(conversation: hoverConversation)
+                        .environment(\.statusRowHovered, hovered)
+                }.frame(width: 300, alignment: .leading).padding(14)
+                    .background(scheme == .light ? Color.white : Color(red: 0.09, green: 0.11, blue: 0.16)),
+                scheme: scheme)
+        }
     }
     settings.experience.privacyMode = true
     try save("session-list-private", content: sessionSections(webAvailable: true).background(Color.white), scheme: .light)

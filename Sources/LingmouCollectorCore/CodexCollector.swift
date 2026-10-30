@@ -56,7 +56,10 @@ struct CodexCollector {
                             subagentName: header.subagentName,
                             internalSubagent: header.internalSubagent))
         }
-        for (id, segments) in groups {
+        // Each refresh runs in a new process with a different Dictionary hash seed.
+        // Keep session order independent of enumeration, log writes and metrics updates.
+        for id in groups.keys.sorted() {
+            guard let segments = groups[id] else { continue }
             let sorted = segments.sorted { $0.modified > $1.modified }
             guard let newest = sorted.first else { continue }
             let stored = threads[id]

@@ -28,6 +28,15 @@ public struct UsageRequest: Codable, Hashable, Sendable {
         self.metricKind = metricKind
     }
 
+    /// Local request start to first token; unavailable or inconsistent clocks stay unknown.
+    public var timeToFirstToken: TimeInterval? {
+        guard let startedAt, let firstTokenAt,
+            startedAt.isFinite, firstTokenAt.isFinite, finishedAt.isFinite,
+            startedAt <= firstTokenAt, firstTokenAt <= finishedAt
+        else { return nil }
+        return firstTokenAt - startedAt
+    }
+
     public var generationDuration: TimeInterval? {
         guard let firstTokenAt, finishedAt > firstTokenAt else { return nil }
         return finishedAt - firstTokenAt
@@ -66,13 +75,27 @@ public struct ModelUsageSpeed: Codable, Hashable, Sendable {
     }
 }
 
+public struct SessionUsageSpeed: Codable, Hashable, Sendable {
+    public let tool: String
+    public let sessionId: String
+    public let tps: Double?
+    public let metricKind: String
+    public let speedSamples: Int
+    public let firstTokenSeconds: Double?
+    public let firstTokenSamples: Int
+    public let requestCount: Int
+    public let latest: UsageRequest
+}
+
 public struct UsageSpeedData: Codable, Hashable, Sendable {
     public let recent: [UsageRequest]
     public let models: [ModelUsageSpeed]
+    public let sessions: [SessionUsageSpeed]?
 
-    public init(recent: [UsageRequest], models: [ModelUsageSpeed]) {
+    public init(recent: [UsageRequest], models: [ModelUsageSpeed], sessions: [SessionUsageSpeed]? = nil) {
         self.recent = recent
         self.models = models
+        self.sessions = sessions
     }
 }
 
@@ -93,6 +116,8 @@ struct UsageSpeedStore {
         }
         try database.execute(
             "CREATE INDEX IF NOT EXISTS requests_finished ON requests(finished_at DESC)")
+        try database.execute(
+            "CREATE INDEX IF NOT EXISTS requests_session ON requests(tool, session_id, finished_at DESC, id)")
         try database.execute(
             "CREATE TABLE IF NOT EXISTS request_exclusions(id TEXT PRIMARY KEY, finished_at REAL)")
     }
@@ -156,7 +181,66 @@ struct UsageSpeedStore {
                 finishedAt: finishedAt, outputTokens: row["output_tokens"]?.int ?? 0,
                 metricKind: row["metric_kind"]?.string)
         }
-        return UsageSpeedData(recent: requests, models: summarize(requests))
+        return UsageSpeedData(recent: requests, models: summarize(requests),
+                              sessions: try summarizeSessions(database: database))
+    }
+
+    private static func summarizeSessions(database: SQLiteDatabase) throws -> [SessionUsageSpeed] {
+        // Aggregate all retained records in SQLite, independent of the 1,000-row detail cap.
+        // Codex whole-turn legacy records are excluded just as they are in conversation rows.
+        let generation = "first_token_at >= started_at AND finished_at > first_token_at"
+            + " OR started_at IS NULL AND finished_at > first_token_at"
+        let average = "finished_at > started_at"
+        let firstToken = "first_token_at >= started_at AND finished_at >= first_token_at"
+        let rows = try database.query(
+            """
+            WITH ranked AS (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY tool, session_id ORDER BY finished_at DESC, id) AS latest_rank
+                FROM requests
+                WHERE session_id IS NOT NULL AND session_id != '' AND output_tokens > 0
+                    AND (tool != 'codex' OR metric_kind = 'effective')
+            ), summary AS (
+                SELECT tool, session_id, COUNT(*) AS request_count,
+                    SUM(CASE WHEN (\(generation)) THEN output_tokens ELSE 0 END) AS generation_tokens,
+                    SUM(CASE WHEN (\(generation)) THEN finished_at-first_token_at ELSE 0 END) AS generation_seconds,
+                    SUM(CASE WHEN (\(generation)) THEN 1 ELSE 0 END) AS generation_samples,
+                    SUM(CASE WHEN \(average) THEN output_tokens ELSE 0 END) AS average_tokens,
+                    SUM(CASE WHEN \(average) THEN finished_at-started_at ELSE 0 END) AS average_seconds,
+                    SUM(CASE WHEN \(average) THEN 1 ELSE 0 END) AS average_samples,
+                    SUM(CASE WHEN \(firstToken) THEN first_token_at-started_at ELSE 0 END) AS first_token_seconds,
+                    SUM(CASE WHEN \(firstToken) THEN 1 ELSE 0 END) AS first_token_samples,
+                    MAX(CASE WHEN latest_rank=1 THEN id END) AS latest_id
+                FROM ranked GROUP BY tool, session_id
+            )
+            SELECT s.*, r.id, r.model, r.started_at, r.first_token_at, r.finished_at,
+                r.output_tokens, r.metric_kind
+            FROM summary s JOIN requests r ON r.id=s.latest_id
+            ORDER BY s.tool, s.session_id
+            """)
+        return rows.compactMap { row in
+            guard let tool = row["tool"]?.string, let sessionId = row["session_id"]?.string,
+                let id = row["id"]?.string, let finishedAt = row["finished_at"]?.double
+            else { return nil }
+            let generationSeconds = row["generation_seconds"]?.double ?? 0
+            let averageSeconds = row["average_seconds"]?.double ?? 0
+            let useGeneration = generationSeconds > 0
+            let seconds = useGeneration ? generationSeconds : averageSeconds
+            let tokens = row[useGeneration ? "generation_tokens" : "average_tokens"]?.double ?? 0
+            let firstSamples = row["first_token_samples"]?.int ?? 0
+            return SessionUsageSpeed(
+                tool: tool, sessionId: sessionId, tps: seconds > 0 ? tokens / seconds : nil,
+                metricKind: tool == "codex" ? "effective" : (useGeneration ? "generation" : "average"),
+                speedSamples: row[useGeneration ? "generation_samples" : "average_samples"]?.int ?? 0,
+                firstTokenSeconds: firstSamples > 0
+                    ? (row["first_token_seconds"]?.double ?? 0) / Double(firstSamples) : nil,
+                firstTokenSamples: firstSamples, requestCount: row["request_count"]?.int ?? 0,
+                latest: UsageRequest(id: id, tool: tool, model: row["model"]?.string ?? "",
+                    sessionId: sessionId, startedAt: row["started_at"]?.double,
+                    firstTokenAt: row["first_token_at"]?.double, finishedAt: finishedAt,
+                    outputTokens: row["output_tokens"]?.int ?? 0,
+                    metricKind: row["metric_kind"]?.string))
+        }
     }
 
     private static func summarize(_ requests: [UsageRequest]) -> [ModelUsageSpeed] {

@@ -505,7 +505,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         if store.data != nil || !store.recentEvents.isEmpty {
             MenuBarPresentation.appendTools(to: menu, tools: store.data?.tools ?? [],
                                             events: store.recentEvents,
-                                            requests: store.data?.usage?.speed?.recent ?? [], target: self,
+                                            requests: store.data?.usage?.speed?.recent ?? [],
+                                            sessions: store.data?.usage?.speed?.sessions ?? [], target: self,
                                             openTool: #selector(openTool(_:)),
                                             openConnections: #selector(openMenuConnections),
                                             displayTitle: { store.displayTitle($0) })

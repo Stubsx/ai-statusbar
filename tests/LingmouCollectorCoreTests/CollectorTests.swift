@@ -227,6 +227,54 @@ final class CollectorTests: XCTestCase {
                        "Finished conversations must retain their identity for the recent-task link")
     }
 
+    func testCodexSessionOrderStaysStableAcrossLogWritesAndCompletion() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let ids = (1...12).map { String(format: "12345678-1234-1234-1234-%012d", $0) }
+        var paths: [URL] = []
+        for (index, id) in ids.enumerated() {
+            let path = home.appendingPathComponent(
+                ".codex/sessions/2026/01/01/rollout-\(12 - index)-\(id).jsonl")
+            let source = index.isMultiple(of: 2) ? "vscode" : "cli"
+            try write(
+                """
+                {"type":"session_meta","payload":{"id":"\(id)","source":"\(source)"}}
+                {"type":"event_msg","payload":{"type":"task_started"}}
+                """ + "\n", to: path)
+            try touch(path, at: now - TimeInterval(index + 1))
+            paths.append(path)
+        }
+        let collector = CodexCollector(
+            environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+            settings: CollectorSettings(), files: FileSupport(),
+            processes: processSupport(["Codex", "codex"]))
+        let ideIDs = ids.enumerated().filter { $0.offset.isMultiple(of: 2) }.map(\.element)
+        let cliIDs = ids.enumerated().filter { !$0.offset.isMultiple(of: 2) }.map(\.element)
+        let initial = collector.collect()
+        XCTAssertEqual(initial.ide.busy.map(\.id), ideIDs)
+        XCTAssertEqual(initial.cli.busy.map(\.id), cliIDs)
+
+        // Reverse activity recency; background writes must not reorder running rows.
+        for (index, path) in paths.enumerated() {
+            let text = try String(contentsOf: path)
+                + "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"progress\"}}\n"
+            try write(text, to: path)
+            try touch(path, at: now - TimeInterval(paths.count - index))
+        }
+        let refreshed = collector.collect()
+        XCTAssertEqual(refreshed.ide.busy.map(\.id), ideIDs)
+        XCTAssertEqual(refreshed.cli.busy.map(\.id), cliIDs)
+
+        let completed = try String(contentsOf: paths[0])
+            + "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n"
+        try write(completed, to: paths[0])
+        try touch(paths[0], at: now)
+        let finished = collector.collect()
+        XCTAssertEqual(finished.ide.busy.map(\.id), Array(ideIDs.dropFirst()))
+        XCTAssertEqual(finished.cli.busy.map(\.id), cliIDs)
+    }
+
     /// 正文里恰好提到任务标记词（如工具输出里出现 task_complete 字样）不能误判成任务已结束：
     /// 倒序搜索命中候选行后必须通过事件结构校验，校验失败继续向前找真正的事件行。
     func testCodexMarkerWordsInsideContentDoNotCloseTask() throws {
@@ -1964,6 +2012,34 @@ final class CollectorTests: XCTestCase {
         XCTAssertEqual(
             collectors(dshProcess).dsh().busy,
             [BusyItem(id: "session-busy", title: "DSH 忙碌会话")])
+    }
+
+    /// 桌面端 DeepSeek Harness.app 主程序也视为 DSH 运行中；
+    /// 此前只认 CLI 的 .bin/dsh 与 /bin/dsh 路径，桌面端被误判为无进程，busy 全被抑制。
+    func testDshDesktopAppProcessDetection() throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let now: TimeInterval = 2_000_000_000
+        let busyFile = home.appendingPathComponent(
+            ".dsh/storages/session_projcache/sessions/session-busy.json")
+        try write(
+            """
+            {"version":5,"record":{"identity":{"createdAt":1999999000000,"cwd":"/tmp/proj"},"rows":{
+                "title":{"val":"DSH 桌面会话"},
+                "sessionStats":{"val":{"openStep":2,"pendingCalls":{}}},
+                "sessionListMetadata":{"val":{"lastPromptAt":2000000000000}}}}}
+            """,
+            to: busyFile)
+        try touch(busyFile, at: now)
+        func collectors(_ processes: ProcessSupport) -> LocalCollectors {
+            LocalCollectors(
+                environment: CollectorEnvironment(homeDirectory: home.path, now: now),
+                settings: CollectorSettings(), files: FileSupport(), processes: processes)
+        }
+        let desktop = collectors(processSupport(["DeepSeek Harness"])).dsh()
+        XCTAssertTrue(desktop.processOn)
+        XCTAssertEqual(desktop.detail, "桌面端在线")
+        XCTAssertEqual(desktop.busy, [BusyItem(id: "session-busy", title: "DSH 桌面会话")])
     }
 
     /// 用量快照差分同样支持按会话分文件的新版投影缓存。

@@ -314,7 +314,7 @@ final class StatusStore: ObservableObject {
     var harnessGroups: [HarnessConversationGroup] {
         HarnessConversations.groups(
             tools: data?.tools ?? [], events: recentEvents,
-            requests: data?.usage?.speed?.recent ?? [])
+            requests: data?.usage?.speed?.recent ?? [], sessions: data?.usage?.speed?.sessions ?? [])
     }
 
     func openConversation(_ conversation: HarnessConversation) {

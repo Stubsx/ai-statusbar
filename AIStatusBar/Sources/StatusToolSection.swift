@@ -105,8 +105,8 @@ struct StatusToolSection: View {
             ? NotificationRouter.destinationLabel(forToolKey: tool.key, sessionId: conversation.sessionId)
             : NotificationRouter.destinationLabel(forToolKey: tool.key)
         let age = conversation.timestamp.map { " · " + ExperienceFormat.age($0) } ?? ""
-        let speed = conversation.speedText.map { "\n最近完成请求：\($0)" } ?? ""
-        return "\(displayTitle(conversation.title))\n\(conversation.label)\(age)\(speed)\n\(route)"
+        let metricsHelp = conversation.metricsHelp.map { "\n" + $0 } ?? ""
+        return "\(displayTitle(conversation.title))\n\(conversation.label)\(age)\(metricsHelp)\n\(route)"
             + (conversation.needsAttention ? "，并清除此会话的提醒" : "")
     }
 
@@ -122,7 +122,7 @@ struct StatusToolSection: View {
             } else {
                 sessionLabel(conversation)
                     .padding(.trailing, 16).padding(.horizontal, 6).padding(.vertical, 4)
-                    .help(displayTitle(conversation.title) + "\n暂不支持自动打开")
+                    .help(routeHelp(conversation) + "\n暂不支持自动打开")
             }
         }.padding(.leading, 14)
     }
@@ -131,20 +131,43 @@ struct StatusToolSection: View {
         HStack(spacing: 6) {
             Image(systemName: conversation.symbol).font(.system(size: 9))
                 .foregroundColor(statusColor(conversation)).frame(width: 10)
-            Text(displayTitle(conversation.title))
-                .font(.system(size: 11))
-                .foregroundColor(conversation.current || conversation.needsAttention ? .primary : .secondary)
-                .lineLimit(1).truncationMode(.tail).frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(displayTitle(conversation.title))
+                    .font(.system(size: 11))
+                    .foregroundColor(conversation.current || conversation.needsAttention ? .primary : .secondary)
+                    .lineLimit(1).truncationMode(.tail)
+                StatusConversationMetrics(conversation: conversation)
+            }.frame(maxWidth: .infinity, alignment: .leading)
             if conversation.needsAttention {
                 Circle().fill(Color.accentColor).frame(width: 4, height: 4)
                     .accessibilityLabel("未读")
             }
-            if let speed = conversation.speedText {
-                Text(speed).font(.system(size: 8).monospacedDigit())
-                    .foregroundColor(.secondary).fixedSize()
-            }
             Text(conversation.label).font(.system(size: 9))
                 .foregroundColor(statusColor(conversation)).fixedSize()
+        }
+    }
+}
+
+private struct StatusRowHoveredKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var statusRowHovered: Bool {
+        get { self[StatusRowHoveredKey.self] }
+        set { self[StatusRowHoveredKey.self] = newValue }
+    }
+}
+
+/// Read the button style's hover state so the metrics and row highlight switch together.
+struct StatusConversationMetrics: View {
+    let conversation: HarnessConversation
+    @Environment(\.statusRowHovered) private var hovered
+
+    var body: some View {
+        if let metrics = conversation.metricsText(hovered: hovered) {
+            Text(metrics).font(.system(size: 9).monospacedDigit())
+                .foregroundColor(.secondary).fixedSize()
         }
     }
 }
@@ -170,6 +193,7 @@ private struct StatusRowButtonBody<Label: View>: View {
 
     var body: some View {
         label
+            .environment(\.statusRowHovered, hovered)
             .padding(.trailing, trailingInset)
             .overlay(alignment: .trailing) {
                 if showsArrow {

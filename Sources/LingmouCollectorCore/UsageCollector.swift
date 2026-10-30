@@ -232,14 +232,19 @@ struct UsageCollector {
                 }
             }
             collectHermes(database: database)
-            collectDsh(database: database)
+            let dshSpeedSessions = collectDsh(database: database)
             try UsageSpeedStore.prune(
                 database: database, retentionDays: settings.usageRequestRetentionDays,
                 now: environment.now)
             let rows = try localDaily(database: database)
+            var speed = try UsageSpeedStore.load(database: database)
+            if !dshSpeedSessions.isEmpty {
+                speed = UsageSpeedData(
+                    recent: speed.recent, models: speed.models,
+                    sessions: (speed.sessions ?? []) + dshSpeedSessions)
+            }
             let local = Self.usageData(
-                from: UsageSync.mergedDaily([rows]), now: environment.now,
-                speed: try UsageSpeedStore.load(database: database))
+                from: UsageSync.mergedDaily([rows]), now: environment.now, speed: speed)
             guard settings.usageSyncEnabled else { return (local, nil, nil) }
             let synced = try syncUsage(localRows: rows)
             return (local, synced.merged, synced.status)
@@ -794,7 +799,10 @@ struct UsageCollector {
     /// projcache 无 per-session 模型，模型 id 从会话事件流（session.jsonl.zstd）
     /// 尾部的 finish 块解析，依赖外部 zstd 二进制；不可用时回退 settings.yaml 的
     /// agent-default-model。
-    private func collectDsh(database: SQLiteDatabase) {
+    /// 同时从 sessionStats（llmMs/ttftMs/decodeMs/decodeTokens，与桌面端会话统计同源）
+    /// 生成会话级速度统计返回，由调用方合并进 speed.sessions；DSH 没有逐请求明细，
+    /// 不进 requests 表。
+    private func collectDsh(database: SQLiteDatabase) -> [SessionUsageSpeed] {
         do {
             try database.execute(
                 """
@@ -820,7 +828,7 @@ struct UsageCollector {
                 guard let root = files.read(cachePath).flatMap(JSONValue.object),
                     let tables = root["tables"] as? JSONObject,
                     let table = tables["sessions"] as? JSONObject
-                else { return }
+                else { return [] }
                 for (id, entry) in table {
                     guard let entry = entry as? JSONObject,
                         let rows = entry["rows"] as? JSONObject
@@ -828,7 +836,7 @@ struct UsageCollector {
                     sessions.append((id, rows))
                 }
             }
-            guard !sessions.isEmpty else { return }
+            guard !sessions.isEmpty else { return [] }
             // 会话路径映射只有出现用量增量的会话才用得上；全量枚举 sessions 树
             // 每轮都做太贵，延迟到首个增量会话再扫一次（每轮最多一次）。
             var sessionPathsCache: [String]?
@@ -846,10 +854,46 @@ struct UsageCollector {
             let calendar = Calendar.current
             let todayStart = calendar.startOfDay(for: Date(timeIntervalSince1970: environment.now))
                 .timeIntervalSince1970
+            var speedSessions: [SessionUsageSpeed] = []
             for (id, rows) in sessions {
                 guard let usage = (rows["tokenUsage"] as? JSONObject)?["val"] as? JSONObject,
                     let totals = usage["totals"] as? JSONObject
                 else { continue }
+                // 会话统计与桌面端「会话统计」面板同源：平均 TPS = decodeTokens/decodeMs，
+                // 平均 TTFT = ttftMs/ttftSteps（全程加权累计，不是逐请求样本）。
+                if let stats = (rows["sessionStats"] as? JSONObject)?["val"] as? JSONObject {
+                    let steps = JSONValue.int(stats["steps"]) ?? 0
+                    let decodeMs = JSONValue.double(stats["decodeMs"]) ?? 0
+                    let decodeTokens = JSONValue.double(stats["decodeTokens"]) ?? 0
+                    let ttftMs = JSONValue.double(stats["ttftMs"]) ?? 0
+                    let ttftSteps = JSONValue.int(stats["ttftSteps"]) ?? 0
+                    if steps > 0, decodeTokens > 0 || ttftSteps > 0 {
+                        let metadata = (rows["sessionListMetadata"] as? JSONObject)?["val"]
+                            as? JSONObject ?? [:]
+                        let lastPromptAt = (JSONValue.double(metadata["lastPromptAt"]) ?? 0) / 1_000
+                        let lastBuckets = ((usage["last"] as? JSONObject)?["buckets"])
+                            as? JSONObject
+                        let lastOutput = lastBuckets.flatMap {
+                            JSONValue.int($0["outputTokens"])
+                        } ?? 0
+                        speedSessions.append(
+                            SessionUsageSpeed(
+                                tool: "dsh", sessionId: id,
+                                tps: decodeMs > 0 && decodeTokens > 0
+                                    ? decodeTokens / (decodeMs / 1_000) : nil,
+                                metricKind: "generation",
+                                speedSamples: decodeTokens > 0 ? steps : 0,
+                                firstTokenSeconds: ttftSteps > 0
+                                    ? ttftMs / 1_000 / Double(ttftSteps) : nil,
+                                firstTokenSamples: max(0, ttftSteps),
+                                requestCount: steps,
+                                latest: UsageRequest(
+                                    id: "dsh:\(id)", tool: "dsh", model: "", sessionId: id,
+                                    finishedAt: lastPromptAt > 0
+                                        ? lastPromptAt : environment.now,
+                                    outputTokens: max(0, lastOutput))))
+                    }
+                }
                 let input = JSONValue.int(totals["uncachedInputTokens"]) ?? 0
                 let output = JSONValue.int(totals["outputTokens"]) ?? 0
                 let cache = JSONValue.int(totals["cacheReadTokens"]) ?? 0
@@ -889,8 +933,9 @@ struct UsageCollector {
                             cache: delta.cache, model: model), tool: "dsh", database: database)
                 }
             }
+            return speedSessions
         } catch {
-            return
+            return []
         }
     }
 
